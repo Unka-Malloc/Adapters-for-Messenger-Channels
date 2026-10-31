@@ -1,0 +1,17 @@
+[package]
+name = "a4mc"
+description = "A4MC — the normalized messenger-channel contract: inbound updates, outbound sends with idempotency keys, delivery receipts, external channel identity, lane mechanism classification, and the host-installed LanePort and CustodyPort surfaces."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+version = "0.1.0"
+
+# The contract crate is vocabulary and ports only: serde types, bounded
+# payloads, the lane and custody surfaces the composing host installs.
+# No network code, no custody, no secret material in serialized or debug
+# forms.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true

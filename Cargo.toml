@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/a4mc",
+    "crates/a4mc-telegram",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95.0"
+license = "Apache-2.0"
+repository = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels.git"
+
+[workspace.dependencies]
+a4mc = { path = "crates/a4mc", version = "0.1.0" }
+anyhow = "1"
+fs2 = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2.10", features = ["json"] }
+zeroize = "1"
