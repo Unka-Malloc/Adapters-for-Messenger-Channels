@@ -1,0 +1,15 @@
+# Generated release train for Unka-Malloc/Adapters-for-Messenger-Channels.
+# Regenerate instead of editing: records which engine revision and
+# which source inputs produced the generated files beside it.
+[generator]
+engine = "release-engine"
+version = "0.1.0"
+
+[source]
+templates = "sha256:06393619887472e73b95773b77a1fa86143e32a90b5e9c0818c260d5093379a9"
+declaration = "sha256:d36ebb5235b8158ee31be201c0a0d71924ce6031c9a4bef0d45804d2c6741978"
+
+[outputs]
+".github/workflows/verify.yml" = "sha256:46978e3e22ef9c39ff254d94d5d0f1b99d5603eb583c6dc300ced24a1c414ee1"
+".github/workflows/publish.yml" = "sha256:c22e84ac60df8bbb50cbd8a1073254064c20459fdf80b5e691cfa41245192cd4"
+".github/release.py" = "sha256:9d73a3b660dfbefda496c692201c1d488735b3ddfecd7eadc03abf892f11ddf8"
