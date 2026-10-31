@@ -1,0 +1,22 @@
+[package]
+name = "a4mc-telegram"
+description = "A4MC Telegram dialect: Bot API transport, getUpdates polling loop, inbound lowering onto the a4mc channel contract, per-chat pairing/binding store, slash-command surface, normalized outbound sends with idempotency dedupe."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+version = "0.1.0"
+
+# The dialect owns the Telegram side of the boundary only. Bot-token
+# custody resolves through the host-installed `a4mc::custody` port — the
+# crate never reads keychains, files or environment for the token — and
+# local agent work runs through the host-installed `a4mc::lane` port.
+[dependencies]
+a4mc.workspace = true
+anyhow.workspace = true
+fs2.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+zeroize.workspace = true
