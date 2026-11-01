@@ -29,6 +29,10 @@ const MAX_TOKEN_BYTES: usize = 512;
 pub struct TelegramApiError {
     pub code: String,
     pub message: String,
+    /// The platform's `retry_after` hint in seconds, carried when the
+    /// Bot API throttled the call (HTTP 429 / `error_code` 429).
+    /// `None` on every non-throttled failure.
+    pub retry_after: Option<u64>,
 }
 
 impl TelegramApiError {
@@ -36,7 +40,14 @@ impl TelegramApiError {
         Self {
             code: code.into(),
             message: message.into(),
+            retry_after: None,
         }
+    }
+
+    /// Attach the platform's `retry_after` hint to a throttled failure.
+    pub fn with_retry_after(mut self, retry_after: Option<u64>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 }
 
@@ -195,10 +206,18 @@ impl LiveBotTransport {
             ));
         }
         if value["ok"].as_bool() != Some(true) {
-            return Err(TelegramApiError::new(
-                "a4mc_telegram_api_failed",
-                format!("{method}: Bot API request failed"),
-            ));
+            let retry_after = value
+                .pointer("/parameters/retry_after")
+                .and_then(Value::as_u64);
+            let code = if status == 429 || value["error_code"].as_i64() == Some(429) {
+                "a4mc_telegram_throttled"
+            } else {
+                "a4mc_telegram_api_failed"
+            };
+            return Err(
+                TelegramApiError::new(code, format!("{method}: Bot API request failed"))
+                    .with_retry_after(retry_after),
+            );
         }
         Ok(value["result"].clone())
     }
@@ -252,7 +271,7 @@ impl BotTransport for LiveBotTransport {
         text: &str,
         reply_to_message_id: Option<i64>,
     ) -> Result<Vec<i64>, TelegramApiError> {
-        let chunks = chunk_telegram_text(text, 4000);
+        let chunks = bounded_send_parts(text)?;
         let mut sent_ids = Vec::with_capacity(chunks.len());
         for (index, chunk) in chunks.iter().enumerate() {
             let mut body = json!({
@@ -305,6 +324,28 @@ pub fn live_transport(api_root: Option<&str>) -> Result<LiveBotTransport> {
     Ok(LiveBotTransport::new(token.to_owned(), api_root))
 }
 
+/// The platform's wait hint on a throttled response: the `Retry-After`
+/// header first, then a bounded peek at the error body's
+/// `parameters.retry_after` (never more than a few kilobytes are read).
+fn retry_after_hint(response: ureq::Response) -> Option<u64> {
+    if let Some(secs) = response
+        .header("retry-after")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Some(secs);
+    }
+    let mut body = String::new();
+    response
+        .into_reader()
+        .take(8 * 1024)
+        .read_to_string(&mut body)
+        .ok()?;
+    serde_json::from_str::<Value>(&body)
+        .ok()?
+        .pointer("/parameters/retry_after")?
+        .as_u64()
+}
+
 fn map_transport_error(method: &str, error: ureq::Error) -> TelegramApiError {
     match error {
         ureq::Error::Status(401, _) => TelegramApiError::new(
@@ -315,6 +356,11 @@ fn map_transport_error(method: &str, error: ureq::Error) -> TelegramApiError {
             "a4mc_telegram_conflict",
             "getUpdates conflict: another poller is using this bot token",
         ),
+        ureq::Error::Status(429, response) => TelegramApiError::new(
+            "a4mc_telegram_throttled",
+            format!("{method}: Bot API rate limited"),
+        )
+        .with_retry_after(retry_after_hint(response)),
         ureq::Error::Status(code, _) => {
             TelegramApiError::new("a4mc_telegram_api_failed", format!("{method}: HTTP {code}"))
         }
@@ -336,6 +382,40 @@ fn parse_update(value: &Value) -> Option<Update> {
                 .and_then(|message| parse_message_update(update_id, message, true))
         });
     Some(Update { update_id, message })
+}
+
+/// Chunk size for one `sendMessage` post: inside the platform's
+/// ~4096-char limit, applied on bytes so multi-byte text never
+/// overflows a post.
+const TELEGRAM_TEXT_CHUNK: usize = 4000;
+
+/// Per-chat send budget: the most `sendMessage` posts one logical send
+/// may fan out to. Sized to admit the worst-case UTF-8 expansion of the
+/// contract's `MAX_OUTBOUND_TEXT_CHARS` — a contract-valid text always
+/// fits unless pathological newline fragmentation would explode it
+/// into more posts than the contract maximum can physically need; that
+/// runaway is rejected before the first post, never partially posted.
+const MAX_SEND_PARTS: usize = a4mc::MAX_OUTBOUND_TEXT_CHARS * 4 / TELEGRAM_TEXT_CHUNK + 1;
+
+/// Bound one outbound text for the wire. Text above the contract's
+/// `MAX_OUTBOUND_TEXT_CHARS` is rejected instead of fanning out into an
+/// unbounded post sequence; what remains is chunked at the platform
+/// limit inside the per-chat part budget.
+fn bounded_send_parts(text: &str) -> Result<Vec<&str>, TelegramApiError> {
+    if text.chars().count() > a4mc::MAX_OUTBOUND_TEXT_CHARS {
+        return Err(TelegramApiError::new(
+            "a4mc_telegram_text_too_large",
+            "outbound text exceeded bound",
+        ));
+    }
+    let chunks = chunk_telegram_text(text, TELEGRAM_TEXT_CHUNK);
+    if chunks.len() > MAX_SEND_PARTS {
+        return Err(TelegramApiError::new(
+            "a4mc_telegram_part_budget_exceeded",
+            "outbound text exceeded the per-chat send part budget",
+        ));
+    }
+    Ok(chunks)
 }
 
 pub fn chunk_telegram_text(text: &str, limit: usize) -> Vec<&str> {
@@ -552,6 +632,32 @@ mod tests {
         assert!(chunks.len() >= 2);
         assert_eq!(chunks.concat(), text);
         assert_eq!(chunks[0].as_ptr(), text.as_ptr());
+    }
+
+    #[test]
+    fn send_parts_reject_text_above_the_contract_bound() {
+        let oversized = "x".repeat(a4mc::MAX_OUTBOUND_TEXT_CHARS + 1);
+        let error = bounded_send_parts(&oversized).unwrap_err();
+        assert_eq!(error.code, "a4mc_telegram_text_too_large");
+        // The whole contract range still fits inside the part budget.
+        let maximal = "x".repeat(a4mc::MAX_OUTBOUND_TEXT_CHARS);
+        let parts = bounded_send_parts(&maximal).unwrap();
+        assert!(!parts.is_empty());
+        assert!(parts.len() <= MAX_SEND_PARTS);
+    }
+
+    #[test]
+    fn send_parts_reject_pathological_newline_fan_out() {
+        // Multi-byte text with newlines past the split floor fragments
+        // a contract-valid character count into more posts than the
+        // part budget allows: the send is refused wholesale rather than
+        // partially posted.
+        let unit = format!("{}\n", "😀".repeat(275)); // 276 chars, 1101 bytes
+        let fragmented = unit.repeat(118); // 32568 chars — inside the bound
+        let raw = chunk_telegram_text(&fragmented, TELEGRAM_TEXT_CHUNK);
+        assert!(raw.len() > MAX_SEND_PARTS);
+        let error = bounded_send_parts(&fragmented).unwrap_err();
+        assert_eq!(error.code, "a4mc_telegram_part_budget_exceeded");
     }
 
     #[test]

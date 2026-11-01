@@ -30,9 +30,10 @@ let identity = a4mc_telegram::run_channel_loop(transport, store, config)?;
 ```
 
 `RuntimeConfig` carries `poll_timeout_secs`, `worker_count`,
-`max_admitted`, the shared `stop` flag and `on_started` — the host's
-readiness hook invoked once after the Bot API handshake. The loop runs
-until `stop` and returns the bot identity it served under.
+`max_admitted`, `turn_deadline`, `max_poll_failures`, the shared `stop`
+flag and `on_started` — the host's readiness hook invoked once after
+the Bot API handshake. The loop runs until `stop` and returns the bot
+identity it served under.
 
 ## Rules that keep the contract
 

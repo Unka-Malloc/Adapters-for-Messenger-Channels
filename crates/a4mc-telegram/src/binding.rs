@@ -1,11 +1,13 @@
 //! Pairing and per-chat agent/session binding store.
 //!
 //! The store is channel state the adapter persists where the host points
-//! it: pairing codes waiting for host-side approval, and each chat's
-//! bound agent/session. Approval and revocation decisions are host
-//! policy; the store only records and serves them. Mutations run under
-//! one advisory file lock across reload-merge-write so concurrent
-//! writers never silently overwrite each other.
+//! it: pairing codes waiting for host-side approval, each chat's bound
+//! agent/session, and the durable getUpdates poll cursor so a restart
+//! resumes polling instead of replaying already-confirmed updates.
+//! Approval and revocation decisions are host policy; the store only
+//! records and serves them. Mutations run under one advisory file lock
+//! across reload-merge-write so concurrent writers never silently
+//! overwrite each other.
 
 use crate::private_io::{
     atomic_write_private_text, ensure_private_dir, open_private_lock_file,
@@ -54,6 +56,11 @@ struct BindingDocument {
     schema_version: String,
     pairings: Vec<PairingRecord>,
     chats: BTreeMap<String, ChatBinding>,
+    /// Durable getUpdates cursor: the next offset this runtime
+    /// confirmed to the platform. Defaults to 0 for documents written
+    /// before the cursor existed; older readers ignore the field.
+    #[serde(default)]
+    poll_offset: i64,
 }
 
 #[derive(Debug)]
@@ -250,6 +257,23 @@ impl BindingStore {
             Ok(())
         })
     }
+
+    /// The last durably recorded poll cursor — where the next
+    /// `getUpdates` call resumes after a restart.
+    pub fn poll_offset(&self) -> i64 {
+        self.document.poll_offset
+    }
+
+    /// Persist the poll cursor under the same lock-reload-merge-write
+    /// protocol as every mutation. A crash before this write replays at
+    /// most the in-flight batch; after it, a restart resumes instead of
+    /// re-running paid turns for already-confirmed updates.
+    pub fn set_poll_offset(&mut self, offset: i64) -> Result<()> {
+        self.mutate(|document| {
+            document.poll_offset = offset;
+            Ok(())
+        })
+    }
 }
 
 fn now_secs() -> u64 {
@@ -298,6 +322,7 @@ fn read_document(path: &Path) -> Result<BindingDocument> {
             schema_version: BINDING_SCHEMA.to_owned(),
             pairings: Vec::new(),
             chats: BTreeMap::new(),
+            poll_offset: 0,
         }),
     }
 }
@@ -391,6 +416,22 @@ mod tests {
             let other = first.binding(33).cloned().unwrap();
             assert_eq!(other.session_id.as_deref(), Some("sess-9"));
             assert!(other.updated_at >= generation);
+        });
+    }
+
+    #[test]
+    fn poll_cursor_persists_across_reopen() {
+        temp_store(|mut store| {
+            assert_eq!(store.poll_offset(), 0);
+            store.set_poll_offset(41).unwrap();
+            let reopened = BindingStore::open(store.path.clone()).unwrap();
+            assert_eq!(reopened.poll_offset(), 41);
+            // A later writer merging on an older in-memory document
+            // still preserves the cursor.
+            let mut other = BindingStore::open(store.path.clone()).unwrap();
+            other.request_pairing(11, 22, Some("alice".into())).unwrap();
+            let reread = BindingStore::open(store.path.clone()).unwrap();
+            assert_eq!(reread.poll_offset(), 41);
         });
     }
 
