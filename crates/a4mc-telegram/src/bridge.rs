@@ -10,6 +10,9 @@
 use a4mc::lane;
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeError {
@@ -167,22 +170,52 @@ pub fn open_session(agent_id: &str, session_id: Option<&str>) -> Result<String, 
     Ok(resolved)
 }
 
+/// Run one agent turn within `deadline`. The lane call is
+/// uninterruptible once entered, so it runs on its own thread: on
+/// expiry the worker abandons the call — the detached thread finishes
+/// into a dropped receiver or dies with the lane — and the user gets a
+/// bounded timeout reply instead of a worker pinned forever. The same
+/// deadline is forwarded as `timeoutMs` so a cooperative lane bounds
+/// itself before the hard cutoff.
 pub fn send_turn(
     agent_id: &str,
     session_id: Option<&str>,
     text: &str,
+    deadline: Duration,
 ) -> Result<(String, String), BridgeError> {
     let mut params = json!({
         "agent": agent_id,
         "text": text,
-        "timeoutMs": 0,
+        "timeoutMs": u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
     });
     if let Some(session_id) = session_id.filter(|value| !value.is_empty()) {
         params["sessionId"] = json!(session_id);
     }
-    let result = (lane_port()?.dispatch)("send", &params).map_err(|_| {
-        BridgeError::new("a4mc_telegram_send_failed", "conversation lane send failed")
-    })?;
+    let port = lane_port()?;
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("a4mc-telegram-turn".into())
+        .spawn(move || {
+            let _ = done_tx.send((port.dispatch)("send", &params));
+        })
+        .map_err(|_| BridgeError::new("a4mc_telegram_send_failed", "turn worker spawn failed"))?;
+    let result = match done_rx.recv_timeout(deadline) {
+        Ok(result) => result.map_err(|_| {
+            BridgeError::new("a4mc_telegram_send_failed", "conversation lane send failed")
+        })?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(BridgeError::new(
+                "a4mc_telegram_turn_timeout",
+                "agent turn exceeded the configured deadline",
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(BridgeError::new(
+                "a4mc_telegram_send_failed",
+                "conversation lane send failed",
+            ));
+        }
+    };
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let code = result
             .pointer("/error/code")

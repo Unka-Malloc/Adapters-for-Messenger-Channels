@@ -2,10 +2,14 @@
 //!
 //! The loop long-polls `getUpdates`, admits each message into a globally
 //! bounded, fair, per-chat FIFO scheduler, and hands work to the bridge.
-//! It is fail-safe: unauthorized tokens and second-poller conflicts end
-//! the loop with their error; transient transport failures back off and
-//! continue; a handler failure never kills a worker — it is answered
-//! with a sanitized error reply.
+//! The poll cursor is durably recorded in the binding store as it
+//! advances, so a restart resumes where the platform's acknowledged
+//! offset left off instead of replaying confirmed updates. It is
+//! fail-safe: unauthorized tokens and second-poller conflicts end the
+//! loop with their error; transient transport failures honor the
+//! platform's retry hint, back off with jitter and surface to the host
+//! once the failure budget is spent; a handler failure never kills a
+//! worker — it is answered with a sanitized error reply.
 
 use super::bridge::{
     ensure_known_agent, format_agent_list, format_session_list, list_agents, list_sessions,
@@ -17,6 +21,7 @@ use crate::control::{
     ControlCommand, ControlOutcome, commands_text, help_text, parse_control_command,
 };
 use anyhow::{Result, anyhow};
+use rand_core::{OsRng, RngCore};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -28,6 +33,15 @@ pub struct RuntimeConfig {
     pub stop: Arc<AtomicBool>,
     pub worker_count: usize,
     pub max_admitted: usize,
+    /// Bound on one agent turn. A lane call that outlives the deadline
+    /// is abandoned and reported as `a4mc_telegram_turn_timeout`, so a
+    /// hung turn can never pin all workers and stall shutdown. Must be
+    /// nonzero.
+    pub turn_deadline: Duration,
+    /// Consecutive `getUpdates` failures tolerated before the loop
+    /// surfaces `a4mc_telegram_poll_failed` to the host — an outage or
+    /// a permanently rejected request must not retry silently forever.
+    pub max_poll_failures: u32,
     /// Invoked once after the Bot API handshake (`getMe`, webhook clear,
     /// command registration) succeeds — the host's readiness hook for
     /// status files, supervisors or UI. The adapter owns no such state.
@@ -44,6 +58,8 @@ impl Default for RuntimeConfig {
             stop: Arc::new(AtomicBool::new(false)),
             worker_count: 4,
             max_admitted: 64,
+            turn_deadline: Duration::from_secs(300),
+            max_poll_failures: 8,
             on_started: None,
         }
     }
@@ -89,9 +105,34 @@ impl Scheduler {
         }
     }
 
-    /// Block until admission capacity is available. Used by the poller so it
-    /// never over-admits a fetched batch.
-    fn wait_for_capacity(&self) {
+    /// Block until admission capacity is available or `stop` is raised.
+    /// Used by the poller so it never over-admits a fetched batch; a
+    /// `false` return means shutdown ended the wait and the poller must
+    /// exit instead of parking on a full pipeline.
+    fn wait_for_capacity(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while state.admitted >= self.max_admitted && !self.stop.load(Ordering::SeqCst) {
+            state = self.wake.wait(state).unwrap();
+        }
+        !self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Raise `stop` and wake every parked thread under the state lock.
+    /// The notify must hold the lock a waiter holds across its
+    /// check-then-wait — an unlocked notify can land between a worker's
+    /// `stop` check and its `wake.wait()` registration and be lost,
+    /// parking that worker forever.
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _state = self.state.lock().unwrap();
+        self.wake.notify_all();
+    }
+
+    /// Block until admission capacity frees, regardless of `stop`. The
+    /// drain path runs only after `stop` is already raised and must
+    /// still admit the fetched remainder — admitted work is never
+    /// dropped, and workers free capacity as they finish.
+    fn wait_for_drain(&self) {
         let mut state = self.state.lock().unwrap();
         while state.admitted >= self.max_admitted {
             state = self.wake.wait(state).unwrap();
@@ -215,6 +256,10 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         on_started(&identity);
     }
 
+    // Resume where the last process durably confirmed: updates below
+    // the stored cursor were already acknowledged to the platform, so
+    // restarting from them would replay paid agent turns.
+    let mut offset: i64 = store.poll_offset();
     let store = Arc::new(Mutex::new(store));
     let scheduler = Arc::new(Scheduler::new(
         config.max_admitted,
@@ -224,11 +269,13 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     let processor_transport = Arc::clone(&transport);
     let processor_store = Arc::clone(&store);
     let processor_identity = identity.clone();
+    let turn_deadline = config.turn_deadline;
     let processor = move |chat_id: i64, message: InboundMessage| match handle_inbound(
         &*processor_transport,
         &processor_store,
         &processor_identity,
         &message,
+        turn_deadline,
     ) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -242,58 +289,114 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     };
     let workers = scheduler.spawn_workers(config.worker_count, processor)?;
 
-    let mut offset: i64 = 0;
     let mut pending: VecDeque<InboundMessage> = VecDeque::new();
-    let poll_result = poll_updates(&*transport, &scheduler, &config, &mut offset, &mut pending);
+    let poll_result = poll_updates(
+        &*transport,
+        &scheduler,
+        &store,
+        &config,
+        &mut offset,
+        &mut pending,
+    );
     // Fail-closed on every exit: raising stop before drain/join releases
     // workers parked on `wake` — a fatal poll error that left stop unset
     // would deadlock here instead of returning its error. Workers serve
     // `ready` before re-checking stop, so admitted work still drains.
-    config.stop.store(true, Ordering::SeqCst);
-    scheduler.wake.notify_all();
+    scheduler.shutdown();
     drain_pending(&scheduler, &mut pending);
     scheduler.join_workers(workers)?;
     poll_result?;
     Ok(identity)
 }
 
+/// Ceiling on one retry wait, applied after the platform's
+/// `retry_after` hint is honored — a wild hint cannot park the poller.
+const MAX_RETRY_WAIT_SECS: u64 = 120;
+
 fn poll_updates<T: BotTransport>(
     transport: &T,
     scheduler: &Scheduler,
+    store: &Mutex<BindingStore>,
     config: &RuntimeConfig,
     offset: &mut i64,
     pending: &mut VecDeque<InboundMessage>,
 ) -> Result<()> {
+    let mut consecutive_failures = 0u32;
     while !config.stop.load(Ordering::SeqCst) {
-        scheduler.wait_for_capacity();
-        if config.stop.load(Ordering::SeqCst) {
+        if !scheduler.wait_for_capacity() {
             break;
         }
         if pending.is_empty() {
             let updates = match transport.get_updates(*offset, config.poll_timeout_secs) {
-                Ok(updates) => updates,
+                Ok(updates) => {
+                    consecutive_failures = 0;
+                    updates
+                }
                 Err(error) if error.code == "a4mc_telegram_conflict" => {
                     return Err(anyhow!("{}: {}", error.code, error.message));
                 }
                 Err(error) if error.code == "a4mc_telegram_unauthorized" => {
                     return Err(anyhow!("{}: {}", error.code, error.message));
                 }
-                Err(_) => {
-                    // Recoverable network blip: brief backoff then continue.
-                    std::thread::sleep(Duration::from_secs(2));
+                Err(error) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= config.max_poll_failures.max(1) {
+                        return Err(anyhow!("a4mc_telegram_poll_failed: {error}"));
+                    }
+                    // Recoverable failure: honor the platform's hint,
+                    // exponential backoff otherwise; `stop` ends the wait.
+                    let wait = retry_wait(consecutive_failures, error.retry_after);
+                    if !wait_or_stop(wait, &config.stop) {
+                        break;
+                    }
                     continue;
                 }
             };
+            let mut advanced = false;
             for update in updates {
                 *offset = update.update_id + 1;
+                advanced = true;
                 if let Some(message) = update.message {
                     pending.push_back(message);
                 }
+            }
+            if advanced {
+                // Durable cursor: the platform has been told everything
+                // below `offset`, so persist that acknowledgement. A
+                // write failure surfaces rather than silently recreating
+                // the replay-a-restart bug it exists to prevent.
+                store.lock().unwrap().set_poll_offset(*offset)?;
             }
         }
         admit_available(scheduler, pending);
     }
     Ok(())
+}
+
+/// Next poll retry wait: exponential backoff (2s, doubling, capped)
+/// with up-to-half jitter so restart waves don't synchronize, raised
+/// to the platform's `retry_after` hint when one was sent.
+fn retry_wait(failures: u32, retry_after: Option<u64>) -> Duration {
+    let base = 1u64 << failures.min(5);
+    let jitter = OsRng.next_u64() % (base / 2 + 1);
+    let secs = (base + jitter).max(retry_after.unwrap_or(0));
+    Duration::from_secs(secs.min(MAX_RETRY_WAIT_SECS))
+}
+
+/// Sleep `duration` in short slices so a raised `stop` ends the wait
+/// early; returns `false` when `stop` interrupted it.
+fn wait_or_stop(duration: Duration, stop: &AtomicBool) -> bool {
+    const SLICE: Duration = Duration::from_millis(200);
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        let slice = remaining.min(SLICE);
+        thread::sleep(slice);
+        remaining -= slice;
+    }
+    !stop.load(Ordering::SeqCst)
 }
 
 fn admit_available(scheduler: &Scheduler, pending: &mut VecDeque<InboundMessage>) {
@@ -310,7 +413,7 @@ fn admit_available(scheduler: &Scheduler, pending: &mut VecDeque<InboundMessage>
 
 fn drain_pending(scheduler: &Scheduler, pending: &mut VecDeque<InboundMessage>) {
     while !pending.is_empty() {
-        scheduler.wait_for_capacity();
+        scheduler.wait_for_drain();
         admit_available(scheduler, pending);
     }
 }
@@ -320,6 +423,7 @@ fn handle_inbound<T: BotTransport>(
     store: &Mutex<BindingStore>,
     identity: &BotIdentity,
     message: &InboundMessage,
+    turn_deadline: Duration,
 ) -> Result<()> {
     if !message.is_private {
         // The channel serves direct chats only; group traffic is ignored.
@@ -334,7 +438,7 @@ fn handle_inbound<T: BotTransport>(
             if body.trim().is_empty() {
                 return Ok(());
             }
-            handle_ordinary(transport, store, message, &body)
+            handle_ordinary(transport, store, message, &body, turn_deadline)
         }
     }
 }
@@ -514,6 +618,7 @@ fn handle_ordinary<T: BotTransport>(
     store: &Mutex<BindingStore>,
     message: &InboundMessage,
     text: &str,
+    turn_deadline: Duration,
 ) -> Result<()> {
     if !store_is_paired(store, message.chat_id, message.user_id)? {
         let pending = store_request_pairing(
@@ -539,8 +644,13 @@ fn handle_ordinary<T: BotTransport>(
         )?;
         return Ok(());
     };
-    let (reply, next_session) = send_turn(&agent_id, binding.session_id.as_deref(), text)
-        .map_err(|error| anyhow!(error.to_string()))?;
+    let (reply, next_session) = send_turn(
+        &agent_id,
+        binding.session_id.as_deref(),
+        text,
+        turn_deadline,
+    )
+    .map_err(|error| anyhow!(error.to_string()))?;
     if !next_session.is_empty() && binding.session_id.as_deref() != Some(next_session.as_str()) {
         let _ = store_set_session(store, message.chat_id, Some(next_session));
     }
@@ -679,6 +789,13 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    /// Turn deadline for handler tests: generous so only the dedicated
+    /// timeout test ever trips it.
+    const TEST_DEADLINE: Duration = Duration::from_secs(30);
+    /// Text that makes the synthetic lane's dispatch hang, so turn
+    /// deadline expiry is exercisable.
+    const BLOCKING_TURN_TEXT: &str = "a4mc-block-turn";
+
     fn temp_root() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "a4mc-tg-rt-{}-{}",
@@ -747,7 +864,10 @@ mod tests {
             conversation_list: empty,
             open_or_resume: empty,
             dispatch: |operation, params| {
-                let _ = (operation, params);
+                if params.get("text").and_then(|value| value.as_str()) == Some(BLOCKING_TURN_TEXT) {
+                    thread::sleep(Duration::from_secs(30));
+                }
+                let _ = operation;
                 Ok(json!({"ok": true, "output": "synthetic", "sessionId": "synthetic"}))
             },
         });
@@ -773,11 +893,25 @@ mod tests {
             ..MockBotTransport::default()
         };
         let message = text_message(99, 77, Some("bob"), "/start", 1);
-        handle_inbound(&transport, &store, &BotIdentity::default(), &message).unwrap();
+        handle_inbound(
+            &transport,
+            &store,
+            &BotIdentity::default(),
+            &message,
+            TEST_DEADLINE,
+        )
+        .unwrap();
         let code = store.lock().unwrap().pending_pairings()[0].code.clone();
         store.lock().unwrap().approve(&code).unwrap();
         let list = text_message(99, 77, Some("bob"), "/agent", 2);
-        handle_inbound(&transport, &store, &BotIdentity::default(), &list).unwrap();
+        handle_inbound(
+            &transport,
+            &store,
+            &BotIdentity::default(),
+            &list,
+            TEST_DEADLINE,
+        )
+        .unwrap();
         let messages = sent.lock().unwrap();
         assert!(
             messages
@@ -809,6 +943,7 @@ mod tests {
             &store,
             &identity,
             &text_message(42, 42, Some("alice"), "/whoami", 1),
+            TEST_DEADLINE,
         )
         .unwrap();
         handle_inbound(
@@ -816,6 +951,7 @@ mod tests {
             &store,
             &identity,
             &text_message(42, 42, Some("alice"), "/start", 2),
+            TEST_DEADLINE,
         )
         .unwrap();
         let code = store.lock().unwrap().pending_pairings()[0].code.clone();
@@ -825,6 +961,7 @@ mod tests {
             &store,
             &identity,
             &text_message(42, 42, Some("alice"), "/unpair", 3),
+            TEST_DEADLINE,
         )
         .unwrap();
         assert!(!store.lock().unwrap().is_paired(42, 42));
@@ -864,7 +1001,14 @@ mod tests {
             duration: None,
             emoji: None,
         }];
-        handle_inbound(&transport, &store, &BotIdentity::default(), &message).unwrap();
+        handle_inbound(
+            &transport,
+            &store,
+            &BotIdentity::default(),
+            &message,
+            TEST_DEADLINE,
+        )
+        .unwrap();
         let messages = sent.lock().unwrap();
         assert!(messages.iter().any(|(_, body)| body.contains("chatId: 5")));
         let _ = std::fs::remove_dir_all(root);
@@ -1014,8 +1158,7 @@ mod tests {
             || records.lock().unwrap().len() == 3,
             Duration::from_secs(5),
         );
-        stop.store(true, Ordering::SeqCst);
-        scheduler.wake.notify_all();
+        scheduler.shutdown();
         for handle in workers {
             handle.join().unwrap();
         }
@@ -1089,8 +1232,7 @@ mod tests {
         let mut processed = done.lock().unwrap().clone();
         processed.sort_unstable();
         assert_eq!(processed, vec![1, 2, 3]);
-        stop.store(true, Ordering::SeqCst);
-        scheduler.wake.notify_all();
+        scheduler.shutdown();
         for handle in workers {
             handle.join().unwrap();
         }
@@ -1122,6 +1264,199 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(stop.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restart_resumes_the_persisted_poll_cursor() {
+        install_synthetic_lane();
+        let root = temp_root();
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        {
+            let transport = MockBotTransport {
+                sent: Arc::clone(&sent),
+                ..MockBotTransport::default()
+            };
+            transport.updates.lock().unwrap().extend([
+                Update {
+                    update_id: 1,
+                    message: Some(text_message(42, 42, Some("alice"), "/whoami", 1)),
+                },
+                Update {
+                    update_id: 2,
+                    message: Some(text_message(42, 42, Some("alice"), "/whoami", 2)),
+                },
+            ]);
+            let stop = Arc::new(AtomicBool::new(false));
+            let store = BindingStore::open_in(&root).unwrap();
+            let config = RuntimeConfig {
+                poll_timeout_secs: 1,
+                stop: Arc::clone(&stop),
+                ..RuntimeConfig::default()
+            };
+            let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+            wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(10));
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap();
+            assert_eq!(
+                BindingStore::open_in(&root).unwrap().poll_offset(),
+                3,
+                "poll cursor was not durably recorded"
+            );
+        }
+
+        sent.lock().unwrap().clear();
+        let observed_offsets = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            observed_offsets: Arc::clone(&observed_offsets),
+            ..MockBotTransport::default()
+        };
+        transport.updates.lock().unwrap().extend([
+            // Stale re-delivery below the cursor must not be re-served.
+            Update {
+                update_id: 1,
+                message: Some(text_message(42, 42, Some("alice"), "/whoami", 1)),
+            },
+            Update {
+                update_id: 5,
+                message: Some(text_message(9, 9, Some("zed"), "/whoami", 5)),
+            },
+        ]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let store = BindingStore::open_in(&root).unwrap();
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let offsets = observed_offsets.lock().unwrap();
+        assert_eq!(
+            offsets.first(),
+            Some(&3),
+            "restart polled below the durable cursor: {offsets:?}"
+        );
+        assert!(
+            offsets.iter().all(|offset| *offset >= 3),
+            "restart replayed confirmed updates: {offsets:?}"
+        );
+        let messages = sent.lock().unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "stale update was re-served: {messages:?}"
+        );
+        assert_eq!(messages[0].0, 9);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capacity_wait_unblocks_when_stop_is_raised() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler = Arc::new(Scheduler::new(1, Arc::clone(&stop)));
+        // Fill admission without workers so capacity never frees.
+        scheduler.enqueue(text_message(1, 1, None, "a", 1));
+        let waiter = {
+            let scheduler = Arc::clone(&scheduler);
+            thread::spawn(move || scheduler.wait_for_capacity())
+        };
+        thread::sleep(Duration::from_millis(60));
+        assert!(
+            !waiter.is_finished(),
+            "capacity wait returned while admission was full"
+        );
+        scheduler.shutdown();
+        assert!(
+            !waiter.join().unwrap(),
+            "stop must end the capacity wait even with a full pipeline"
+        );
+    }
+
+    #[test]
+    fn retry_wait_honors_the_server_hint_and_stays_capped() {
+        let first = retry_wait(1, None);
+        assert!(first >= Duration::from_secs(2) && first <= Duration::from_secs(3));
+        // The platform's hint raises the wait beyond computed backoff.
+        assert!(retry_wait(1, Some(30)) >= Duration::from_secs(30));
+        // An absurd hint is capped — the poller can never be parked.
+        assert_eq!(
+            retry_wait(8, Some(86_400)),
+            Duration::from_secs(MAX_RETRY_WAIT_SECS)
+        );
+        assert!(retry_wait(9, None) <= Duration::from_secs(MAX_RETRY_WAIT_SECS));
+    }
+
+    #[test]
+    fn wait_or_stop_ends_the_sleep_early() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        assert!(!wait_or_stop(Duration::from_secs(30), &stop));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        handle.join().unwrap();
+        assert!(!wait_or_stop(Duration::ZERO, &stop));
+    }
+
+    #[test]
+    fn persistent_poll_failures_surface_to_the_host() {
+        let root = temp_root();
+        let store = BindingStore::open_in(&root).unwrap();
+        let transport = MockBotTransport {
+            fail_get_updates_with: Some(TelegramApiError::new(
+                "a4mc_telegram_network_failed",
+                "getUpdates: transport failure",
+            )),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            max_poll_failures: 2,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        // Before the failure budget the loop retried silently forever;
+        // now the host sees `a4mc_telegram_poll_failed`.
+        let error = run_channel_loop(transport, store, config).unwrap_err();
+        assert!(
+            error.to_string().contains("a4mc_telegram_poll_failed"),
+            "unexpected error: {error}"
+        );
+        assert!(stop.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn turn_deadline_reports_timeout_instead_of_pinning_the_worker() {
+        install_synthetic_lane();
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+        store.approve(&pending.code).unwrap();
+        store.set_agent(42, Some("codex".into())).unwrap();
+        let store = Mutex::new(store);
+        let transport = MockBotTransport::default();
+        let error = handle_inbound(
+            &transport,
+            &store,
+            &BotIdentity::default(),
+            &text_message(42, 42, Some("alice"), BLOCKING_TURN_TEXT, 1),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("a4mc_telegram_turn_timeout"),
+            "unexpected error: {error}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
