@@ -9,7 +9,7 @@ members = [
 edition = "2024"
 rust-version = "1.95.0"
 license = "Apache-2.0"
-repository = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels.git"
+repository = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels"
 
 [workspace.dependencies]
 a4mc = { path = "crates/a4mc", version = "0.1.0" }
