@@ -146,11 +146,12 @@ mod tests {
 
     #[test]
     fn secret_token_never_shows_bytes() {
-        let token = SecretToken::try_from_string("123:fixture-secret".into()).unwrap();
+        let value = "fixture-value-not-a-token";
+        let token = SecretToken::try_from_string(value.into()).unwrap();
         let debug = format!("{token:?}");
         assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains("fixture-secret"));
-        assert_eq!(token.expose_utf8().unwrap(), "123:fixture-secret");
+        assert!(!debug.contains(value));
+        assert_eq!(token.expose_utf8().unwrap(), value);
         assert!(SecretToken::try_from_bytes(Vec::new()).is_err());
         assert!(SecretToken::try_from_bytes(vec![0u8; MAX_SECRET_BYTES + 1]).is_err());
         let copy = token.copy_for_persistent_read();
@@ -223,7 +224,7 @@ mod tests {
         );
 
         let port: Arc<dyn CustodyPort> = Arc::new(FixtureCustody {
-            token: Some("456:fixture-token".into()),
+            token: Some("fixture-custody-value".into()),
         });
         custody::install(Arc::clone(&port)).unwrap();
         custody::install(Arc::clone(&port)).unwrap(); // same port: idempotent
@@ -232,7 +233,7 @@ mod tests {
             .channel_token(&ChannelId::from("fixture"))
             .unwrap()
             .unwrap();
-        assert_eq!(token.expose_utf8().unwrap(), "456:fixture-token");
+        assert_eq!(token.expose_utf8().unwrap(), "fixture-custody-value");
 
         let other: Arc<dyn CustodyPort> = Arc::new(FixtureCustody { token: None });
         assert!(custody::install(other).is_err());
