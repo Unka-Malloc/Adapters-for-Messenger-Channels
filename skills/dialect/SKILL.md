@@ -38,7 +38,27 @@ the other; it never reaches into host internals.
   work only through the installed ports — no keychain, file or
   environment reads for tokens.
 - Secret material never appears in serialized or debug forms.
-- `a4mc-telegram` is the reference dialect: `transport` (Bot API long
-  polling), `lower` (updates → contract), `channel` (descriptor +
+- `a4mc-telegram` is the reference poll dialect: `transport` (Bot API
+  long polling), `lower` (updates → contract), `channel` (descriptor +
   idempotent sends), `runtime` (the bounded fair scheduler that runs
   the channel loop).
+- `a4mc-slack` is the reference socket dialect: `transport` (Web API,
+  both tokens via custody), `socket` (Socket Mode framing, ack/dedupe,
+  reconnect), `lower` (event callbacks → contract), `channel`
+  (descriptor + idempotent sends), `bridge` (LanePort turns). Socket
+  Mode needs no public callback, which is the pattern for a firewall
+  that forbids inbound ingress. A bridge turn waits for the lane call
+  and forwards `timeoutMs`; it never returns a local timeout while the
+  dispatch keeps running.
+- `a4mc-discord` is the reference Gateway-websocket dialect:
+  `transport` (REST identity/sends via custody), `gateway` (HELLO,
+  IDENTIFY/RESUME, heartbeat, zombie detection, dispatch dedupe,
+  reconnect state), `lower` (dispatch events → contract), `channel`
+  (descriptor + nonce-backed idempotent sends with safe 2,000-character
+  splitting). The Gateway is outbound-only, so no public callback is
+  needed.
+- `a4mc-webhook` is the reference signed-HTTP dialect: verify the
+  HMAC-SHA256 signature over `timestamp.body` and a bounded timestamp
+  window before parsing, then lower the contract JSON. It is
+  receive-only, declares every send feature unsupported, and may
+  suppress bounded replays by verified signature.

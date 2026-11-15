@@ -1,0 +1,20 @@
+[package]
+name = "a4mc-webhook"
+description = "A4MC signed HTTP webhook dialect: HMAC-SHA256 signature verification with a bounded timestamp window, fail-closed rejection, and normalized channel updates onto the a4mc contract."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+version = "0.1.0"
+
+# This dialect owns the inbound signed-HTTP boundary only: request
+# verification and normalized update lowering. It has no network code and
+# no outbound platform surface; the composing host owns the HTTP server,
+# and the signing secret resolves only through the host-installed
+# `a4mc::custody` port.
+[dependencies]
+a4mc.workspace = true
+hmac.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

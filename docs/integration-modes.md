@@ -13,6 +13,9 @@ draw on belong to the host process.
 [dependencies]
 a4mc = "0.1"
 a4mc-telegram = "0.1"
+a4mc-slack = "0.1"
+a4mc-discord = "0.1"
+a4mc-webhook = "0.1"
 ```
 
 ```rust
@@ -26,12 +29,63 @@ let store = a4mc_telegram::BindingStore::open_in(&state_dir)?;
 a4mc_telegram::run_channel_loop(transport, store, RuntimeConfig::default())?;
 ```
 
+Slack runs the same composition over Socket Mode, so it needs no public
+callback URL. Custody answers `slack-app` with the app-level Socket Mode
+token and `slack` with the bot token; the receive loop opens a
+short-lived websocket and acknowledges envelopes before dispatch.
+
+```rust
+let api = std::sync::Arc::new(a4mc_slack::live_api(None)?);
+let channel = std::sync::Arc::new(a4mc_slack::SlackChannel::new(std::sync::Arc::clone(&api)));
+let mut handler = MySlackHandler { channel };              // SocketHandler
+a4mc_slack::run_socket_mode(
+    &*api,
+    &a4mc_slack::LiveSocketConnector,
+    &mut handler,
+    &a4mc_slack::SocketModeConfig::default(),
+)?;
+```
+
+Discord runs the same composition over its Gateway websocket: HELLO,
+IDENTIFY/RESUME, heartbeats and reconnect framing are the adapter's
+job, so no public callback is needed. Custody answers `discord` with the
+bot token; the REST client uses the same custody-resolved token the
+Gateway loop identifies with.
+
+```rust
+let api = std::sync::Arc::new(a4mc_discord::live_api(None)?);
+let channel = std::sync::Arc::new(a4mc_discord::DiscordChannel::new(std::sync::Arc::clone(&api)));
+let mut handler = MyDiscordHandler { channel };            // GatewayHandler
+a4mc_discord::run_gateway(
+    &a4mc_discord::LiveGatewayConnector,
+    api.token(),
+    &mut handler,
+    &a4mc_discord::GatewayModeConfig::default(),
+)?;
+```
+
+A webhook host owns the HTTP server and adapts its request into
+`WebhookRequest`; the dialect verifies the HMAC-SHA256 signature and
+timestamp window before parsing, then lowers the contract JSON. Custody
+answers `webhook` with the signing secret. Exact replays inside the
+window can be acknowledged without running the update again.
+
+```rust
+let receiver = a4mc_webhook::WebhookReceiver::from_custody(300)?;
+let request = a4mc_webhook::WebhookRequest::new(method, body)
+    .with_header(a4mc_webhook::TIMESTAMP_HEADER, timestamp)
+    .with_header(a4mc_webhook::SIGNATURE_HEADER, signature);
+match receiver.receive(&request, now_unix)? {
+    a4mc_webhook::DeliveryOutcome::Event(delivery) => handle(delivery.event),
+    a4mc_webhook::DeliveryOutcome::Duplicate => {}          // answer 2xx
+}
+```
+
 The adapter owns the platform's receive mechanism and send surface —
-polling, update lowering, outbound sends with idempotency dedupe, the
-slash-command surface, the bounded fair scheduler. The host owns where
-the token lives, agent admission, pairing approval and the readiness
-hook (`RuntimeConfig::on_started`, invoked once after the Bot API
-handshake).
+polling, Socket Mode, the Discord Gateway or signed HTTP receive, update
+lowering, outbound sends with idempotency dedupe, and the channel's own
+UX. The host owns where tokens live, agent admission, pairing approval
+and any readiness hook.
 
 ## Dialect — implement the contract
 
@@ -42,7 +96,9 @@ the platform allows, and publish a `ChannelDescriptor` through
 `ChannelAdapter::descriptor` that reports each `UpdateKind` and
 `SendFeature` as `native`, `adapted` or `unsupported`. A dialect
 depends on `a4mc` and on no sibling dialect; it resolves tokens only
-through the `CustodyPort`. `a4mc-telegram` is the reference dialect.
+through the `CustodyPort`. `a4mc-telegram` (poll), `a4mc-slack` (Socket
+Mode), `a4mc-discord` (Gateway websocket) and `a4mc-webhook` (signed
+HTTP) are the reference dialects.
 
 ## Skills
 

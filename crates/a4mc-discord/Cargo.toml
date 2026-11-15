@@ -1,0 +1,23 @@
+[package]
+name = "a4mc-discord"
+description = "A4MC Discord dialect: Gateway websocket receive with heartbeat, identify and resume, Discord event lowering onto the a4mc channel contract, normalized REST sends with nonce-backed idempotency dedupe, and custody port integration."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+version = "0.1.0"
+
+# The dialect owns the Discord side of the boundary only. The bot token
+# resolves through the host-installed `a4mc::custody` port — the crate
+# never reads keychains, files or environment for it. Discord's Gateway
+# is a persistent outbound websocket, so no public callback or inbound
+# ingress is required.
+[dependencies]
+a4mc.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tungstenite.workspace = true
+ureq.workspace = true
+zeroize.workspace = true

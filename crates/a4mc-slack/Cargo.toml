@@ -1,0 +1,25 @@
+[package]
+name = "a4mc-slack"
+description = "A4MC Slack dialect: Socket Mode receive inside enterprise firewalls with no public callback, Slack event lowering onto the a4mc channel contract, normalized outbound sends, and lane/custody port integration."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+version = "0.1.0"
+
+# The dialect owns the Slack side of the boundary only. The app-level
+# Socket Mode token and the bot token resolve through the host-installed
+# `a4mc::custody` port — the crate never reads keychains, files or
+# environment for them — and local agent work runs through the
+# host-installed `a4mc::lane` port. Socket Mode is a persistent
+# bidirectional websocket, so no inbound callback or public ingress is
+# required.
+[dependencies]
+a4mc.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tungstenite.workspace = true
+ureq.workspace = true
+zeroize.workspace = true
