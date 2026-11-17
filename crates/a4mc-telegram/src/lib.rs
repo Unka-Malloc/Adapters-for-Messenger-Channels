@@ -31,16 +31,21 @@ mod private_io;
 pub mod runtime;
 pub mod transport;
 
-pub use binding::{BINDING_SCHEMA, BindingStore, ChatBinding, PairingRecord};
+pub use binding::{BINDING_SCHEMA, BindingStore, ChatBinding, DroppedUpdate, PairingRecord};
 pub use channel::{CHANNEL, TelegramChannel, descriptor};
 pub use control::{ControlCommand, ControlOutcome, parse_control_command};
 pub use inbound::{InboundKind, InboundMessage, MediaRef, ReplyRef};
 pub use lower::{lower_event, lower_message, lower_update};
-pub use runtime::{RuntimeConfig, run_channel_loop};
+pub use runtime::{OnEvent, OnStarted, RuntimeConfig, run_channel_loop};
 pub use transport::{
     BotIdentity, BotTransport, LiveBotTransport, MockBotTransport, TelegramApiError, Update,
     bot_commands, live_transport, validate_bot_token,
 };
+
+/// The lane port is process-wide; test modules that install it must
+/// serialize against every other module doing the same.
+#[cfg(test)]
+pub(crate) static LANE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// This dialect's channel identifier on the a4mc contract.
 pub fn channel_id() -> a4mc::ChannelId {

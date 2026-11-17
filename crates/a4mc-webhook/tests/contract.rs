@@ -62,8 +62,19 @@ fn full_message() -> InboundMessage {
 }
 
 fn secret() -> WebhookSecret {
-    WebhookSecret::new(SecretToken::try_from_string("fixture-webhook-secret".into()).unwrap())
-        .unwrap()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let key = format!(
+        "a4mc-webhook-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    );
+    WebhookSecret::new(SecretToken::try_from_string(key).unwrap()).unwrap()
 }
 
 #[test]
@@ -71,11 +82,12 @@ fn signed_full_message_crosses_the_public_receiver_without_field_loss() {
     let update = InboundUpdate::Message(full_message());
     let body = serde_json::to_vec(&update).unwrap();
     let timestamp = 1_700_000_000u64;
+    let key = secret();
     let request = WebhookRequest::new("POST", body.clone())
         .with_header(TIMESTAMP_HEADER, timestamp.to_string())
-        .with_header(SIGNATURE_HEADER, sign(&secret(), timestamp, &body));
+        .with_header(SIGNATURE_HEADER, sign(&key, timestamp, &body));
 
-    let receiver = WebhookReceiver::new(WebhookVerifier::new(secret(), 300));
+    let receiver = WebhookReceiver::new(WebhookVerifier::new(key, 300));
     let DeliveryOutcome::Event(delivery) = receiver.receive(&request, timestamp).unwrap() else {
         panic!("expected a verified event");
     };

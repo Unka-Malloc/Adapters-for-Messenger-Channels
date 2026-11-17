@@ -13,7 +13,23 @@ use a4mc_discord::{
 use serde_json::{Value, json};
 use std::net::TcpListener;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Test credential material is minted per run; no static token literal
+/// is committed.
+fn fixture_token() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "a4mc-discord-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    )
+}
 
 struct ReplyHandler {
     channel: Arc<DiscordChannel<MockDiscordApi>>,
@@ -46,6 +62,8 @@ impl GatewayHandler for ReplyHandler {
 fn gateway_dispatch_is_lowered_and_answered_over_the_rest_api() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let token_value = fixture_token();
+    let server_token = token_value.clone();
     let server = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         let mut socket = tungstenite::accept(stream).unwrap();
@@ -58,7 +76,7 @@ fn gateway_dispatch_is_lowered_and_answered_over_the_rest_api() {
         let identify = socket.read().unwrap();
         let identify: Value = serde_json::from_str(identify.to_text().unwrap()).unwrap();
         assert_eq!(identify["op"], json!(2));
-        assert_eq!(identify["d"]["token"], json!("fixture-discord-value"));
+        assert_eq!(identify["d"]["token"], json!(server_token));
 
         socket
             .send(tungstenite::Message::text(
@@ -114,7 +132,7 @@ fn gateway_dispatch_is_lowered_and_answered_over_the_rest_api() {
         events: Vec::new(),
         receipts: Vec::new(),
     };
-    let token = SecretToken::try_from_string("fixture-discord-value".into()).unwrap();
+    let token = SecretToken::try_from_string(token_value).unwrap();
     let mut connection = LiveGatewayConnector
         .connect(&GatewayUrl::new(format!("ws://127.0.0.1:{port}/?v=10")))
         .unwrap();

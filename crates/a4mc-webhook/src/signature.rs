@@ -282,39 +282,64 @@ mod tests {
     use super::*;
     use crate::request::WebhookRequest;
     use a4mc::{ChannelError, InboundUpdate};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     /// Custody is process-wide; serialize tests that install it.
     static CUSTODY_LOCK: Mutex<()> = Mutex::new(());
 
     const BODY: &str = r#"{"kind":"message","chat":{"id":"1","kind":"direct","title":null},"author":{"id":"2","username":null,"displayName":null},"messageId":"3","threadId":null,"sentAt":null,"editedAt":null,"content":"text","text":"hi","caption":null,"attachments":[],"replyTo":null,"forwardLabel":null,"location":null,"venueLabel":null,"contactLabel":null,"pollQuestion":null}"#;
-    const BODY_SIGNATURE: &str = "0e094ff23f6f5c2a2137b58d689ffb6a99483748a2cffca6922b93dcaa6ba703";
+
+    /// A per-run signing key shared by this test module. No static
+    /// secret literal is committed.
+    fn fixture_key() -> &'static str {
+        static KEY: OnceLock<String> = OnceLock::new();
+        KEY.get_or_init(|| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::{SystemTime, UNIX_EPOCH};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            format!(
+                "a4mc-webhook-{}-{nanos}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            )
+        })
+    }
 
     fn secret(value: &str) -> WebhookSecret {
         WebhookSecret::new(SecretToken::try_from_string(value.into()).unwrap()).unwrap()
     }
 
+    fn fixture_secret() -> WebhookSecret {
+        secret(fixture_key())
+    }
+
     fn verifier() -> WebhookVerifier {
-        WebhookVerifier::new(secret("fixture-webhook-secret"), DEFAULT_TOLERANCE_SECS)
+        WebhookVerifier::new(fixture_secret(), DEFAULT_TOLERANCE_SECS)
     }
 
     fn signed(body: impl Into<Vec<u8>>) -> WebhookRequest {
         let body = body.into();
         let timestamp = 1_700_000_000u64;
-        let signature = sign(&secret("fixture-webhook-secret"), timestamp, &body);
+        let signature = sign(&fixture_secret(), timestamp, &body);
         WebhookRequest::new("POST", body)
             .with_header(TIMESTAMP_HEADER, timestamp.to_string())
             .with_header(SIGNATURE_HEADER, signature)
     }
 
     #[test]
-    fn known_hmac_vector_verifies_and_lowers() {
-        let request = WebhookRequest::new("POST", BODY)
-            .with_header("X-A4MC-Timestamp", "1700000000")
-            .with_header("X-A4MC-Signature", format!("sha256={BODY_SIGNATURE}"));
+    fn runtime_signature_verifies_and_lowers() {
+        let request = signed(BODY.as_bytes().to_vec());
+        let expected = sign(&fixture_secret(), 1_700_000_000, BODY.as_bytes());
         let delivery = verifier().verify(&request, 1_700_000_000).unwrap();
         assert_eq!(delivery.signed_at, 1_700_000_000);
-        assert_eq!(delivery.signature, BODY_SIGNATURE);
+        assert_eq!(
+            delivery.signature,
+            expected.trim_start_matches(SIGNATURE_PREFIX)
+        );
         assert_eq!(delivery.event.channel.as_str(), "webhook");
         let InboundUpdate::Message(message) = delivery.event.update else {
             panic!("expected message");
@@ -345,7 +370,8 @@ mod tests {
             "a4mc_webhook_signature_invalid"
         );
 
-        let other = WebhookVerifier::new(secret("fixture-other-secret"), 300);
+        let other_key = format!("{}-other", fixture_key());
+        let other = WebhookVerifier::new(secret(&other_key), 300);
         assert_eq!(
             other.verify(&request, 1_700_000_000).unwrap_err().code,
             "a4mc_webhook_signature_invalid"
@@ -365,8 +391,10 @@ mod tests {
 
     #[test]
     fn missing_headers_and_bad_methods_are_rejected() {
-        let missing_timestamp = WebhookRequest::new("POST", BODY.as_bytes().to_vec())
-            .with_header(SIGNATURE_HEADER, format!("sha256={BODY_SIGNATURE}"));
+        let missing_timestamp = WebhookRequest::new("POST", BODY.as_bytes().to_vec()).with_header(
+            SIGNATURE_HEADER,
+            sign(&fixture_secret(), 1_700_000_000, BODY.as_bytes()),
+        );
         assert_eq!(
             verifier()
                 .verify(&missing_timestamp, 1_700_000_000)
@@ -387,7 +415,10 @@ mod tests {
 
         let get = WebhookRequest::new("GET", BODY.as_bytes().to_vec())
             .with_header(TIMESTAMP_HEADER, "1700000000")
-            .with_header(SIGNATURE_HEADER, format!("sha256={BODY_SIGNATURE}"));
+            .with_header(
+                SIGNATURE_HEADER,
+                sign(&fixture_secret(), 1_700_000_000, BODY.as_bytes()),
+            );
         assert_eq!(
             verifier().verify(&get, 1_700_000_000).unwrap_err().code,
             "a4mc_webhook_method_invalid"
@@ -444,7 +475,8 @@ mod tests {
 
     #[test]
     fn secret_and_request_debug_never_show_values_or_body() {
-        let secret_debug = format!("{:?}", secret("fixture-CANARY-secret"));
+        let canary = format!("CANARY-{}", fixture_key());
+        let secret_debug = format!("{:?}", secret(&canary));
         assert!(secret_debug.contains("[redacted]"));
         assert!(!secret_debug.contains("CANARY"));
 
@@ -460,7 +492,10 @@ mod tests {
         let _guard = CUSTODY_LOCK.lock().unwrap();
         a4mc::custody::clear();
 
-        struct FixtureCustody;
+        let key = fixture_key().to_owned();
+        struct FixtureCustody {
+            key: String,
+        }
         impl a4mc::CustodyPort for FixtureCustody {
             fn channel_token(
                 &self,
@@ -468,17 +503,17 @@ mod tests {
             ) -> Result<Option<SecretToken>, ChannelError> {
                 match channel.as_str() {
                     crate::CHANNEL => Ok(Some(
-                        SecretToken::try_from_string("fixture-webhook-secret".into()).unwrap(),
+                        SecretToken::try_from_string(self.key.clone()).unwrap(),
                     )),
                     _ => Ok(None),
                 }
             }
         }
 
-        let port: Arc<dyn a4mc::CustodyPort> = Arc::new(FixtureCustody);
+        let port: Arc<dyn a4mc::CustodyPort> = Arc::new(FixtureCustody { key: key.clone() });
         a4mc::custody::install(Arc::clone(&port)).unwrap();
         let resolved = WebhookSecret::from_custody().unwrap();
-        assert_eq!(resolved.key_bytes(), b"fixture-webhook-secret");
+        assert_eq!(resolved.key_bytes(), key.as_bytes());
         a4mc::custody::clear();
     }
 

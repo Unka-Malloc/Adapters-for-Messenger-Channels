@@ -33,10 +33,9 @@ pub struct RuntimeConfig {
     pub stop: Arc<AtomicBool>,
     pub worker_count: usize,
     pub max_admitted: usize,
-    /// Bound on one agent turn. A lane call that outlives the deadline
-    /// is abandoned and reported as `a4mc_telegram_turn_timeout`, so a
-    /// hung turn can never pin all workers and stall shutdown. Must be
-    /// nonzero.
+    /// Forwarded to the lane as `timeoutMs` for one agent turn. The lane
+    /// owns bounding the work; the runtime never abandons a paid turn on
+    /// a local elapsed-time cutoff.
     pub turn_deadline: Duration,
     /// Consecutive `getUpdates` failures tolerated before the loop
     /// surfaces `a4mc_telegram_poll_failed` to the host — an outage or
@@ -46,10 +45,21 @@ pub struct RuntimeConfig {
     /// command registration) succeeds — the host's readiness hook for
     /// status files, supervisors or UI. The adapter owns no such state.
     pub on_started: Option<OnStarted>,
+    /// Host observer for a fetched update that carries no message body
+    /// this channel can dispatch (dice/game/service payloads). The
+    /// lowered event is passed so the host sees the gap instead of the
+    /// cursor silently advancing past it. When no hook is mounted the
+    /// runtime persists the update id in the binding store, so the loss
+    /// is durable and inspectable rather than silent.
+    pub on_event: Option<OnEvent>,
 }
 
 /// The readiness hook invoked once after a successful Bot API handshake.
 pub type OnStarted = Box<dyn FnOnce(&BotIdentity) + Send>;
+/// The host observer for updates this runtime cannot dispatch as a
+/// message. Returning an error leaves the durable cursor before the
+/// update, so it is redelivered rather than acknowledged unseen.
+pub type OnEvent = Box<dyn FnMut(&a4mc::ChannelEvent) -> Result<()> + Send>;
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -61,6 +71,7 @@ impl Default for RuntimeConfig {
             turn_deadline: Duration::from_secs(300),
             max_poll_failures: 8,
             on_started: None,
+            on_event: None,
         }
     }
 }
@@ -290,6 +301,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     let workers = scheduler.spawn_workers(config.worker_count, processor)?;
 
     let mut pending: VecDeque<InboundMessage> = VecDeque::new();
+    let mut on_event = config.on_event.take();
     let poll_result = poll_updates(
         &*transport,
         &scheduler,
@@ -297,6 +309,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         &config,
         &mut offset,
         &mut pending,
+        &mut on_event,
     );
     // Fail-closed on every exit: raising stop before drain/join releases
     // workers parked on `wake` — a fatal poll error that left stop unset
@@ -320,6 +333,7 @@ fn poll_updates<T: BotTransport>(
     config: &RuntimeConfig,
     offset: &mut i64,
     pending: &mut VecDeque<InboundMessage>,
+    on_event: &mut Option<OnEvent>,
 ) -> Result<()> {
     let mut consecutive_failures = 0u32;
     while !config.stop.load(Ordering::SeqCst) {
@@ -354,11 +368,42 @@ fn poll_updates<T: BotTransport>(
             };
             let mut advanced = false;
             for update in updates {
-                *offset = update.update_id + 1;
-                advanced = true;
-                if let Some(message) = update.message {
-                    pending.push_back(message);
+                // The cursor is monotonic: a transport that redelivers an
+                // update below the durable cursor must not drag the offset
+                // back and replay already-confirmed turns. Telegram sends
+                // ascending update ids, so a lower one is a stale replay.
+                let next = update.update_id.saturating_add(1);
+                if next <= *offset {
+                    continue;
                 }
+                // An update with no dispatchable message body (a
+                // dice/game/service payload, or an unmapped update
+                // type) is handed to the host hook when one is
+                // mounted. Without a hook the id is persisted before
+                // the cursor advances, so the gap is durable instead of
+                // vanishing silently.
+                match unhandled_kind(&update) {
+                    Some(raw_kind) => {
+                        let event = crate::lower::lower_event(&update);
+                        if let Some(on_event) = on_event.as_mut() {
+                            on_event(&event).map_err(|error| {
+                                anyhow!("a4mc_telegram_unhandled_event: {error}")
+                            })?;
+                        } else {
+                            store
+                                .lock()
+                                .unwrap()
+                                .record_dropped_update(update.update_id, raw_kind)?;
+                        }
+                    }
+                    None => {
+                        if let Some(message) = update.message {
+                            pending.push_back(message);
+                        }
+                    }
+                }
+                *offset = next;
+                advanced = true;
             }
             if advanced {
                 // Durable cursor: the platform has been told everything
@@ -371,6 +416,29 @@ fn poll_updates<T: BotTransport>(
         admit_available(scheduler, pending);
     }
     Ok(())
+}
+
+/// Classify an update the message-oriented runtime cannot dispatch.
+/// Returns the raw platform kind for the durable record; `None` means a
+/// normal message is queued for a worker.
+fn unhandled_kind(update: &crate::transport::Update) -> Option<&'static str> {
+    let Some(message) = update.message.as_ref() else {
+        return Some("unmapped_update");
+    };
+    if message.kind != crate::inbound::InboundKind::Unsupported {
+        return None;
+    }
+    let blank = |value: &Option<String>| {
+        value
+            .as_ref()
+            .map(|text| text.trim().is_empty())
+            .unwrap_or(true)
+    };
+    if blank(&message.text) && blank(&message.caption) {
+        Some(message.kind.as_str())
+    } else {
+        None
+    }
 }
 
 /// Next poll retry wait: exponential backoff (2s, doubling, capped)
@@ -645,14 +713,18 @@ fn handle_ordinary<T: BotTransport>(
         return Ok(());
     };
     let (reply, next_session) = send_turn(
+        message.chat_id,
         &agent_id,
         binding.session_id.as_deref(),
         text,
         turn_deadline,
     )
     .map_err(|error| anyhow!(error.to_string()))?;
+    // Persist the new session before telling the user the turn
+    // succeeded. If the store is unavailable (busy, read-only, full),
+    // the next message must not silently route to the old session.
     if !next_session.is_empty() && binding.session_id.as_deref() != Some(next_session.as_str()) {
-        let _ = store_set_session(store, message.chat_id, Some(next_session));
+        store_set_session(store, message.chat_id, Some(next_session))?;
     }
     send_reply(transport, message, &reply)?;
     Ok(())
@@ -789,12 +861,12 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    /// Turn deadline for handler tests: generous so only the dedicated
-    /// timeout test ever trips it.
+    /// Turn deadline for handler tests.
     const TEST_DEADLINE: Duration = Duration::from_secs(30);
-    /// Text that makes the synthetic lane's dispatch hang, so turn
-    /// deadline expiry is exercisable.
+    /// Text that makes the synthetic lane's dispatch outlive a tiny
+    /// caller deadline, so the wait-and-deliver behavior is exercisable.
     const BLOCKING_TURN_TEXT: &str = "a4mc-block-turn";
+    static LAST_TURN_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
 
     fn temp_root() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -864,8 +936,15 @@ mod tests {
             conversation_list: empty,
             open_or_resume: empty,
             dispatch: |operation, params| {
+                LAST_TURN_TIMEOUT_MS.store(
+                    params
+                        .get("timeoutMs")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0),
+                    Ordering::SeqCst,
+                );
                 if params.get("text").and_then(|value| value.as_str()) == Some(BLOCKING_TURN_TEXT) {
-                    thread::sleep(Duration::from_secs(30));
+                    thread::sleep(Duration::from_millis(150));
                 }
                 let _ = operation;
                 Ok(json!({"ok": true, "output": "synthetic", "sessionId": "synthetic"}))
@@ -881,8 +960,113 @@ mod tests {
         }
     }
 
+    /// Fails the first `getUpdates` with a throttled error, then delegates
+    /// to the inner mock. Lets the poll loop's 429 backoff and retry be
+    /// exercised without a live Bot API.
+    struct ThrottleOnceTransport {
+        inner: MockBotTransport,
+        get_updates_calls: AtomicUsize,
+        retry_after: u64,
+    }
+
+    impl ThrottleOnceTransport {
+        fn new(inner: MockBotTransport, retry_after: u64) -> Self {
+            Self {
+                inner,
+                get_updates_calls: AtomicUsize::new(0),
+                retry_after,
+            }
+        }
+    }
+
+    impl BotTransport for ThrottleOnceTransport {
+        fn get_me(&self) -> Result<BotIdentity, TelegramApiError> {
+            self.inner.get_me()
+        }
+        fn delete_webhook(&self) -> Result<(), TelegramApiError> {
+            self.inner.delete_webhook()
+        }
+        fn set_my_commands(&self, commands: &[(String, String)]) -> Result<(), TelegramApiError> {
+            self.inner.set_my_commands(commands)
+        }
+        fn get_updates(
+            &self,
+            offset: i64,
+            timeout_secs: u64,
+        ) -> Result<Vec<Update>, TelegramApiError> {
+            if self.get_updates_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.inner.observed_offsets.lock().unwrap().push(offset);
+                return Err(TelegramApiError::new(
+                    "a4mc_telegram_throttled",
+                    "getUpdates: Bot API rate limited",
+                )
+                .with_retry_after(Some(self.retry_after)));
+            }
+            self.inner.get_updates(offset, timeout_secs)
+        }
+        fn send_message(
+            &self,
+            chat_id: i64,
+            text: &str,
+            reply_to_message_id: Option<i64>,
+        ) -> Result<Vec<i64>, TelegramApiError> {
+            self.inner.send_message(chat_id, text, reply_to_message_id)
+        }
+    }
+
+    /// Replays its queued updates on the first call regardless of the
+    /// supplied offset, then delegates. Models a transport/server that
+    /// re-delivers below the durable cursor.
+    struct ReplayOnceTransport {
+        inner: MockBotTransport,
+        replayed: AtomicBool,
+    }
+
+    impl ReplayOnceTransport {
+        fn new(inner: MockBotTransport) -> Self {
+            Self {
+                inner,
+                replayed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl BotTransport for ReplayOnceTransport {
+        fn get_me(&self) -> Result<BotIdentity, TelegramApiError> {
+            self.inner.get_me()
+        }
+        fn delete_webhook(&self) -> Result<(), TelegramApiError> {
+            self.inner.delete_webhook()
+        }
+        fn set_my_commands(&self, commands: &[(String, String)]) -> Result<(), TelegramApiError> {
+            self.inner.set_my_commands(commands)
+        }
+        fn get_updates(
+            &self,
+            offset: i64,
+            timeout_secs: u64,
+        ) -> Result<Vec<Update>, TelegramApiError> {
+            if !self.replayed.swap(true, Ordering::SeqCst) {
+                self.inner.observed_offsets.lock().unwrap().push(offset);
+                return Ok(self.inner.updates.lock().unwrap().drain(..).collect());
+            }
+            self.inner.get_updates(offset, timeout_secs)
+        }
+        fn send_message(
+            &self,
+            chat_id: i64,
+            text: &str,
+            reply_to_message_id: Option<i64>,
+        ) -> Result<Vec<i64>, TelegramApiError> {
+            self.inner.send_message(chat_id, text, reply_to_message_id)
+        }
+    }
+
     #[test]
     fn start_issues_pairing_and_approve_enables_agent_command() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         install_synthetic_lane();
         let root = temp_root();
         let store = BindingStore::open_in(&root).unwrap();
@@ -919,7 +1103,7 @@ mod tests {
                 .any(|(_, body)| body.contains("Pairing code"))
         );
         assert!(messages.iter().any(|(_, body)| {
-            body.contains("Verified local agents") || body.contains("No verified local agents")
+            body.contains("Local agents") || body.contains("No local agents")
         }));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1269,6 +1453,9 @@ mod tests {
 
     #[test]
     fn restart_resumes_the_persisted_poll_cursor() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         install_synthetic_lane();
         let root = temp_root();
         let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
@@ -1356,6 +1543,233 @@ mod tests {
     }
 
     #[test]
+    fn failed_poll_does_not_advance_the_durable_cursor() {
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store.set_poll_offset(7).unwrap();
+        let transport = MockBotTransport {
+            fail_get_updates_with: Some(
+                TelegramApiError::new("a4mc_telegram_throttled", "Bot API rate limited")
+                    .with_retry_after(Some(1)),
+            ),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            max_poll_failures: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let error = run_channel_loop(transport, store, config).unwrap_err();
+        assert!(
+            error.to_string().contains("a4mc_telegram_poll_failed"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            7,
+            "a failed poll changed the durable cursor"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn throttled_poll_backs_off_then_retries_the_same_cursor() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let observed_offsets = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let transport = ThrottleOnceTransport::new(
+            MockBotTransport {
+                sent: Arc::clone(&sent),
+                observed_offsets: Arc::clone(&observed_offsets),
+                updates: Arc::new(Mutex::new(vec![Update {
+                    update_id: 9,
+                    message: Some(text_message(42, 42, Some("alice"), "/whoami", 9)),
+                }])),
+                ..MockBotTransport::default()
+            },
+            0,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let started = Instant::now();
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(15));
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "429 was retried without honoring the backoff: {elapsed:?}"
+        );
+        let offsets = observed_offsets.lock().unwrap();
+        assert_eq!(
+            offsets.first().copied(),
+            Some(0),
+            "initial cursor was not zero: {offsets:?}"
+        );
+        assert!(
+            offsets.iter().take(2).all(|offset| *offset == 0),
+            "cursor advanced on a throttled poll: {offsets:?}"
+        );
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            10,
+            "cursor was not persisted after the retried poll"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn message_less_update_is_reported_to_the_host_before_the_cursor_advances() {
+        let root = temp_root();
+        let observed_offsets = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let transport = MockBotTransport {
+            observed_offsets: Arc::clone(&observed_offsets),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 20,
+                message: None,
+            }])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(Mutex::new(Vec::<a4mc::ChannelEvent>::new()));
+        let observed_hook = Arc::clone(&observed);
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            on_event: Some(Box::new(move |event: &a4mc::ChannelEvent| {
+                observed_hook.lock().unwrap().push(event.clone());
+                Ok(())
+            })),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(
+            || observed_offsets.lock().unwrap().contains(&21),
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+
+        let events = observed.lock().unwrap();
+        assert_eq!(events.len(), 1, "the host did not observe the update");
+        assert!(matches!(
+            &events[0].update,
+            a4mc::InboundUpdate::Unsupported { raw_kind } if raw_kind == "unmapped_update"
+        ));
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            21,
+            "a message-less update did not advance the cursor"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn message_less_update_is_durably_recorded_without_a_host_hook() {
+        let root = temp_root();
+        let observed_offsets = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let transport = MockBotTransport {
+            observed_offsets: Arc::clone(&observed_offsets),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 20,
+                message: None,
+            }])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(
+            || observed_offsets.lock().unwrap().contains(&21),
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+
+        let reopened = BindingStore::open_in(&root).unwrap();
+        assert_eq!(reopened.poll_offset(), 21);
+        let dropped = reopened.dropped_updates();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].update_id, 20);
+        assert_eq!(dropped[0].raw_kind, "unmapped_update");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_transport_replay_is_not_served_twice() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store.set_poll_offset(5).unwrap();
+        drop(store);
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = ReplayOnceTransport::new(MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![
+                // Below the durable cursor: a stale re-delivery.
+                Update {
+                    update_id: 3,
+                    message: Some(text_message(42, 42, Some("alice"), "/whoami", 3)),
+                },
+                // The only update that is actually new.
+                Update {
+                    update_id: 8,
+                    message: Some(text_message(88, 88, Some("zoe"), "/whoami", 8)),
+                },
+            ])),
+            ..MockBotTransport::default()
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(|| !sent.lock().unwrap().is_empty(), Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+
+        let messages = sent.lock().unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "stale replayed update was served: {messages:?}"
+        );
+        assert_eq!(messages[0].0, 88);
+        drop(messages);
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            9,
+            "cursor regressed or failed to advance past the fresh update"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn capacity_wait_unblocks_when_stop_is_raised() {
         let stop = Arc::new(AtomicBool::new(false));
         let scheduler = Arc::new(Scheduler::new(1, Arc::clone(&stop)));
@@ -1379,10 +1793,25 @@ mod tests {
 
     #[test]
     fn retry_wait_honors_the_server_hint_and_stays_capped() {
-        let first = retry_wait(1, None);
-        assert!(first >= Duration::from_secs(2) && first <= Duration::from_secs(3));
+        assert_eq!(retry_wait(0, None), Duration::from_secs(1));
+        for (failures, low, high) in [
+            (1, 2, 3),
+            (2, 4, 6),
+            (3, 8, 12),
+            (4, 16, 24),
+            (5, 32, 48),
+            // The exponent is capped: further failures do not grow it.
+            (9, 32, 48),
+        ] {
+            let wait = retry_wait(failures, None);
+            assert!(
+                wait >= Duration::from_secs(low) && wait <= Duration::from_secs(high),
+                "failure {failures} waited {wait:?}, outside {low}..={high}s"
+            );
+        }
         // The platform's hint raises the wait beyond computed backoff.
         assert!(retry_wait(1, Some(30)) >= Duration::from_secs(30));
+        assert_eq!(retry_wait(1, Some(5)), Duration::from_secs(5));
         // An absurd hint is capped — the poller can never be parked.
         assert_eq!(
             retry_wait(8, Some(86_400)),
@@ -1436,7 +1865,10 @@ mod tests {
     }
 
     #[test]
-    fn turn_deadline_reports_timeout_instead_of_pinning_the_worker() {
+    fn turn_deadline_is_forwarded_and_the_lane_output_is_delivered() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         install_synthetic_lane();
         let root = temp_root();
         let mut store = BindingStore::open_in(&root).unwrap();
@@ -1444,18 +1876,80 @@ mod tests {
         store.approve(&pending.code).unwrap();
         store.set_agent(42, Some("codex".into())).unwrap();
         let store = Mutex::new(store);
-        let transport = MockBotTransport::default();
-        let error = handle_inbound(
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let started = Instant::now();
+        handle_inbound(
             &transport,
             &store,
             &BotIdentity::default(),
             &text_message(42, 42, Some("alice"), BLOCKING_TURN_TEXT, 1),
             Duration::from_millis(50),
         )
-        .unwrap_err();
+        .unwrap();
+        let elapsed = started.elapsed();
+
         assert!(
-            error.to_string().contains("a4mc_telegram_turn_timeout"),
-            "unexpected error: {error}"
+            elapsed >= Duration::from_millis(100),
+            "the runtime abandoned the lane at the local deadline: {elapsed:?}"
+        );
+        assert_eq!(
+            LAST_TURN_TIMEOUT_MS.load(Ordering::SeqCst),
+            50,
+            "the deadline must be forwarded as timeoutMs, not enforced locally"
+        );
+        let messages = sent.lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|(chat, text)| *chat == 42 && text == "synthetic"),
+            "the lane output was not delivered: {messages:?}"
+        );
+        drop(messages);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn set_session_write_failure_is_returned_before_the_success_reply() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+        store.approve(&pending.code).unwrap();
+        store.set_agent(42, Some("codex".into())).unwrap();
+        store.set_session(42, Some("old-session".into())).unwrap();
+        store.fail_next_write_for_test();
+        let store = Mutex::new(store);
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+
+        let error = handle_inbound(
+            &transport,
+            &store,
+            &BotIdentity::default(),
+            &text_message(42, 42, Some("alice"), "hello", 1),
+            TEST_DEADLINE,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("a4mc_telegram_state_write_failed"),
+            "the session write failure was not propagated: {error}"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the turn reported success before the new session was persisted"
         );
         let _ = std::fs::remove_dir_all(root);
     }

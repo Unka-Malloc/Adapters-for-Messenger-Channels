@@ -535,6 +535,23 @@ mod tests {
         SecretToken::try_from_string(value.into()).unwrap()
     }
 
+    /// Test credential material is minted per run; no static token
+    /// literal is committed.
+    fn fixture_token() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        format!(
+            "a4mc-slack-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+
     fn serve_once(status: u16, body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -581,7 +598,12 @@ mod tests {
         let _guard = CUSTODY_LOCK.lock().unwrap();
         a4mc::custody::clear();
 
-        struct FixtureCustody;
+        let app = fixture_token();
+        let bot = fixture_token();
+        struct FixtureCustody {
+            app: String,
+            bot: String,
+        }
         impl a4mc::CustodyPort for FixtureCustody {
             fn channel_token(
                 &self,
@@ -589,45 +611,44 @@ mod tests {
             ) -> Result<Option<SecretToken>, ChannelError> {
                 match channel.as_str() {
                     crate::APP_TOKEN_CHANNEL => Ok(Some(
-                        SecretToken::try_from_string("fixture-app-value".into()).unwrap(),
+                        SecretToken::try_from_string(self.app.clone()).unwrap(),
                     )),
                     crate::CHANNEL => Ok(Some(
-                        SecretToken::try_from_string("fixture-bot-value".into()).unwrap(),
+                        SecretToken::try_from_string(self.bot.clone()).unwrap(),
                     )),
                     _ => Ok(None),
                 }
             }
         }
 
-        let port: Arc<dyn a4mc::CustodyPort> = Arc::new(FixtureCustody);
+        let port: Arc<dyn a4mc::CustodyPort> = Arc::new(FixtureCustody {
+            app: app.clone(),
+            bot: bot.clone(),
+        });
         a4mc::custody::install(Arc::clone(&port)).unwrap();
         let tokens = SlackTokens::from_custody().unwrap();
-        assert_eq!(
-            tokens.app_token().expose_utf8().unwrap(),
-            "fixture-app-value"
-        );
-        assert_eq!(
-            tokens.bot_token().expose_utf8().unwrap(),
-            "fixture-bot-value"
-        );
+        assert_eq!(tokens.app_token().expose_utf8().unwrap(), app);
+        assert_eq!(tokens.bot_token().expose_utf8().unwrap(), bot);
         a4mc::custody::clear();
     }
 
     #[test]
     fn token_debug_is_redacted() {
-        let tokens =
-            SlackTokens::new(secret("fixture-app-value"), secret("fixture-bot-value")).unwrap();
+        let app = fixture_token();
+        let bot = fixture_token();
+        let tokens = SlackTokens::new(secret(&app), secret(&bot)).unwrap();
         let debug = format!("{tokens:?}");
         assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains("fixture-app-value"));
-        assert!(!debug.contains("fixture-bot-value"));
+        assert!(!debug.contains(app.as_str()));
+        assert!(!debug.contains(bot.as_str()));
     }
 
     #[test]
     fn token_shape_rejects_bounded_and_whitespace_values() {
-        assert!(SlackTokens::new(secret("fixture-app"), secret("fixture-bot")).is_ok());
+        let valid = fixture_token();
+        assert!(SlackTokens::new(secret(&valid), secret(&fixture_token())).is_ok());
         assert_eq!(
-            SlackTokens::new(secret(" "), secret("fixture-bot"))
+            SlackTokens::new(secret(" "), secret(&fixture_token()))
                 .unwrap_err()
                 .code,
             "a4mc_slack_token_invalid"
@@ -635,14 +656,15 @@ mod tests {
         assert_eq!(
             SlackTokens::new(
                 secret(&"a".repeat(MAX_TOKEN_BYTES + 1)),
-                secret("fixture-bot"),
+                secret(&fixture_token()),
             )
             .unwrap_err()
             .code,
             "a4mc_slack_token_invalid"
         );
+        let whitespace = format!("{} bot", fixture_token());
         assert_eq!(
-            SlackTokens::new(secret("fixture-app"), secret("fixture bot"))
+            SlackTokens::new(secret(&valid), secret(&whitespace))
                 .unwrap_err()
                 .code,
             "a4mc_slack_token_invalid"
@@ -659,17 +681,17 @@ mod tests {
 
     #[test]
     fn http_error_never_leaks_token_body_or_host() {
-        let token_value = "fixture-slack-bot-value";
+        let token_value = fixture_token();
         let body = "{\"ok\":false,\"error\":\"CANARY_BODY\"}";
         let (port, handle) = serve_once(500, body);
         let api = LiveSlackApi::new(
-            SlackTokens::new(secret("fixture-app-value"), secret(token_value)).unwrap(),
+            SlackTokens::new(secret(&fixture_token()), secret(&token_value)).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let error = api.auth_test().unwrap_err();
         handle.join().unwrap();
         assert_eq!(error.code, "a4mc_slack_api_failed");
-        assert!(!error.message.contains(token_value));
+        assert!(!error.message.contains(token_value.as_str()));
         assert!(!error.message.contains("CANARY_BODY"));
         assert!(!error.message.contains("127.0.0.1"));
     }
@@ -693,7 +715,7 @@ mod tests {
         let body = "{\"ok\":false,\"error\":\"channel_not_found\"}";
         let (port, handle) = serve_once(200, body);
         let api = LiveSlackApi::new(
-            SlackTokens::new(secret("fixture-app-value"), secret("fixture-bot-value")).unwrap(),
+            SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let error = api.auth_test().unwrap_err();
@@ -708,7 +730,7 @@ mod tests {
         let body = "{\"ok\":false,\"error\":\"invalid_auth\"}";
         let (port, handle) = serve_once(200, body);
         let api = LiveSlackApi::new(
-            SlackTokens::new(secret("fixture-app-value"), secret("fixture-bot-value")).unwrap(),
+            SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let error = api.auth_test().unwrap_err();
@@ -722,7 +744,7 @@ mod tests {
         let body = "{\"ok\":true,\"team_id\":\"T1\",\"team\":\"Team\",\"user_id\":\"U1\",\"user\":\"bot\",\"bot_id\":\"B1\",\"is_enterprise_install\":true}";
         let (port, handle) = serve_once(200, body);
         let api = LiveSlackApi::new(
-            SlackTokens::new(secret("fixture-app-value"), secret("fixture-bot-value")).unwrap(),
+            SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let identity = api.auth_test().unwrap();
@@ -738,7 +760,7 @@ mod tests {
         let body = "{\"ok\":true,\"channel\":\"C1\",\"ts\":\"1700000000.000100\"}";
         let (port, handle) = serve_once(200, body);
         let api = LiveSlackApi::new(
-            SlackTokens::new(secret("fixture-app-value"), secret("fixture-bot-value")).unwrap(),
+            SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let posted = api

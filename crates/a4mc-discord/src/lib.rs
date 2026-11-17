@@ -44,9 +44,10 @@ pub use channel::{CHANNEL, DiscordChannel, client_nonce, descriptor};
 pub use gateway::{
     DEFAULT_GATEWAY_URL, DEFAULT_INTENTS, GatewayConfig, GatewayConnection, GatewayConnector,
     GatewayHandler, GatewayModeConfig, GatewayPayload, GatewayRead, GatewaySession, GatewayUrl,
-    INTENT_DIRECT_MESSAGE_REACTIONS, INTENT_DIRECT_MESSAGES, INTENT_GUILD_MEMBERS,
-    INTENT_GUILD_MESSAGE_REACTIONS, INTENT_GUILD_MESSAGES, INTENT_GUILDS, LiveGatewayConnector,
-    SessionOutcome, run_gateway, run_gateway_session,
+    HANDLER_FAILED_CODE, INTENT_DIRECT_MESSAGE_REACTIONS, INTENT_DIRECT_MESSAGES,
+    INTENT_GUILD_MEMBERS, INTENT_GUILD_MESSAGE_REACTIONS, INTENT_GUILD_MESSAGES, INTENT_GUILDS,
+    LiveGatewayConnector, SessionOutcome, TERMINAL_CLOSE_CODE, is_terminal_close_code, run_gateway,
+    run_gateway_session,
 };
 pub use lower::{lower_event, lower_events, lower_update, parse_timestamp};
 pub use transport::{

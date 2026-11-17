@@ -447,6 +447,23 @@ mod tests {
         DiscordToken::new(secret(value)).unwrap()
     }
 
+    /// Test credential material is minted per run; no static token
+    /// literal is committed.
+    fn fixture_token() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        format!(
+            "a4mc-discord-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+
     fn serve_once(status: u16, body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -494,7 +511,10 @@ mod tests {
         let _guard = CUSTODY_LOCK.lock().unwrap();
         a4mc::custody::clear();
 
-        struct FixtureCustody;
+        let fixture = fixture_token();
+        struct FixtureCustody {
+            token: String,
+        }
         impl a4mc::CustodyPort for FixtureCustody {
             fn channel_token(
                 &self,
@@ -502,20 +522,19 @@ mod tests {
             ) -> Result<Option<SecretToken>, ChannelError> {
                 match channel.as_str() {
                     crate::CHANNEL => Ok(Some(
-                        SecretToken::try_from_string("fixture-discord-value".into()).unwrap(),
+                        SecretToken::try_from_string(self.token.clone()).unwrap(),
                     )),
                     _ => Ok(None),
                 }
             }
         }
 
-        let port: Arc<dyn a4mc::CustodyPort> = Arc::new(FixtureCustody);
+        let port: Arc<dyn a4mc::CustodyPort> = Arc::new(FixtureCustody {
+            token: fixture.clone(),
+        });
         a4mc::custody::install(Arc::clone(&port)).unwrap();
         let resolved = DiscordToken::from_custody().unwrap();
-        assert_eq!(
-            resolved.token().expose_utf8().unwrap(),
-            "fixture-discord-value"
-        );
+        assert_eq!(resolved.token().expose_utf8().unwrap(), fixture);
         a4mc::custody::clear();
     }
 
@@ -531,10 +550,10 @@ mod tests {
 
     #[test]
     fn token_debug_is_redacted_and_shape_is_bounded() {
-        let value = "fixture-discord-value";
-        let debug = format!("{:?}", token(value));
+        let value = fixture_token();
+        let debug = format!("{:?}", token(&value));
         assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains(value));
+        assert!(!debug.contains(value.as_str()));
         assert_eq!(
             DiscordToken::new(secret(" ")).unwrap_err().code,
             "a4mc_discord_token_invalid"
@@ -552,7 +571,7 @@ mod tests {
         let body = "{\"id\":\"U1\",\"username\":\"bot\",\"global_name\":\"Bot Name\",\"bot\":true}";
         let (port, handle) = serve_once(200, body);
         let api = LiveDiscordApi::new(
-            token("fixture-discord-value"),
+            token(&fixture_token()),
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let identity = api.current_user().unwrap();
@@ -568,7 +587,7 @@ mod tests {
         let body = "{\"id\":\"M1\",\"channel_id\":\"C1\"}";
         let (port, handle) = serve_once(200, body);
         let api = LiveDiscordApi::new(
-            token("fixture-discord-value"),
+            token(&fixture_token()),
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let posted = api
@@ -586,17 +605,17 @@ mod tests {
 
     #[test]
     fn http_error_never_leaks_token_or_body() {
-        let token_value = "fixture-discord-value";
+        let token_value = fixture_token();
         let body = "{\"message\":\"CANARY_BODY\",\"code\":50035}";
         let (port, handle) = serve_once(400, body);
         let api = LiveDiscordApi::new(
-            token(token_value),
+            token(&token_value),
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let error = api.current_user().unwrap_err();
         handle.join().unwrap();
         assert_eq!(error.code, "a4mc_discord_api_failed");
-        assert!(!error.message.contains(token_value));
+        assert!(!error.message.contains(token_value.as_str()));
         assert!(!error.message.contains("CANARY_BODY"));
         assert!(!error.message.contains("127.0.0.1"));
     }
@@ -606,7 +625,7 @@ mod tests {
         let body = "{\"message\":\"401: Unauthorized\",\"code\":0}";
         let (port, handle) = serve_once(401, body);
         let api = LiveDiscordApi::new(
-            token("fixture-discord-value"),
+            token(&fixture_token()),
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let error = api.current_user().unwrap_err();

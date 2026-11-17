@@ -24,8 +24,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STATE_FILE: &str = "bindings.json";
 const MAX_STATE_BYTES: usize = 256 * 1024;
+const MAX_DROPPED_UPDATES: usize = 256;
+const MAX_RAW_KIND_CHARS: usize = 64;
 const PAIRING_TTL: Duration = Duration::from_secs(60 * 60);
 pub const BINDING_SCHEMA: &str = "a4mc.telegram-bindings.v1";
+
+/// One platform update this runtime received but could not hand to the
+/// host as a message (a dice/game/service payload, or any update with no
+/// message body). Persisting the id makes the gap durable even when the
+/// host mounts no `on_event` hook, so advancing the poll cursor never
+/// silently discards it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DroppedUpdate {
+    pub update_id: i64,
+    pub raw_kind: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +75,10 @@ struct BindingDocument {
     /// before the cursor existed; older readers ignore the field.
     #[serde(default)]
     poll_offset: i64,
+    /// Bounded record of fetched updates the runtime did not turn into
+    /// host-visible messages. Older readers ignore the field.
+    #[serde(default)]
+    dropped_updates: Vec<DroppedUpdate>,
 }
 
 #[derive(Debug)]
@@ -68,6 +86,8 @@ pub struct BindingStore {
     path: PathBuf,
     lock: File,
     document: BindingDocument,
+    #[cfg(test)]
+    fail_next_write: bool,
 }
 
 impl BindingStore {
@@ -87,6 +107,8 @@ impl BindingStore {
             path,
             lock,
             document,
+            #[cfg(test)]
+            fail_next_write: false,
         };
         Ok(store)
     }
@@ -106,6 +128,10 @@ impl BindingStore {
     /// merge, and atomic save so concurrent writers never silently overwrite
     /// each other's changes.
     fn mutate<R>(&mut self, change: impl FnOnce(&mut BindingDocument) -> Result<R>) -> Result<R> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_write) {
+            return Err(anyhow!("a4mc_telegram_state_write_failed"));
+        }
         self.lock
             .lock_exclusive()
             .map_err(|_| anyhow!("a4mc_telegram_bindings_lock_failed"))?;
@@ -264,6 +290,13 @@ impl BindingStore {
         self.document.poll_offset
     }
 
+    /// Fail the next mutation, so a caller's error path can be exercised
+    /// without relying on OS permissions that root can bypass.
+    #[cfg(test)]
+    pub fn fail_next_write_for_test(&mut self) {
+        self.fail_next_write = true;
+    }
+
     /// Persist the poll cursor under the same lock-reload-merge-write
     /// protocol as every mutation. A crash before this write replays at
     /// most the in-flight batch; after it, a restart resumes instead of
@@ -273,6 +306,37 @@ impl BindingStore {
             document.poll_offset = offset;
             Ok(())
         })
+    }
+
+    /// Persist one update id the runtime could not hand to the host as a
+    /// message, bounded to the newest [`MAX_DROPPED_UPDATES`] entries.
+    /// Writing this record before the cursor advances is what keeps a
+    /// dice/game/service payload from vanishing without a trace.
+    pub fn record_dropped_update(&mut self, update_id: i64, raw_kind: &str) -> Result<()> {
+        let raw_kind: String = raw_kind.chars().take(MAX_RAW_KIND_CHARS).collect();
+        self.mutate(|document| {
+            document
+                .dropped_updates
+                .retain(|item| item.update_id != update_id);
+            document.dropped_updates.push(DroppedUpdate {
+                update_id,
+                raw_kind,
+            });
+            let excess = document
+                .dropped_updates
+                .len()
+                .saturating_sub(MAX_DROPPED_UPDATES);
+            if excess > 0 {
+                document.dropped_updates.drain(..excess);
+            }
+            Ok(())
+        })
+    }
+
+    /// The bounded durable record of updates the runtime could not turn
+    /// into host-visible messages, newest last.
+    pub fn dropped_updates(&self) -> Vec<DroppedUpdate> {
+        self.document.dropped_updates.clone()
     }
 }
 
@@ -323,6 +387,7 @@ fn read_document(path: &Path) -> Result<BindingDocument> {
             pairings: Vec::new(),
             chats: BTreeMap::new(),
             poll_offset: 0,
+            dropped_updates: Vec::new(),
         }),
     }
 }
@@ -434,6 +499,7 @@ mod tests {
             assert_eq!(reread.poll_offset(), 41);
         });
     }
+
 
     #[test]
     fn stale_schema_file_is_refused_and_left_untouched() {

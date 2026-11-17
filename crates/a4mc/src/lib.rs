@@ -56,6 +56,23 @@ mod tests {
     /// Port statics are process-wide; serialize port tests behind one lock.
     static PORT_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Test credential material is minted per run; no static secret
+    /// literal is committed.
+    fn fixture_secret() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        format!(
+            "a4mc-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+
     fn sample_message() -> InboundMessage {
         InboundMessage {
             update_cursor: Some("42".into()),
@@ -146,11 +163,11 @@ mod tests {
 
     #[test]
     fn secret_token_never_shows_bytes() {
-        let value = "fixture-value-not-a-token";
-        let token = SecretToken::try_from_string(value.into()).unwrap();
+        let value = fixture_secret();
+        let token = SecretToken::try_from_string(value.clone()).unwrap();
         let debug = format!("{token:?}");
         assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains(value));
+        assert!(!debug.contains(value.as_str()));
         assert_eq!(token.expose_utf8().unwrap(), value);
         assert!(SecretToken::try_from_bytes(Vec::new()).is_err());
         assert!(SecretToken::try_from_bytes(vec![0u8; MAX_SECRET_BYTES + 1]).is_err());
@@ -223,8 +240,9 @@ mod tests {
             "a4mc_custody_port_unavailable"
         );
 
+        let fixture_token = fixture_secret();
         let port: Arc<dyn CustodyPort> = Arc::new(FixtureCustody {
-            token: Some("fixture-custody-value".into()),
+            token: Some(fixture_token.clone()),
         });
         custody::install(Arc::clone(&port)).unwrap();
         custody::install(Arc::clone(&port)).unwrap(); // same port: idempotent
@@ -233,7 +251,7 @@ mod tests {
             .channel_token(&ChannelId::from("fixture"))
             .unwrap()
             .unwrap();
-        assert_eq!(token.expose_utf8().unwrap(), "fixture-custody-value");
+        assert_eq!(token.expose_utf8().unwrap(), fixture_token);
 
         let other: Arc<dyn CustodyPort> = Arc::new(FixtureCustody { token: None });
         assert!(custody::install(other).is_err());

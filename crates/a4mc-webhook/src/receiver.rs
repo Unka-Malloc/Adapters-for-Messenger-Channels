@@ -106,22 +106,40 @@ mod tests {
     use super::*;
     use crate::signature::{SIGNATURE_HEADER, TIMESTAMP_HEADER, WebhookSecret, sign};
     use a4mc::SecretToken;
+    use std::sync::OnceLock;
 
     const BODY: &str = r#"{"kind":"message","chat":{"id":"1","kind":"direct","title":null},"author":{"id":"2","username":null,"displayName":null},"messageId":"3","threadId":null,"sentAt":null,"editedAt":null,"content":"text","text":"hi","caption":null,"attachments":[],"replyTo":null,"forwardLabel":null,"location":null,"venueLabel":null,"contactLabel":null,"pollQuestion":null}"#;
 
+    /// A per-run signing key shared by this test module. No static
+    /// secret literal is committed.
+    fn fixture_key() -> &'static str {
+        static KEY: OnceLock<String> = OnceLock::new();
+        KEY.get_or_init(|| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::{SystemTime, UNIX_EPOCH};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            format!(
+                "a4mc-webhook-{}-{nanos}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            )
+        })
+    }
+
+    fn fixture_secret() -> WebhookSecret {
+        WebhookSecret::new(SecretToken::try_from_string(fixture_key().into()).unwrap()).unwrap()
+    }
+
     fn receiver() -> WebhookReceiver {
-        let secret = WebhookSecret::new(
-            SecretToken::try_from_string("fixture-webhook-secret".into()).unwrap(),
-        )
-        .unwrap();
-        WebhookReceiver::new(WebhookVerifier::new(secret, 300))
+        WebhookReceiver::new(WebhookVerifier::new(fixture_secret(), 300))
     }
 
     fn request(timestamp: u64, body: &str) -> WebhookRequest {
-        let secret = WebhookSecret::new(
-            SecretToken::try_from_string("fixture-webhook-secret".into()).unwrap(),
-        )
-        .unwrap();
+        let secret = fixture_secret();
         WebhookRequest::new("POST", body.as_bytes().to_vec())
             .with_header(TIMESTAMP_HEADER, timestamp.to_string())
             .with_header(SIGNATURE_HEADER, sign(&secret, timestamp, body.as_bytes()))

@@ -41,7 +41,10 @@ pub const OP_HEARTBEAT_ACK: u8 = 11;
 /// Guild lifecycle events.
 pub const INTENT_GUILDS: u64 = 1 << 0;
 /// Guild member add/remove events. Discord marks this a privileged
-/// intent: an application without the grant receives no member events.
+/// intent: an application without the grant receives no member events,
+/// and enabling it without the grant makes the Gateway close with 4014.
+/// It is therefore **opt-in** — add it to [`GatewayConfig::intents`]
+/// only after Discord has granted the intent.
 pub const INTENT_GUILD_MEMBERS: u64 = 1 << 1;
 /// Guild message create/update/delete events.
 pub const INTENT_GUILD_MESSAGES: u64 = 1 << 9;
@@ -52,13 +55,29 @@ pub const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
 /// Direct message reaction add/remove events.
 pub const INTENT_DIRECT_MESSAGE_REACTIONS: u64 = 1 << 13;
 
-/// The intents needed to receive every update kind this dialect lowers.
+/// The intents needed to receive every update kind this dialect lowers,
+/// excluding the privileged [`INTENT_GUILD_MEMBERS`] opt-in.
 pub const DEFAULT_INTENTS: u64 = INTENT_GUILDS
-    | INTENT_GUILD_MEMBERS
     | INTENT_GUILD_MESSAGES
     | INTENT_GUILD_MESSAGE_REACTIONS
     | INTENT_DIRECT_MESSAGES
     | INTENT_DIRECT_MESSAGE_REACTIONS;
+
+/// Error code for a host handler that failed a dispatched event. The
+/// gateway returns this to its caller instead of treating it as a
+/// transient socket failure and reconnecting over the event.
+pub const HANDLER_FAILED_CODE: &str = "a4mc_discord_handler_failed";
+/// Error code for a Gateway close code that Discord documents as
+/// non-reconnectable (bad token, bad shard, bad intents, ...).
+pub const TERMINAL_CLOSE_CODE: &str = "a4mc_discord_gateway_terminal_close";
+
+/// Close codes Discord documents as `Reconnect = false`. Reconnecting
+/// with the same configuration can only fail the same way, so the
+/// gateway surfaces the code instead of burning a 1-second handshake
+/// loop forever.
+pub fn is_terminal_close_code(code: u16) -> bool {
+    matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
+}
 
 const MAX_GATEWAY_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
@@ -140,8 +159,9 @@ pub enum GatewayRead {
     Text(String),
     /// No frame arrived before the read timeout; a heartbeat is due.
     Timeout,
-    /// The peer closed the socket.
-    Closed,
+    /// The peer closed the socket, carrying the websocket close code
+    /// when the peer supplied one.
+    Closed(Option<u16>),
 }
 
 /// A Gateway websocket connection.
@@ -217,9 +237,13 @@ impl GatewayConnection for LiveGatewayConnection {
                 | Ok(tungstenite::Message::Ping(_))
                 | Ok(tungstenite::Message::Pong(_))
                 | Ok(tungstenite::Message::Frame(_)) => {}
-                Ok(tungstenite::Message::Close(_)) => return Ok(GatewayRead::Closed),
+                Ok(tungstenite::Message::Close(frame)) => {
+                    return Ok(GatewayRead::Closed(
+                        frame.map(|frame| u16::from(frame.code)),
+                    ));
+                }
                 Err(tungstenite::Error::ConnectionClosed)
-                | Err(tungstenite::Error::AlreadyClosed) => return Ok(GatewayRead::Closed),
+                | Err(tungstenite::Error::AlreadyClosed) => return Ok(GatewayRead::Closed(None)),
                 Err(tungstenite::Error::Io(error))
                     if matches!(
                         error.kind(),
@@ -266,12 +290,18 @@ pub trait GatewayHandler {
 /// Cross-reconnect Gateway session state.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct GatewaySession {
-    /// Last observed sequence number.
+    /// Resume sequence: the last dispatch the host handler accepted.
+    /// A dispatch that fails the handler does not advance this value, so
+    /// a later resume replays the unhandled event instead of skipping it.
     pub sequence: Option<u64>,
     /// Session id from `READY`; needed for `RESUME`.
     pub session_id: Option<String>,
     /// `resume_gateway_url` from `READY`.
     pub resume_gateway_url: Option<String>,
+    /// Last dispatch sequence successfully handed to the host. Kept
+    /// separate from received frames so a handler failure never lets the
+    /// resume cursor move past work the host did not observe.
+    pub last_dispatched: Option<u64>,
 }
 
 impl std::fmt::Debug for GatewaySession {
@@ -294,6 +324,7 @@ impl GatewaySession {
 
     pub fn clear(&mut self) {
         self.sequence = None;
+        self.last_dispatched = None;
         self.session_id = None;
         self.resume_gateway_url = None;
     }
@@ -341,6 +372,13 @@ pub fn run_gateway_session(
     let mut next_heartbeat: Option<Instant> = None;
     let mut awaiting_ack = false;
     let mut hello_seen = false;
+    // Frames received advance this local cursor for heartbeats and
+    // duplicate detection. `session.sequence` only advances after the
+    // host handler accepts a dispatch.
+    let mut last_received = session.sequence;
+    if session.last_dispatched.is_none() {
+        session.last_dispatched = session.sequence;
+    }
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -353,7 +391,15 @@ pub fn run_gateway_session(
             None => Duration::from_secs(60),
         };
         match connection.read_frame(timeout)? {
-            GatewayRead::Closed => return Ok(SessionOutcome::Reconnect),
+            GatewayRead::Closed(code) => {
+                if let Some(code) = code.filter(|code| is_terminal_close_code(*code)) {
+                    return Err(DiscordApiError::new(
+                        TERMINAL_CLOSE_CODE,
+                        format!("Gateway closed with non-reconnectable code {code}"),
+                    ));
+                }
+                return Ok(SessionOutcome::Reconnect);
+            }
             GatewayRead::Timeout => {
                 if next_heartbeat.is_some() {
                     if awaiting_ack {
@@ -361,7 +407,7 @@ pub fn run_gateway_session(
                         // reconnect instead of treating a zombie as live.
                         return Ok(SessionOutcome::Reconnect);
                     }
-                    send_heartbeat(connection, session.sequence)?;
+                    send_heartbeat(connection, last_received)?;
                     awaiting_ack = true;
                     next_heartbeat = Some(Instant::now() + heartbeat_interval);
                 }
@@ -370,10 +416,9 @@ pub fn run_gateway_session(
                 let payload = GatewayPayload::parse(&text)?;
                 let duplicate = payload
                     .sequence
-                    .is_some_and(|sequence| session.sequence.is_some_and(|last| sequence <= last));
+                    .is_some_and(|sequence| last_received.is_some_and(|last| sequence <= last));
                 if let Some(sequence) = payload.sequence {
-                    session.sequence =
-                        Some(session.sequence.map_or(sequence, |last| last.max(sequence)));
+                    last_received = Some(last_received.map_or(sequence, |last| last.max(sequence)));
                 }
                 match payload.op {
                     OP_HELLO => {
@@ -389,12 +434,12 @@ pub fn run_gateway_session(
                             .clamp(1, 3_600_000);
                         heartbeat_interval = Duration::from_millis(millis);
                         send_handshake(connection, token, session, config)?;
-                        send_heartbeat(connection, session.sequence)?;
+                        send_heartbeat(connection, last_received)?;
                         awaiting_ack = true;
                         next_heartbeat = Some(Instant::now() + heartbeat_interval);
                     }
                     OP_HEARTBEAT => {
-                        send_heartbeat(connection, session.sequence)?;
+                        send_heartbeat(connection, last_received)?;
                         awaiting_ack = true;
                         next_heartbeat = Some(Instant::now() + heartbeat_interval);
                     }
@@ -429,18 +474,47 @@ pub fn run_gateway_session(
                         // channel updates; their state is recorded above
                         // and they are not lowered as host work.
                         if matches!(event_name, "READY" | "RESUMED") {
+                            commit_dispatch(session, payload.sequence);
                             continue;
                         }
                         for event in
                             crate::lower::lower_events(event_name, &payload.data, payload.sequence)
                         {
-                            handler.on_dispatch(&event, &payload)?;
+                            handler
+                                .on_dispatch(&event, &payload)
+                                .map_err(handler_failure)?;
                         }
+                        // Only a fully accepted dispatch advances the
+                        // resume cursor. A handler failure leaves it at
+                        // the previous event, so reconnecting replays the
+                        // event the host never observed.
+                        commit_dispatch(session, payload.sequence);
                     }
                     _ => {}
                 }
             }
         }
+    }
+}
+
+/// Wrap a host handler failure in a distinct, host-visible code so the
+/// reconnect loop can return it instead of treating it as a transient
+/// transport error.
+fn handler_failure(error: DiscordApiError) -> DiscordApiError {
+    DiscordApiError::new(
+        HANDLER_FAILED_CODE,
+        format!("Gateway handler failed: {}: {}", error.code, error.message),
+    )
+}
+
+fn commit_dispatch(session: &mut GatewaySession, sequence: Option<u64>) {
+    if let Some(sequence) = sequence {
+        session.last_dispatched = Some(
+            session
+                .last_dispatched
+                .map_or(sequence, |last| last.max(sequence)),
+        );
+        session.sequence = Some(session.sequence.map_or(sequence, |last| last.max(sequence)));
     }
 }
 
@@ -567,6 +641,13 @@ pub fn run_gateway(
                 config.reconnect_delay
             }
             Err(error) => {
+                // A handler failure and a documented non-reconnectable
+                // close are terminal for this configuration: retrying
+                // would silently drop the same dispatch again or burn a
+                // permanent handshake loop. Surface both to the host.
+                if error.code == HANDLER_FAILED_CODE || error.code == TERMINAL_CLOSE_CODE {
+                    return Err(error);
+                }
                 if config.max_sessions != 0 && sessions >= config.max_sessions {
                     return Err(error);
                 }
@@ -606,6 +687,21 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    fn fixture_token() -> String {
+        use std::sync::atomic::AtomicU64;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        format!(
+            "a4mc-discord-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+
     #[derive(Default)]
     struct RecordingHandler {
         events: Vec<ChannelEvent>,
@@ -643,7 +739,7 @@ mod tests {
 
     impl GatewayConnection for ScriptedConnection {
         fn read_frame(&mut self, _timeout: Duration) -> Result<GatewayRead, DiscordApiError> {
-            Ok(self.frames.pop_front().unwrap_or(GatewayRead::Closed))
+            Ok(self.frames.pop_front().unwrap_or(GatewayRead::Closed(None)))
         }
 
         fn send_text(&mut self, text: &str) -> Result<(), DiscordApiError> {
@@ -655,10 +751,42 @@ mod tests {
         }
     }
 
+    struct FailingHandler;
+
+    impl GatewayHandler for FailingHandler {
+        fn on_dispatch(
+            &mut self,
+            _event: &ChannelEvent,
+            _payload: &GatewayPayload,
+        ) -> Result<(), DiscordApiError> {
+            Err(DiscordApiError::new(
+                "a4mc_discord_fixture_handler",
+                "fixture handler rejected the dispatch",
+            ))
+        }
+    }
+
+    struct ScriptedConnector {
+        connections: Mutex<VecDeque<Box<dyn GatewayConnection>>>,
+    }
+
+    impl GatewayConnector for ScriptedConnector {
+        fn connect(
+            &self,
+            _url: &GatewayUrl,
+        ) -> Result<Box<dyn GatewayConnection>, DiscordApiError> {
+            self.connections.lock().unwrap().pop_front().ok_or_else(|| {
+                DiscordApiError::new(
+                    "a4mc_discord_fixture_exhausted",
+                    "fixture connector ran out of connections",
+                )
+            })
+        }
+    }
+
     fn hello() -> GatewayRead {
         GatewayRead::Text(json!({"op": 10, "d": {"heartbeat_interval": 30_000}}).to_string())
     }
-
     fn ready() -> GatewayRead {
         GatewayRead::Text(
             json!({
@@ -727,7 +855,8 @@ mod tests {
         let mut handler = RecordingHandler::default();
         let mut session = GatewaySession::default();
         let stop = AtomicBool::new(false);
-        let token = SecretToken::try_from_string("fixture-discord-value".into()).unwrap();
+        let token_value = fixture_token();
+        let token = SecretToken::try_from_string(token_value.clone()).unwrap();
 
         let outcome = run_gateway_session(
             &mut connection,
@@ -754,7 +883,7 @@ mod tests {
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent[0]["op"], json!(OP_IDENTIFY));
-        assert_eq!(sent[0]["d"]["token"], json!("fixture-discord-value"));
+        assert_eq!(sent[0]["d"]["token"], json!(token_value));
         assert_eq!(sent[0]["d"]["intents"], json!(DEFAULT_INTENTS));
         assert_eq!(sent[1]["op"], json!(OP_HEARTBEAT));
         assert_eq!(sent[1]["d"], Value::Null);
@@ -769,9 +898,10 @@ mod tests {
             sequence: Some(4),
             session_id: Some("session-1".into()),
             resume_gateway_url: None,
+            last_dispatched: None,
         };
         let stop = AtomicBool::new(false);
-        let token = SecretToken::try_from_string("fixture-discord-value".into()).unwrap();
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
 
         let outcome = run_gateway_session(
             &mut connection,
@@ -804,9 +934,10 @@ mod tests {
             sequence: Some(4),
             session_id: Some("session-1".into()),
             resume_gateway_url: None,
+            last_dispatched: None,
         };
         let stop = AtomicBool::new(false);
-        let token = SecretToken::try_from_string("fixture-discord-value".into()).unwrap();
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
         let outcome = run_gateway_session(
             &mut connection,
             &token,
@@ -835,7 +966,7 @@ mod tests {
         let mut handler = RecordingHandler::default();
         let mut session = GatewaySession::default();
         let stop = AtomicBool::new(false);
-        let token = SecretToken::try_from_string("fixture-discord-value".into()).unwrap();
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
         let outcome = run_gateway_session(
             &mut connection,
             &token,
@@ -863,7 +994,7 @@ mod tests {
         let mut handler = RecordingHandler::default();
         let mut session = GatewaySession::default();
         let stop = AtomicBool::new(false);
-        let token = SecretToken::try_from_string("fixture-discord-value".into()).unwrap();
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
         let outcome = run_gateway_session(
             &mut connection,
             &token,
@@ -891,7 +1022,7 @@ mod tests {
         let mut handler = RecordingHandler::default();
         let mut session = GatewaySession::default();
         let stop = AtomicBool::new(true);
-        let token = SecretToken::try_from_string("fixture-discord-value".into()).unwrap();
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
         let outcome = run_gateway_session(
             &mut connection,
             &token,
@@ -926,5 +1057,113 @@ mod tests {
         let debug = format!("{session:?}");
         assert!(debug.contains("[redacted]"));
         assert!(!debug.contains("CANARY"));
+    }
+
+    #[test]
+    fn handler_failure_is_returned_and_does_not_advance_the_resume_cursor() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection =
+            ScriptedConnection::new([hello(), ready(), message(2)], Arc::clone(&sent));
+        let mut handler = FailingHandler;
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let error = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, HANDLER_FAILED_CODE);
+        assert!(
+            error.message.contains("a4mc_discord_fixture_handler"),
+            "handler detail was lost: {error}"
+        );
+        // READY (sequence 1) was accepted; the rejected MESSAGE_CREATE
+        // (sequence 2) must remain replayable.
+        assert_eq!(session.sequence, Some(1));
+        assert_eq!(session.last_dispatched, Some(1));
+    }
+
+    #[test]
+    fn run_gateway_surfaces_handler_failure_instead_of_reconnecting_forever() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let connection = ScriptedConnection::new([hello(), ready(), message(2)], sent);
+        let connector = ScriptedConnector {
+            connections: Mutex::new(VecDeque::from([
+                Box::new(connection) as Box<dyn GatewayConnection>
+            ])),
+        };
+        let token =
+            DiscordToken::new(SecretToken::try_from_string(fixture_token()).unwrap()).unwrap();
+        let mut handler = FailingHandler;
+        let config = GatewayModeConfig {
+            max_sessions: 0,
+            reconnect_delay: Duration::ZERO,
+            max_reconnect_delay: Duration::ZERO,
+            ..GatewayModeConfig::default()
+        };
+
+        let error = run_gateway(&connector, &token, &mut handler, &config).unwrap_err();
+        assert_eq!(error.code, HANDLER_FAILED_CODE);
+    }
+
+    #[test]
+    fn terminal_close_code_ends_the_session_without_reconnect() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection =
+            ScriptedConnection::new([GatewayRead::Closed(Some(4004))], Arc::clone(&sent));
+        let mut handler = RecordingHandler::default();
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let error = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, TERMINAL_CLOSE_CODE);
+        assert!(error.message.contains("4004"));
+        assert!(is_terminal_close_code(4004));
+        assert!(is_terminal_close_code(4014));
+        assert!(!is_terminal_close_code(4000));
+    }
+
+    #[test]
+    fn non_terminal_close_code_still_reconnects() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection =
+            ScriptedConnection::new([GatewayRead::Closed(Some(4000))], Arc::clone(&sent));
+        let mut handler = RecordingHandler::default();
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let outcome = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(outcome, SessionOutcome::Reconnect);
+    }
+
+    #[test]
+    fn default_intents_leave_privileged_member_events_opt_in() {
+        assert_eq!(DEFAULT_INTENTS & INTENT_GUILD_MEMBERS, 0);
+        assert_eq!(GatewayConfig::default().intents & INTENT_GUILD_MEMBERS, 0);
     }
 }
