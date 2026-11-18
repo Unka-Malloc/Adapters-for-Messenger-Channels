@@ -226,6 +226,49 @@ impl<T: SlackApi + ?Sized> SlackApi for Arc<T> {
     }
 }
 
+/// Authorities credentialed Web API requests may target: the provider's
+/// documented API domain family only.
+const APPROVED_API_AUTHORITIES: &[&str] = &["slack.com"];
+
+fn api_root_refused() -> SlackApiError {
+    SlackApiError::new(
+        "a4mc_slack_api_root_refused",
+        "Slack Web API root is outside the approved endpoint policy",
+    )
+}
+
+/// Validate a configured Web API root for credentialed live requests:
+/// HTTPS only — plaintext can never carry a token — on the provider's
+/// own authority family. Plaintext loopback fixtures go through the
+/// test-only construction path; redirects are never followed, so the
+/// policy holds for every byte that leaves the process.
+fn validate_api_root(root: &str) -> Result<String, SlackApiError> {
+    let rest = root
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("https://")
+        .ok_or_else(api_root_refused)?;
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(api_root_refused());
+    }
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            port.parse::<u16>().map_err(|_| api_root_refused())?;
+            host
+        }
+        None => authority,
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let approved = APPROVED_API_AUTHORITIES
+        .iter()
+        .any(|authority| host == *authority || host.ends_with(&format!(".{authority}")));
+    if host.is_empty() || !approved {
+        return Err(api_root_refused());
+    }
+    Ok(format!("https://{rest}"))
+}
+
 /// Live ureq-backed Slack Web API client.
 pub struct LiveSlackApi {
     api_root: String,
@@ -234,25 +277,50 @@ pub struct LiveSlackApi {
 }
 
 impl LiveSlackApi {
-    pub fn new(tokens: SlackTokens, api_root: Option<&str>) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(60))
-            .build();
+    /// Build the live client after validating `api_root` against the
+    /// credentialed endpoint policy (`https://` on the provider's
+    /// authority family). `None` keeps the default [`DEFAULT_API_ROOT`].
+    /// The agent never follows redirects, so the validated endpoint is
+    /// the only authority a credentialed request can reach.
+    pub fn new(tokens: SlackTokens, api_root: Option<&str>) -> Result<Self, SlackApiError> {
+        Ok(Self {
+            api_root: validate_api_root(api_root.unwrap_or(DEFAULT_API_ROOT))?,
+            tokens,
+            agent: Self::agent(),
+        })
+    }
+
+    /// Test-only construction for plaintext loopback fixtures: skips the
+    /// endpoint policy so `http://127.0.0.1:{port}` responders can stand
+    /// in for the API. Only exists under `cfg(test)` — no production
+    /// build can ever select this path.
+    #[cfg(test)]
+    fn new_for_test(tokens: SlackTokens, api_root: Option<&str>) -> Self {
         Self {
             api_root: api_root
                 .unwrap_or(DEFAULT_API_ROOT)
                 .trim_end_matches('/')
                 .to_owned(),
             tokens,
-            agent,
+            agent: Self::agent(),
         }
+    }
+
+    /// One agent configuration for every construction path: bounded
+    /// timeouts and redirects disabled, so a credentialed request can
+    /// never be steered onto an authority the endpoint policy refused.
+    fn agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15))
+            .timeout_read(Duration::from_secs(60))
+            .redirects(0)
+            .build()
     }
 
     /// Resolve both credentials through the installed custody port and
     /// build the live client.
     pub fn from_custody(api_root: Option<&str>) -> Result<Self, SlackApiError> {
-        Ok(Self::new(SlackTokens::from_custody()?, api_root))
+        Self::new(SlackTokens::from_custody()?, api_root)
     }
 
     fn call(&self, method: &str, token: &SecretToken, body: Value) -> Result<Value, SlackApiError> {
@@ -593,6 +661,48 @@ mod tests {
         (port, handle)
     }
 
+    /// Answer the first request with a 302 pointing at `location`.
+    fn serve_redirect(location: &str) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let location = location.to_owned();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (port, handle)
+    }
+
+    /// A listener that reports through the channel if any connection —
+    /// e.g. a followed redirect carrying the Authorization header —
+    /// ever reaches it.
+    fn recording_listener() -> (u16, std::sync::mpsc::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if listener.accept().is_ok() {
+                let _ = tx.send(());
+            }
+        });
+        (port, rx)
+    }
+
     #[test]
     fn resolves_both_tokens_through_custody_channel_keys() {
         let _guard = CUSTODY_LOCK.lock().unwrap();
@@ -684,7 +794,7 @@ mod tests {
         let token_value = fixture_token();
         let body = "{\"ok\":false,\"error\":\"CANARY_BODY\"}";
         let (port, handle) = serve_once(500, body);
-        let api = LiveSlackApi::new(
+        let api = LiveSlackApi::new_for_test(
             SlackTokens::new(secret(&fixture_token()), secret(&token_value)).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );
@@ -714,7 +824,7 @@ mod tests {
     fn slack_api_error_maps_to_bounded_code() {
         let body = "{\"ok\":false,\"error\":\"channel_not_found\"}";
         let (port, handle) = serve_once(200, body);
-        let api = LiveSlackApi::new(
+        let api = LiveSlackApi::new_for_test(
             SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );
@@ -729,7 +839,7 @@ mod tests {
     fn invalid_auth_maps_to_unauthorized() {
         let body = "{\"ok\":false,\"error\":\"invalid_auth\"}";
         let (port, handle) = serve_once(200, body);
-        let api = LiveSlackApi::new(
+        let api = LiveSlackApi::new_for_test(
             SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );
@@ -743,7 +853,7 @@ mod tests {
     fn auth_test_maps_identity_fields() {
         let body = "{\"ok\":true,\"team_id\":\"T1\",\"team\":\"Team\",\"user_id\":\"U1\",\"user\":\"bot\",\"bot_id\":\"B1\",\"is_enterprise_install\":true}";
         let (port, handle) = serve_once(200, body);
-        let api = LiveSlackApi::new(
+        let api = LiveSlackApi::new_for_test(
             SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );
@@ -756,10 +866,57 @@ mod tests {
     }
 
     #[test]
+    fn credentialed_requests_refuse_roots_outside_the_policy() {
+        for root in [
+            "http://slack.com/api",
+            "https://example.com/api",
+            "https://slack.com.evil.example/api",
+            "wss://slack.com/api",
+            "https://token@slack.com/api",
+            "https://slack.com:abc/api",
+        ] {
+            assert_eq!(
+                LiveSlackApi::new(
+                    SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
+                    Some(root),
+                )
+                .err()
+                .unwrap()
+                .code,
+                "a4mc_slack_api_root_refused",
+                "{root} was not refused"
+            );
+        }
+        let tokens =
+            || SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap();
+        LiveSlackApi::new(tokens(), None).unwrap();
+        LiveSlackApi::new(tokens(), Some("https://slack.com/api")).unwrap();
+        LiveSlackApi::new(tokens(), Some("https://edge.slack.com/api/")).unwrap();
+        LiveSlackApi::new(tokens(), Some("https://slack.com:8443/api")).unwrap();
+    }
+
+    #[test]
+    fn redirects_are_never_followed_so_authorization_stays_put() {
+        let (target_port, seen) = recording_listener();
+        let (port, handle) = serve_redirect(&format!("http://127.0.0.1:{target_port}/"));
+        let api = LiveSlackApi::new_for_test(
+            SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
+            Some(&format!("http://127.0.0.1:{port}")),
+        );
+        let error = api.auth_test().unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error.code, "a4mc_slack_api_failed");
+        assert!(
+            seen.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a redirect moved a credentialed request to another authority"
+        );
+    }
+
+    #[test]
     fn post_message_maps_thread_and_client_id() {
         let body = "{\"ok\":true,\"channel\":\"C1\",\"ts\":\"1700000000.000100\"}";
         let (port, handle) = serve_once(200, body);
-        let api = LiveSlackApi::new(
+        let api = LiveSlackApi::new_for_test(
             SlackTokens::new(secret(&fixture_token()), secret(&fixture_token())).unwrap(),
             Some(&format!("http://127.0.0.1:{port}")),
         );

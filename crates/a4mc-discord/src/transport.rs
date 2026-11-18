@@ -169,6 +169,49 @@ impl<T: DiscordApi + ?Sized> DiscordApi for Arc<T> {
     }
 }
 
+/// Authorities credentialed REST requests may target: the provider's
+/// documented API domain family only.
+const APPROVED_API_AUTHORITIES: &[&str] = &["discord.com", "discord.gg"];
+
+fn api_root_refused() -> DiscordApiError {
+    DiscordApiError::new(
+        "a4mc_discord_api_root_refused",
+        "Discord REST API root is outside the approved endpoint policy",
+    )
+}
+
+/// Validate a configured REST API root for credentialed live requests:
+/// HTTPS only — plaintext can never carry the token — on the provider's
+/// own authority family. Plaintext loopback fixtures go through the
+/// test-only construction path; redirects are never followed, so the
+/// policy holds for every byte that leaves the process.
+fn validate_api_root(root: &str) -> Result<String, DiscordApiError> {
+    let rest = root
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("https://")
+        .ok_or_else(api_root_refused)?;
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(api_root_refused());
+    }
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            port.parse::<u16>().map_err(|_| api_root_refused())?;
+            host
+        }
+        None => authority,
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let approved = APPROVED_API_AUTHORITIES
+        .iter()
+        .any(|authority| host == *authority || host.ends_with(&format!(".{authority}")));
+    if host.is_empty() || !approved {
+        return Err(api_root_refused());
+    }
+    Ok(format!("https://{rest}"))
+}
+
 /// Live ureq-backed Discord REST client.
 pub struct LiveDiscordApi {
     api_root: String,
@@ -177,25 +220,50 @@ pub struct LiveDiscordApi {
 }
 
 impl LiveDiscordApi {
-    pub fn new(token: DiscordToken, api_root: Option<&str>) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(60))
-            .build();
+    /// Build the live client after validating `api_root` against the
+    /// credentialed endpoint policy (`https://` on the provider's
+    /// authority family). `None` keeps the default [`DEFAULT_API_ROOT`].
+    /// The agent never follows redirects, so the validated endpoint is
+    /// the only authority a credentialed request can reach.
+    pub fn new(token: DiscordToken, api_root: Option<&str>) -> Result<Self, DiscordApiError> {
+        Ok(Self {
+            api_root: validate_api_root(api_root.unwrap_or(DEFAULT_API_ROOT))?,
+            token,
+            agent: Self::agent(),
+        })
+    }
+
+    /// Test-only construction for plaintext loopback fixtures: skips the
+    /// endpoint policy so `http://127.0.0.1:{port}` responders can stand
+    /// in for the API. Only exists under `cfg(test)` — no production
+    /// build can ever select this path.
+    #[cfg(test)]
+    fn new_for_test(token: DiscordToken, api_root: Option<&str>) -> Self {
         Self {
             api_root: api_root
                 .unwrap_or(DEFAULT_API_ROOT)
                 .trim_end_matches('/')
                 .to_owned(),
             token,
-            agent,
+            agent: Self::agent(),
         }
+    }
+
+    /// One agent configuration for every construction path: bounded
+    /// timeouts and redirects disabled, so a credentialed request can
+    /// never be steered onto an authority the endpoint policy refused.
+    fn agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15))
+            .timeout_read(Duration::from_secs(60))
+            .redirects(0)
+            .build()
     }
 
     /// Resolve the bot token through the installed custody port and
     /// build the live client.
     pub fn from_custody(api_root: Option<&str>) -> Result<Self, DiscordApiError> {
-        Ok(Self::new(DiscordToken::from_custody()?, api_root))
+        Self::new(DiscordToken::from_custody()?, api_root)
     }
 
     /// The custody-resolved token, for composing the Gateway loop with
@@ -506,6 +574,48 @@ mod tests {
         (port, handle)
     }
 
+    /// Answer the first request with a 302 pointing at `location`.
+    fn serve_redirect(location: &str) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let location = location.to_owned();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (port, handle)
+    }
+
+    /// A listener that reports through the channel if any connection —
+    /// e.g. a followed redirect carrying the Authorization header —
+    /// ever reaches it.
+    fn recording_listener() -> (u16, std::sync::mpsc::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if listener.accept().is_ok() {
+                let _ = tx.send(());
+            }
+        });
+        (port, rx)
+    }
+
     #[test]
     fn resolves_token_through_custody_channel_key() {
         let _guard = CUSTODY_LOCK.lock().unwrap();
@@ -570,7 +680,7 @@ mod tests {
     fn current_user_maps_identity_fields() {
         let body = "{\"id\":\"U1\",\"username\":\"bot\",\"global_name\":\"Bot Name\",\"bot\":true}";
         let (port, handle) = serve_once(200, body);
-        let api = LiveDiscordApi::new(
+        let api = LiveDiscordApi::new_for_test(
             token(&fixture_token()),
             Some(&format!("http://127.0.0.1:{port}")),
         );
@@ -583,10 +693,61 @@ mod tests {
     }
 
     #[test]
+    fn credentialed_requests_refuse_roots_outside_the_policy() {
+        for root in [
+            "http://discord.com/api/v10",
+            "https://example.com/api",
+            "https://discord.com.evil.example/api",
+            "wss://discord.com/api",
+            "https://token@discord.com/api",
+            "https://discord.com:abc/api",
+        ] {
+            assert_eq!(
+                LiveDiscordApi::new(token(&fixture_token()), Some(root))
+                    .err()
+                    .unwrap()
+                    .code,
+                "a4mc_discord_api_root_refused",
+                "{root} was not refused"
+            );
+        }
+        LiveDiscordApi::new(token(&fixture_token()), None).unwrap();
+        LiveDiscordApi::new(token(&fixture_token()), Some("https://discord.com/api/v10")).unwrap();
+        LiveDiscordApi::new(
+            token(&fixture_token()),
+            Some("https://canary.discord.com/api/"),
+        )
+        .unwrap();
+        LiveDiscordApi::new(token(&fixture_token()), Some("https://discord.gg/api")).unwrap();
+        LiveDiscordApi::new(
+            token(&fixture_token()),
+            Some("https://discord.com:8443/api"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn redirects_are_never_followed_so_authorization_stays_put() {
+        let (target_port, seen) = recording_listener();
+        let (port, handle) = serve_redirect(&format!("http://127.0.0.1:{target_port}/"));
+        let api = LiveDiscordApi::new_for_test(
+            token(&fixture_token()),
+            Some(&format!("http://127.0.0.1:{port}")),
+        );
+        let error = api.current_user().unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error.code, "a4mc_discord_api_failed");
+        assert!(
+            seen.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a redirect moved a credentialed request to another authority"
+        );
+    }
+
+    #[test]
     fn post_message_maps_reply_and_nonce() {
         let body = "{\"id\":\"M1\",\"channel_id\":\"C1\"}";
         let (port, handle) = serve_once(200, body);
-        let api = LiveDiscordApi::new(
+        let api = LiveDiscordApi::new_for_test(
             token(&fixture_token()),
             Some(&format!("http://127.0.0.1:{port}")),
         );
@@ -608,7 +769,7 @@ mod tests {
         let token_value = fixture_token();
         let body = "{\"message\":\"CANARY_BODY\",\"code\":50035}";
         let (port, handle) = serve_once(400, body);
-        let api = LiveDiscordApi::new(
+        let api = LiveDiscordApi::new_for_test(
             token(&token_value),
             Some(&format!("http://127.0.0.1:{port}")),
         );
@@ -624,7 +785,7 @@ mod tests {
     fn unauthorized_maps_to_bounded_code() {
         let body = "{\"message\":\"401: Unauthorized\",\"code\":0}";
         let (port, handle) = serve_once(401, body);
-        let api = LiveDiscordApi::new(
+        let api = LiveDiscordApi::new_for_test(
             token(&fixture_token()),
             Some(&format!("http://127.0.0.1:{port}")),
         );
