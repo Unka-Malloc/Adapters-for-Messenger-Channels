@@ -500,7 +500,6 @@ mod tests {
         });
     }
 
-
     #[test]
     fn stale_schema_file_is_refused_and_left_untouched() {
         let root = std::env::temp_dir().join(format!(

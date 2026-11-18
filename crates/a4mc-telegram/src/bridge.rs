@@ -171,10 +171,21 @@ struct TurnGate {
 
 type TurnResult = Result<(String, String), BridgeError>;
 
+/// Identity of one joinable turn. Each field is hashed separately, so
+/// caller-supplied text or session ids containing separator bytes can
+/// never make two distinct turns serialize to the same key.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TurnKey {
+    chat_id: i64,
+    agent_id: String,
+    session_id: String,
+    text: String,
+}
+
 /// One table of joinable turns. The lane dispatch is synchronous and
 /// uninterruptible; this gate makes duplicate callers share its result
 /// instead of starting a second paid dispatch over the same turn.
-static TURN_GATES: LazyLock<Mutex<HashMap<String, TurnGate>>> =
+static TURN_GATES: LazyLock<Mutex<HashMap<TurnKey, TurnGate>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static TURN_WAKE: Condvar = Condvar::new();
 
@@ -184,11 +195,11 @@ enum TurnJoin {
 }
 
 struct TurnPermit {
-    key: String,
+    key: Option<TurnKey>,
 }
 
 impl TurnPermit {
-    fn acquire(key: String) -> TurnJoin {
+    fn acquire(key: TurnKey) -> TurnJoin {
         let mut gates = TURN_GATES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -204,7 +215,7 @@ impl TurnPermit {
                             result: None,
                         },
                     );
-                    return TurnJoin::Leader(Self { key });
+                    return TurnJoin::Leader(Self { key: Some(key) });
                 }
                 Some(gate) if gate.done => {
                     let result = gate
@@ -234,15 +245,19 @@ impl TurnPermit {
     }
 
     /// Publish the turn's result to every waiter, then wake them.
-    fn finish(self, result: &TurnResult) {
+    fn finish(mut self, result: &TurnResult) {
+        // Take the key so Drop is inert afterwards: a finished gate may
+        // already be removed and re-registered by a new leader before
+        // this permit's destructor runs.
+        let key = self.key.take().expect("an unfinished turn holds its key");
         let mut gates = TURN_GATES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(gate) = gates.get_mut(&self.key) {
+        if let Some(gate) = gates.get_mut(&key) {
             gate.done = true;
             gate.result = Some(result.clone());
             if gate.waiters == 0 {
-                gates.remove(&self.key);
+                gates.remove(&key);
             }
         }
         drop(gates);
@@ -254,10 +269,13 @@ impl Drop for TurnPermit {
     fn drop(&mut self) {
         // Reached only when the leader unwinds before finish: release
         // waiters with a bounded error instead of parking them forever.
+        let Some(key) = &self.key else {
+            return;
+        };
         let mut gates = TURN_GATES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(gate) = gates.get_mut(&self.key)
+        if let Some(gate) = gates.get_mut(key)
             && !gate.done
         {
             gate.done = true;
@@ -266,7 +284,7 @@ impl Drop for TurnPermit {
                 "conversation lane turn aborted",
             )));
             if gate.waiters == 0 {
-                gates.remove(&self.key);
+                gates.remove(key);
             }
         }
         drop(gates);
@@ -274,11 +292,16 @@ impl Drop for TurnPermit {
     }
 }
 
-fn turn_key(chat_id: i64, agent_id: &str, session_id: Option<&str>, text: &str) -> String {
-    format!(
-        "{chat_id}\u{1f}{agent_id}\u{1f}{}\u{1f}{text}",
-        session_id.filter(|value| !value.is_empty()).unwrap_or("")
-    )
+fn turn_key(chat_id: i64, agent_id: &str, session_id: Option<&str>, text: &str) -> TurnKey {
+    TurnKey {
+        chat_id,
+        agent_id: agent_id.to_owned(),
+        session_id: session_id
+            .filter(|value| !value.is_empty())
+            .unwrap_or("")
+            .to_owned(),
+        text: text.to_owned(),
+    }
 }
 
 /// Run one agent turn and wait for the lane to finish it.
