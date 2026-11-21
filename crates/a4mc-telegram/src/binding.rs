@@ -83,10 +83,14 @@ pub struct PendingUpdate {
     /// means the message was admitted but never processed.
     #[serde(default)]
     pub reply: Option<String>,
-    /// The session the finished turn produced, when it differs from
-    /// what the binding already holds.
+    /// The idempotency key the recorded reply is delivered under —
+    /// persisted with the text so a restart resend repeats the first
+    /// attempt's key instead of minting a different one (a fallback
+    /// error report keeps `error:<id>` rather than being resent as
+    /// `reply:<id>`). `None` predates the field; recovery derives the
+    /// ordinary `reply:` key for it.
     #[serde(default)]
-    pub next_session: Option<String>,
+    pub reply_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -415,16 +419,12 @@ impl BindingStore {
         tasks
     }
 
-    /// Record a finished turn's reply — and the session it produced —
-    /// on the admitted task *before* delivery, so an exit between the
-    /// lane returning and the send completing leaves a resumable result
-    /// instead of losing paid agent work.
-    pub fn record_reply(
-        &mut self,
-        update_id: i64,
-        reply: &str,
-        next_session: Option<String>,
-    ) -> Result<()> {
+    /// Record a finished turn's reply — and the delivery key its first
+    /// send attempt carries — on the admitted task *before* delivery,
+    /// so an exit between the lane returning and the send completing
+    /// leaves a resumable result under the same key instead of losing
+    /// paid agent work.
+    pub fn record_reply(&mut self, update_id: i64, reply: &str, key: &str) -> Result<()> {
         self.mutate(|document| {
             if let Some(task) = document
                 .pending_updates
@@ -432,7 +432,41 @@ impl BindingStore {
                 .find(|task| task.update_id == update_id)
             {
                 task.reply = Some(reply.to_owned());
-                task.next_session = next_session;
+                task.reply_key = Some(key.to_owned());
+            }
+            Ok(())
+        })
+    }
+
+    /// Commit a chat's session change and one finished reply record in
+    /// the same write: the binding change routing subsequent messages
+    /// and the resumable result land or fail together, so a restart
+    /// never finds a committed session change on an unfinished task
+    /// and re-runs it — or reapplies a session a later committed write
+    /// already replaced. The session is applied only while the chat
+    /// still has an agent bound; the reply record never depends on it.
+    pub fn record_reply_and_session(
+        &mut self,
+        chat_id: i64,
+        update_id: i64,
+        reply: &str,
+        key: &str,
+        session_id: Option<String>,
+    ) -> Result<()> {
+        self.mutate(|document| {
+            if let Some(binding) = document.chats.get_mut(&chat_id.to_string())
+                && binding.agent_id.is_some()
+            {
+                binding.session_id = session_id;
+                binding.updated_at = now_secs();
+            }
+            if let Some(task) = document
+                .pending_updates
+                .iter_mut()
+                .find(|task| task.update_id == update_id)
+            {
+                task.reply = Some(reply.to_owned());
+                task.reply_key = Some(key.to_owned());
             }
             Ok(())
         })
@@ -440,9 +474,18 @@ impl BindingStore {
 
     /// Record an undelivered fallback error report on the admitted
     /// task — only when it holds no finished reply already: a paid
-    /// agent result is never shadowed by an error report. The restart
-    /// drain then delivers the fallback like any recorded reply.
-    pub fn record_fallback_reply(&mut self, update_id: i64, reply: &str) -> Result<()> {
+    /// agent result is never shadowed by an error report. The report
+    /// keeps the delivery key its first send attempt carried, so the
+    /// restart drain resends the same logical send instead of minting
+    /// a second key for one delivery. `Ok(true)` means the report was
+    /// recorded; `Ok(false)` means a finished reply already held the
+    /// slot (or the task is gone) and nothing was written.
+    pub fn record_fallback_reply(
+        &mut self,
+        update_id: i64,
+        reply: &str,
+        key: &str,
+    ) -> Result<bool> {
         self.mutate(|document| {
             if let Some(task) = document
                 .pending_updates
@@ -451,8 +494,10 @@ impl BindingStore {
                 && task.reply.is_none()
             {
                 task.reply = Some(reply.to_owned());
+                task.reply_key = Some(key.to_owned());
+                return Ok(true);
             }
-            Ok(())
+            Ok(false)
         })
     }
 
@@ -778,6 +823,86 @@ mod tests {
             FileExt::unlock(&held).unwrap();
             handle.join().unwrap();
             assert!(finished.load(Ordering::SeqCst));
+        });
+    }
+
+    fn inbound_message(update_id: i64, chat_id: i64) -> InboundMessage {
+        InboundMessage {
+            update_id,
+            chat_id,
+            chat_type: "private".into(),
+            user_id: chat_id,
+            username: Some("alice".into()),
+            from_name: None,
+            is_private: true,
+            message_id: update_id,
+            message_thread_id: None,
+            edited: false,
+            date: None,
+            edit_date: None,
+            kind: crate::inbound::InboundKind::Text,
+            text: Some("hello".into()),
+            caption: None,
+            media: Vec::new(),
+            reply_to: None,
+            forward_label: None,
+            location: None,
+            venue_label: None,
+            contact_label: None,
+            poll_question: None,
+        }
+    }
+
+    #[test]
+    fn reply_and_session_commit_lands_or_fails_as_one_write() {
+        temp_store(|mut store| {
+            let pending = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(9, Some("codex".into())).unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                    }],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // A failed commit must leave neither half applied: a moved
+            // binding on an unfinished task is exactly the state that
+            // let a restart re-run the command or revert a later
+            // session.
+            store.fail_next_write_for_test();
+            store
+                .record_reply_and_session(
+                    9,
+                    7,
+                    "Started a new conversation: s2",
+                    "reply:7",
+                    Some("s2".into()),
+                )
+                .unwrap_err();
+            assert_eq!(store.binding(9).unwrap().session_id, None);
+            assert!(store.pending_updates()[0].reply.is_none());
+            store
+                .record_reply_and_session(
+                    9,
+                    7,
+                    "Started a new conversation: s2",
+                    "reply:7",
+                    Some("s2".into()),
+                )
+                .unwrap();
+            assert_eq!(store.binding(9).unwrap().session_id.as_deref(), Some("s2"));
+            let task = &store.pending_updates()[0];
+            assert_eq!(
+                task.reply.as_deref(),
+                Some("Started a new conversation: s2")
+            );
+            assert_eq!(task.reply_key.as_deref(), Some("reply:7"));
         });
     }
 }

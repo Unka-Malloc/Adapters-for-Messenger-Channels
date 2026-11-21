@@ -572,6 +572,13 @@ pub struct GatewaySession {
     /// separate from received frames so a handler failure never lets the
     /// resume cursor move past work the host did not observe.
     pub last_dispatched: Option<u64>,
+    /// Set when the session was cleared as dead (close 4007/4009 or a
+    /// non-resumable INVALID_SESSION): teardown must not write drained
+    /// worker acknowledgements back into it — their sequences belong to
+    /// the dead session and would sit above the fresh session's
+    /// restarted numbering as a resurrected resume cursor. A live
+    /// `READY` resets the flag for the session it establishes.
+    pub expired: bool,
 }
 
 impl std::fmt::Debug for GatewaySession {
@@ -583,6 +590,7 @@ impl std::fmt::Debug for GatewaySession {
                 "resume_gateway_url",
                 &self.resume_gateway_url.as_ref().map(|_| "[redacted]"),
             )
+            .field("expired", &self.expired)
             .finish()
     }
 }
@@ -597,6 +605,7 @@ impl GatewaySession {
         self.last_dispatched = None;
         self.session_id = None;
         self.resume_gateway_url = None;
+        self.expired = true;
     }
 }
 
@@ -707,7 +716,15 @@ pub fn run_gateway_session(
         let mut first_failure = None;
         while let Ok(ack) = ack_rx.recv() {
             match ack.result {
-                Ok(()) if accepted_prefix => commit_dispatch(session, ack.sequence),
+                // Commit only while the session still lives: an expiry
+                // clear (close 4007/4009, a non-resumable INVALID_SESSION)
+                // marked it dead, and writing the dead session's drained
+                // acknowledgements back would resurrect a cursor above
+                // the next session's restarted numbering — its fresh
+                // READY and dispatches would be filtered as duplicates.
+                Ok(()) if accepted_prefix && !session.expired => {
+                    commit_dispatch(session, ack.sequence)
+                }
                 Ok(()) => {}
                 Err(error) => {
                     accepted_prefix = false;
@@ -901,9 +918,12 @@ fn session_loop(
                                 .and_then(Value::as_str)
                                 .filter(|value| !value.is_empty())
                                 .map(str::to_owned);
-                            // READY opens a fresh session: no earlier
+                            // READY opens a fresh session: the expired
+                            // marker clears so this session's teardown
+                            // drain commits normally, and no earlier
                             // work can be queued behind it, so its
                             // sequence commits directly.
+                            session.expired = false;
                             commit_dispatch(session, payload.sequence);
                             continue;
                         }
@@ -1364,6 +1384,7 @@ mod tests {
             session_id: Some("session-1".into()),
             resume_gateway_url: None,
             last_dispatched: None,
+            expired: false,
         };
         let stop = AtomicBool::new(false);
         let token = SecretToken::try_from_string(fixture_token()).unwrap();
@@ -1400,6 +1421,7 @@ mod tests {
             session_id: Some("session-1".into()),
             resume_gateway_url: None,
             last_dispatched: None,
+            expired: false,
         };
         let stop = AtomicBool::new(false);
         let token = SecretToken::try_from_string(fixture_token()).unwrap();
@@ -2129,6 +2151,7 @@ mod tests {
             session_id: Some("session-1".into()),
             resume_gateway_url: None,
             last_dispatched: None,
+            expired: false,
         };
         let stop = AtomicBool::new(false);
         let token = SecretToken::try_from_string(fixture_token()).unwrap();
@@ -2163,6 +2186,7 @@ mod tests {
             session_id: Some("session-1".into()),
             resume_gateway_url: None,
             last_dispatched: None,
+            expired: false,
         };
         let stop = AtomicBool::new(false);
         let token = SecretToken::try_from_string(fixture_token()).unwrap();
@@ -2183,5 +2207,104 @@ mod tests {
         // resumable at the last contiguous accepted sequence.
         assert_eq!(session.sequence, Some(4));
         assert!(session.can_resume());
+    }
+
+    #[test]
+    fn an_expired_session_never_resurrects_its_cursor_from_the_drained_queue() {
+        // Close 4007/4009 and a non-resumable INVALID_SESSION expire the
+        // session while the worker can still hold queued
+        // acknowledgements. The teardown drain must consume them
+        // without writing the dead session's sequence back: the next
+        // connection IDENTIFYs a fresh session whose READY and
+        // dispatches restart numbering at 1, and a resurrected cursor
+        // would filter them out as duplicates.
+        for terminator in [
+            GatewayRead::Closed(Some(4007)),
+            GatewayRead::Closed(Some(4009)),
+            GatewayRead::Text(json!({"op": OP_INVALID_SESSION, "d": false}).to_string()),
+        ] {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let mut connection = ScriptedConnection::new(
+                [hello(), ready(), message(2), terminator],
+                Arc::clone(&sent),
+            );
+            let mut handler = PausableHandler {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            };
+            let mut session = GatewaySession::default();
+            let runner = std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                let token = SecretToken::try_from_string(fixture_token()).unwrap();
+                let outcome = run_gateway_session(
+                    &mut connection,
+                    &token,
+                    &mut handler,
+                    &mut session,
+                    &GatewayConfig::default(),
+                    &stop,
+                );
+                (outcome, session)
+            });
+            // The dispatch parks the worker while the read loop
+            // consumes the expiry frame and reaches the teardown
+            // drain; releasing lets its acknowledgement arrive inside
+            // the drained queue.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while entered.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "dispatch never reached the handler"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            {
+                let (mutex, condvar) = &*release;
+                *mutex.lock().unwrap() = true;
+                condvar.notify_all();
+            }
+            let (outcome, mut session) = runner.join().unwrap();
+            assert_eq!(outcome.unwrap(), SessionOutcome::Reconnect);
+            assert!(
+                session.sequence.is_none(),
+                "drained acknowledgements resurrected the expired session's cursor: {session:?}"
+            );
+            assert!(session.expired);
+            assert!(!session.can_resume());
+
+            // The next connection starts a fresh session: its READY
+            // (sequence 1) and first dispatch must be delivered, not
+            // filtered against a resurrected high-water mark.
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let mut connection = ScriptedConnection::new(
+                [hello(), ready(), message(2), reconnect()],
+                Arc::clone(&sent),
+            );
+            let mut handler = RecordingHandler::default();
+            let stop = AtomicBool::new(false);
+            let token = SecretToken::try_from_string(fixture_token()).unwrap();
+            let outcome = run_gateway_session(
+                &mut connection,
+                &token,
+                &mut handler,
+                &mut session,
+                &GatewayConfig::default(),
+                &stop,
+            )
+            .unwrap();
+            assert_eq!(outcome, SessionOutcome::Reconnect);
+            assert_eq!(
+                handler.events.len(),
+                1,
+                "the fresh session's first dispatch was filtered as a duplicate"
+            );
+            assert_eq!(session.sequence, Some(2));
+            assert!(session.can_resume());
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent[0]["op"], json!(OP_IDENTIFY));
+        }
     }
 }

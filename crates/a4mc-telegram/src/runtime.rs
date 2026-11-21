@@ -361,33 +361,38 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
             // unfinished task record stays for the restart drain.
             Err(error) if is_policy_deferral(&error) => Ok(()),
             Err(error) => {
-                // The fallback error reply is an outbound send like
-                // any other: it waits out a policy deferral rather
-                // than being discarded on the first attempt. If the
-                // wait ends undelivered — shutdown cut it short, or
-                // the channel refused — the report is persisted on
-                // the task so the restart drain still delivers it
-                // instead of deleting the update unserved.
-                let fallback = reply_message(
-                    chat_id,
-                    message.message_id,
-                    update_id,
-                    "error",
-                    &sanitize_error(&error),
-                );
-                if send_policy_wait(&processor_channel, &fallback, &processor_stop).is_err() {
-                    let _ = processor_store
-                        .lock()
-                        .unwrap()
-                        .record_fallback_reply(update_id, &fallback.text);
-                }
-                // A task whose finished reply never got delivered keeps
-                // its record — restart resumes that stage; anything else
-                // was fully handled and settles here.
-                let _ = processor_store
+                // The fallback error report is persisted — under the
+                // delivery key its first send attempt carries — BEFORE
+                // delivery: a mid-send exit leaves a resumable record
+                // the restart drain resends under the same key, so host
+                // policy and dedupe see one logical send. The record
+                // only lands while the task holds no finished reply —
+                // a paid agent result is never shadowed — and a failed
+                // write surfaces instead of being settled over.
+                let key = reply_key(update_id, "error");
+                let text = sanitize_error(&error);
+                let recorded = processor_store
                     .lock()
                     .unwrap()
-                    .settle_failed_update(update_id);
+                    .record_fallback_reply(update_id, &text, &key)?;
+                let delivered = deliver_sends(
+                    &processor_channel,
+                    &reply_sends(chat_id, message.message_id, &key, &text),
+                    &processor_stop,
+                )
+                .is_ok();
+                // A fallback that was both recorded and delivered ends
+                // the task outright; anything else — an undelivered
+                // report, or a finished agent reply still owed — keeps
+                // its record for the restart drain.
+                if recorded && delivered {
+                    processor_store.lock().unwrap().complete_update(update_id)?;
+                } else {
+                    processor_store
+                        .lock()
+                        .unwrap()
+                        .settle_failed_update(update_id)?;
+                }
                 Ok(())
             }
         }
@@ -398,42 +403,52 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     // Resume admitted-but-unfinished work before polling: finished turns
     // only need their recorded reply delivered; unstarted messages are
     // re-queued whole. Records survive only while their stage is
-    // unfinished, so nothing paid or already confirmed runs twice. A
-    // resend the host's policy is holding retries after the store lock
-    // drops — parking on its deferral window under the lock would stall
-    // every worker's store access.
-    let mut held: Vec<(i64, a4mc::OutboundMessage)> = Vec::new();
+    // unfinished, so nothing paid or already confirmed runs twice. The
+    // binding's session is already committed — a turn's session change
+    // lands in the same store write as its reply record — so recovery
+    // only re-delivers; it never re-applies a superseded routing
+    // change. A resend the host's policy is holding retries after the
+    // store lock drops — parking on its deferral window under the lock
+    // would stall every worker's store access.
+    let mut held: Vec<(i64, Vec<a4mc::OutboundMessage>)> = Vec::new();
     {
         let mut guard = store.lock().unwrap();
         for task in guard.pending_updates() {
             match task.reply {
                 Some(reply) => {
-                    if let Some(session) = task.next_session.filter(|s| !s.is_empty()) {
-                        let _ = guard.set_session(task.message.chat_id, Some(session));
+                    // The resend repeats the delivery key the first
+                    // attempt carried; records that predate the field
+                    // derive the ordinary reply key.
+                    let key = task
+                        .reply_key
+                        .unwrap_or_else(|| reply_key(task.update_id, "reply"));
+                    let parts =
+                        reply_sends(task.message.chat_id, task.message.message_id, &key, &reply);
+                    // Deliver parts in order: a policy hold parks the
+                    // remainder for the off-lock wait below; a
+                    // rejection leaves the record for the next
+                    // restart's resend under the same keys.
+                    let mut sent_count = 0usize;
+                    while sent_count < parts.len() {
+                        match channel.send(&parts[sent_count]) {
+                            Ok(_) => sent_count += 1,
+                            Err(error) if is_outbound_deferral(&error) => {
+                                held.push((task.update_id, parts[sent_count..].to_vec()));
+                                break;
+                            }
+                            Err(_) => break,
+                        }
                     }
-                    let outbound = reply_message(
-                        task.message.chat_id,
-                        task.message.message_id,
-                        task.update_id,
-                        "reply",
-                        &reply,
-                    );
-                    match channel.send(&outbound) {
-                        Ok(_) => {
-                            let _ = guard.complete_update(task.update_id);
-                        }
-                        Err(error) if is_outbound_deferral(&error) => {
-                            held.push((task.update_id, outbound));
-                        }
-                        Err(_) => {}
+                    if sent_count == parts.len() {
+                        let _ = guard.complete_update(task.update_id);
                     }
                 }
                 None => pending.push_back(task.message),
             }
         }
     }
-    for (update_id, outbound) in held {
-        if send_policy_wait(&channel, &outbound, &config.stop).is_ok() {
+    for (update_id, parts) in held {
+        if deliver_sends(&channel, &parts, &config.stop).is_ok() {
             let _ = store.lock().unwrap().complete_update(update_id);
         }
     }
@@ -604,7 +619,7 @@ fn poll_updates<T: BotTransport>(
                                 update_id: update.update_id,
                                 message: message.clone(),
                                 reply: None,
-                                next_session: None,
+                                reply_key: None,
                             });
                             admitted.push(message);
                         }
@@ -729,24 +744,58 @@ fn handle_inbound<T: BotTransport>(
     }
 }
 
-/// The normalized send for one runtime-generated reply. `purpose`
+/// The delivery key for one runtime-generated reply. `purpose`
 /// distinguishes the reply produced by handling the update (`reply`)
 /// from the fallback error report for the same update (`error`), so a
 /// recorded agent reply can never be shadowed by an observed error
 /// receipt under the same dedupe key.
-fn reply_message(
+fn reply_key(update_id: i64, purpose: &str) -> String {
+    format!("{purpose}:{update_id}")
+}
+
+/// One runtime reply as contract-valid sends. Text inside the
+/// contract bound is a single send under `key`; a larger lane output
+/// fans out at the character bound — part zero keeps `key`, later
+/// parts derive `<key>:<index>` — so every part is deliverable and a
+/// restarted fan-out repeats the same part keys under the host's
+/// dedupe instead of retrying one forever-invalid payload. A
+/// whitespace-only chunk is skipped: the contract rejects empty text
+/// and it carries nothing.
+fn reply_sends(
     chat_id: i64,
     reply_to_message_id: i64,
-    update_id: i64,
-    purpose: &str,
+    key: &str,
     text: &str,
-) -> a4mc::OutboundMessage {
-    let mut outbound =
-        a4mc::OutboundMessage::new(chat_id.to_string(), text, format!("{purpose}:{update_id}"));
-    outbound.reply_to_message_id = Some(a4mc::ExternalMessageId::from(
-        reply_to_message_id.to_string(),
-    ));
-    outbound
+) -> Vec<a4mc::OutboundMessage> {
+    const PART_CHARS: usize = a4mc::MAX_OUTBOUND_TEXT_CHARS;
+    let mut sends = Vec::new();
+    let mut rest = text;
+    let mut index = 0usize;
+    while !rest.is_empty() {
+        let end = if rest.chars().count() <= PART_CHARS {
+            rest.len()
+        } else {
+            rest.char_indices()
+                .nth(PART_CHARS)
+                .map_or(rest.len(), |(offset, _)| offset)
+        };
+        let (part, remaining) = rest.split_at(end);
+        rest = remaining;
+        if !part.trim().is_empty() {
+            let key = if index == 0 {
+                key.to_owned()
+            } else {
+                format!("{key}:{index}")
+            };
+            let mut outbound = a4mc::OutboundMessage::new(chat_id.to_string(), part, key);
+            outbound.reply_to_message_id = Some(a4mc::ExternalMessageId::from(
+                reply_to_message_id.to_string(),
+            ));
+            sends.push(outbound);
+        }
+        index += 1;
+    }
+    sends
 }
 
 /// Retry floor for a policy deferral that carries no hint — modest
@@ -800,19 +849,32 @@ fn send_policy_wait<T: BotTransport>(
     }
 }
 
+/// Deliver one reply's contract-valid sends under the host's policy,
+/// part after part: a deferral waits out its hint on each part, and the
+/// first failure stops the fan-out so the caller keeps the work record.
+fn deliver_sends<T: BotTransport>(
+    channel: &TelegramChannel<T>,
+    parts: &[a4mc::OutboundMessage],
+    stop: &AtomicBool,
+) -> Result<(), a4mc::ChannelError> {
+    for part in parts {
+        send_policy_wait(channel, part, stop)?;
+    }
+    Ok(())
+}
+
 fn send_reply<T: BotTransport>(
     channel: &TelegramChannel<T>,
     message: &InboundMessage,
     text: &str,
     stop: &AtomicBool,
 ) -> Result<()> {
-    send_policy_wait(
+    deliver_sends(
         channel,
-        &reply_message(
+        &reply_sends(
             message.chat_id,
             message.message_id,
-            message.update_id,
-            "reply",
+            &reply_key(message.update_id, "reply"),
             text,
         ),
         stop,
@@ -926,15 +988,6 @@ fn handle_command<T: BotTransport>(
             let agent_id = require_agent(store, message.chat_id)?;
             let opened =
                 open_session(&agent_id, None).map_err(|error| anyhow!(error.to_string()))?;
-            store_set_session(
-                store,
-                message.chat_id,
-                if opened.is_empty() {
-                    None
-                } else {
-                    Some(opened.clone())
-                },
-            )?;
             let confirmation = format!(
                 "Started a new conversation{}.",
                 if opened.is_empty() {
@@ -943,12 +996,24 @@ fn handle_command<T: BotTransport>(
                     format!(": {opened}")
                 }
             );
-            // Persist the finished command and its confirmation before
-            // waiting on outbound policy: if shutdown interrupts a
-            // deferral, recovery resumes delivery of this reply instead
-            // of re-running the command and opening a second
-            // conversation.
-            store_record_reply(store, message.update_id, &confirmation, None)?;
+            // Commit the new binding session and the finished
+            // confirmation in one store mutation before waiting on
+            // outbound policy: separate writes let an exit between
+            // them leave the committed session on an unfinished task,
+            // so restart re-ran the command and opened a second
+            // conversation — the single write means recovery only ever
+            // resumes delivery of this reply.
+            store_record_reply_and_session(
+                store,
+                message.chat_id,
+                message.update_id,
+                &confirmation,
+                if opened.is_empty() {
+                    None
+                } else {
+                    Some(opened.clone())
+                },
+            )?;
             send_reply(channel, message, &confirmation, stop)?;
         }
         ControlCommand::Stop => {
@@ -1043,22 +1108,21 @@ fn handle_ordinary<T: BotTransport>(
         turn_deadline,
     )
     .map_err(|error| anyhow!(error.to_string()))?;
-    // Record the finished reply on the admitted task before delivery or
-    // the session write: an exit after the agent returned still has the
-    // result to resend rather than losing paid work.
-    let pending_session = if next_session.is_empty()
-        || binding.session_id.as_deref() == Some(next_session.as_str())
-    {
-        None
+    // Commit the finished reply — and the session the turn produced —
+    // in one store write before delivery: the routing change and the
+    // resumable result land or fail together, so a restart neither
+    // loses paid work nor re-applies a session a later committed
+    // command already replaced.
+    if next_session.is_empty() || binding.session_id.as_deref() == Some(next_session.as_str()) {
+        store_record_reply(store, message.update_id, &reply)?;
     } else {
-        Some(next_session.clone())
-    };
-    store_record_reply(store, message.update_id, &reply, pending_session)?;
-    // Persist the new session before telling the user the turn
-    // succeeded. If the store is unavailable (busy, read-only, full),
-    // the next message must not silently route to the old session.
-    if !next_session.is_empty() && binding.session_id.as_deref() != Some(next_session.as_str()) {
-        store_set_session(store, message.chat_id, Some(next_session))?;
+        store_record_reply_and_session(
+            store,
+            message.chat_id,
+            message.update_id,
+            &reply,
+            Some(next_session),
+        )?;
     }
     send_reply(channel, message, &reply, stop)?;
     Ok(())
@@ -1101,16 +1165,29 @@ fn store_paired_binding(
         .cloned())
 }
 
-fn store_record_reply(
-    store: &Mutex<BindingStore>,
-    update_id: i64,
-    reply: &str,
-    next_session: Option<String>,
-) -> Result<()> {
+fn store_record_reply(store: &Mutex<BindingStore>, update_id: i64, reply: &str) -> Result<()> {
     store
         .lock()
         .unwrap()
-        .record_reply(update_id, reply, next_session)
+        .record_reply(update_id, reply, &reply_key(update_id, "reply"))
+}
+
+/// Commit a chat's session change and the finished reply record in one
+/// store mutation — see [`BindingStore::record_reply_and_session`].
+fn store_record_reply_and_session(
+    store: &Mutex<BindingStore>,
+    chat_id: i64,
+    update_id: i64,
+    reply: &str,
+    session_id: Option<String>,
+) -> Result<()> {
+    store.lock().unwrap().record_reply_and_session(
+        chat_id,
+        update_id,
+        reply,
+        &reply_key(update_id, "reply"),
+        session_id,
+    )
 }
 
 fn store_binding(store: &Mutex<BindingStore>, chat_id: i64) -> Result<Option<ChatBinding>> {
@@ -1272,6 +1349,11 @@ mod tests {
         }
     }
 
+    /// Optional override for the synthetic lane's turn output —
+    /// oversized replies exercise the multi-part send path without a
+    /// real agent. `None` answers `"synthetic"`.
+    static LANE_TURN_OUTPUT: Mutex<Option<String>> = Mutex::new(None);
+
     /// The composing host owns conversation access; tests install deterministic
     /// lane answers so the channel admission path stays exercised.
     fn install_synthetic_lane() {
@@ -1309,10 +1391,25 @@ mod tests {
                     thread::sleep(Duration::from_millis(150));
                 }
                 let _ = operation;
-                Ok(json!({"ok": true, "output": "synthetic", "sessionId": "synthetic"}))
+                let output = LANE_TURN_OUTPUT
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "synthetic".to_owned());
+                Ok(json!({"ok": true, "output": output, "sessionId": "synthetic"}))
             },
             outbound_hooks: None,
         });
+    }
+
+    /// Installs the synthetic lane answering each turn with `output`.
+    fn install_lane_with_output(output: String) {
+        install_synthetic_lane();
+        *LANE_TURN_OUTPUT.lock().unwrap() = Some(output);
+    }
+
+    fn reset_lane_output() {
+        *LANE_TURN_OUTPUT.lock().unwrap() = None;
     }
 
     /// A host policy that suppresses every outbound send: mounting it
@@ -1342,6 +1439,63 @@ mod tests {
             _: &a4mc::SendContext,
             _: &a4mc::OutboundMessage,
         ) -> a4mc::ThrottleDecision {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < self.deferrals {
+                a4mc::ThrottleDecision::defer(
+                    "send window open",
+                    Some(Duration::from_millis(self.retry_after_ms)),
+                )
+            } else {
+                a4mc::ThrottleDecision::Allow
+            }
+        }
+    }
+
+    /// A host policy that records the idempotency key of every send
+    /// attempt — including deferred ones — and can hold sends the way
+    /// `DeferringHooks` does. Recovery and retry runs assert on the
+    /// recorded keys to prove a re-delivered unit keeps its original
+    /// key.
+    struct KeyRecordingHooks {
+        attempts: AtomicUsize,
+        deferrals: usize,
+        retry_after_ms: u64,
+        keys: Mutex<Vec<String>>,
+    }
+
+    impl KeyRecordingHooks {
+        fn allowing() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                deferrals: 0,
+                retry_after_ms: 0,
+                keys: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn holding(deferrals: usize, retry_after_ms: u64) -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                deferrals,
+                retry_after_ms,
+                keys: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn observed_keys(&self) -> Vec<String> {
+            self.keys.lock().unwrap().clone()
+        }
+    }
+
+    impl a4mc::OutboundHooks for KeyRecordingHooks {
+        fn throttle(
+            &self,
+            _: &a4mc::SendContext,
+            message: &a4mc::OutboundMessage,
+        ) -> a4mc::ThrottleDecision {
+            self.keys
+                .lock()
+                .unwrap()
+                .push(message.idempotency_key.clone());
             if self.attempts.fetch_add(1, Ordering::SeqCst) < self.deferrals {
                 a4mc::ThrottleDecision::defer(
                     "send window open",
@@ -1981,13 +2135,13 @@ mod tests {
                             update_id: 1,
                             message: queued,
                             reply: None,
-                            next_session: None,
+                            reply_key: None,
                         },
                         crate::binding::PendingUpdate {
                             update_id: 2,
                             message: recorded,
                             reply: Some("agent reply".to_owned()),
-                            next_session: None,
+                            reply_key: None,
                         },
                     ],
                     &[],
@@ -2245,7 +2399,7 @@ mod tests {
                         update_id: 2,
                         message: text_message(43, 43, Some("bob"), "hello agent", 2),
                         reply: Some("agent reply".to_owned()),
-                        next_session: None,
+                        reply_key: None,
                     }],
                     &[],
                     3,
@@ -2344,11 +2498,7 @@ mod tests {
             }])),
             ..MockBotTransport::default()
         };
-        let hooks = Arc::new(DeferringHooks {
-            attempts: AtomicUsize::new(0),
-            deferrals: usize::MAX,
-            retry_after_ms: 60_000,
-        });
+        let hooks = Arc::new(KeyRecordingHooks::holding(usize::MAX, 60_000));
         let stop = Arc::new(AtomicBool::new(false));
         let config = RuntimeConfig {
             poll_timeout_secs: 1,
@@ -2366,6 +2516,11 @@ mod tests {
         handle.join().unwrap();
 
         assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(
+            hooks.observed_keys(),
+            vec!["error:2".to_owned()],
+            "the first fallback attempt did not carry its error key"
+        );
         let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
         assert_eq!(
             tasks.len(),
@@ -2379,17 +2534,25 @@ mod tests {
                 .is_some_and(|reply| reply.starts_with("Error:")),
             "the recorded reply is not the fallback report: {tasks:?}"
         );
+        assert_eq!(
+            tasks[0].reply_key.as_deref(),
+            Some("error:2"),
+            "the persisted fallback lost its original idempotency key: {tasks:?}"
+        );
 
         // Restart with the policy now allowing sends: the drain delivers
-        // the recorded fallback instead of dropping the update unserved.
+        // the recorded fallback under the same key the first attempt
+        // carried, so host dedupe and policy see one logical send.
         let transport = MockBotTransport {
             sent: Arc::clone(&sent),
             ..MockBotTransport::default()
         };
+        let hooks = Arc::new(KeyRecordingHooks::allowing());
         let stop = Arc::new(AtomicBool::new(false));
         let config = RuntimeConfig {
             poll_timeout_secs: 1,
             stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks.clone()),
             ..RuntimeConfig::default()
         };
         let store = BindingStore::open_in(&root).unwrap();
@@ -2398,6 +2561,11 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap();
 
+        assert_eq!(
+            hooks.observed_keys(),
+            vec!["error:2".to_owned()],
+            "the recovered fallback resent under a different key"
+        );
         let messages = sent.lock().unwrap();
         assert_eq!(messages.len(), 1, "delivered sends: {messages:?}");
         assert_eq!(messages[0].0, 7);
@@ -2474,6 +2642,15 @@ mod tests {
             tasks[0].reply.as_deref(),
             Some("Started a new conversation: counted-session."),
             "the finished command's confirmation was not persisted: {tasks:?}"
+        );
+        assert_eq!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .binding(42)
+                .and_then(|binding| binding.session_id.clone())
+                .as_deref(),
+            Some("counted-session"),
+            "the new session binding did not commit with the confirmation"
         );
 
         // Restart with sends unheld: recovery delivers the recorded
@@ -3260,6 +3437,267 @@ mod tests {
             BindingStore::open_in(&root).unwrap().poll_offset(),
             14,
             "the refetched batch did not confirm past its last update"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_fallback_record_surfaces_instead_of_settling_the_task() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        a4mc::lane::clear();
+        let root = temp_root();
+        {
+            // An admitted update on an unpaired chat fails admission
+            // with the fallback path; the seeded store leaves that
+            // record write as the run's first state mutation.
+            let mut store = BindingStore::open_in(&root).unwrap();
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 2,
+                        message: text_message(7, 7, Some("zed"), "/agent", 2),
+                        reply: None,
+                        reply_key: None,
+                    }],
+                    &[],
+                    3,
+                )
+                .unwrap();
+        }
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store.fail_next_write_for_test();
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        // Joining is the barrier: whether the worker processed the
+        // update during the run or while the shutdown drain feeds it
+        // queued work, the record write was attempted before exit.
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the failed fallback record was settled over: {tasks:?}"
+        );
+        assert!(
+            tasks[0].reply.is_none(),
+            "the failed write still recorded a reply: {tasks:?}"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "an unpersisted fallback report was delivered anyway"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_resumed_reply_delivery_never_reverts_a_newer_session_binding() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        a4mc::lane::clear();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+            // A later command already moved the binding forward; the
+            // recorded reply's own session change committed with it.
+            // Recovery must deliver the reply only — re-applying the
+            // older routing would send every later message back to
+            // the stale conversation.
+            store.set_session(42, Some("session-newer".into())).unwrap();
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 1,
+                        message: text_message(42, 42, Some("alice"), "hello agent", 1),
+                        reply: Some("agent reply".into()),
+                        reply_key: None,
+                    }],
+                    &[],
+                    2,
+                )
+                .unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let reopened = BindingStore::open_in(&root).unwrap();
+        assert_eq!(
+            reopened
+                .binding(42)
+                .and_then(|binding| binding.session_id.clone())
+                .as_deref(),
+            Some("session-newer"),
+            "recovery reverted the chat binding to an older session"
+        );
+        assert!(
+            reopened.pending_updates().is_empty(),
+            "the delivered reply stayed pending"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_oversized_turn_reply_is_split_into_contract_valid_sends() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let big = "x".repeat(a4mc::MAX_OUTBOUND_TEXT_CHARS + 5_000);
+        install_lane_with_output(big.clone());
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 5,
+                message: Some(text_message(42, 42, Some("alice"), "hello agent", 5)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let hooks = Arc::new(KeyRecordingHooks::allowing());
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks.clone()),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || hooks.attempts.load(Ordering::SeqCst) >= 2,
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        reset_lane_output();
+
+        // One oversized lane output becomes contract-bound parts, each
+        // under its own stable key; the platform chunker then posts
+        // each part in order, so the concatenation is the full reply.
+        assert_eq!(
+            hooks.observed_keys(),
+            vec!["reply:5".to_owned(), "reply:5:1".to_owned()],
+            "the oversized reply was not split under stable part keys"
+        );
+        let reassembled: String = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(reassembled, big, "the delivered parts lost reply text");
+        assert!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .is_empty(),
+            "the delivered multi-part reply stayed pending"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_oversized_recorded_reply_delivers_as_stable_keyed_parts_on_restart() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        a4mc::lane::clear();
+        let root = temp_root();
+        // A reply recorded above the contract bound used to be retried
+        // as one invalid send forever. The restart drain now fans it
+        // out into contract-valid parts under the recorded key's
+        // derived part keys.
+        let big = "x".repeat(a4mc::MAX_OUTBOUND_TEXT_CHARS + 5_000);
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 2,
+                        message: text_message(43, 43, Some("bob"), "hello agent", 2),
+                        reply: Some(big.clone()),
+                        reply_key: None,
+                    }],
+                    &[],
+                    3,
+                )
+                .unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let hooks = Arc::new(KeyRecordingHooks::allowing());
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks.clone()),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || hooks.attempts.load(Ordering::SeqCst) >= 2,
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(
+            hooks.observed_keys(),
+            vec!["reply:2".to_owned(), "reply:2:1".to_owned()],
+            "the recorded reply did not resend under its stable part keys"
+        );
+        let reassembled: String = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(reassembled, big, "the delivered parts lost reply text");
+        let reopened = BindingStore::open_in(&root).unwrap();
+        assert!(
+            reopened.pending_updates().is_empty(),
+            "the fully delivered recorded reply stayed pending"
         );
         let _ = std::fs::remove_dir_all(root);
     }
