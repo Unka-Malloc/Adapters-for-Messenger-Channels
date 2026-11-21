@@ -91,6 +91,18 @@ pub struct PendingUpdate {
     /// ordinary `reply:` key for it.
     #[serde(default)]
     pub reply_key: Option<String>,
+    /// How many of the recorded reply's contract-level sends were
+    /// confirmed delivered, in order. Recovery resends only the tail —
+    /// the confirmed prefix is never reposted.
+    #[serde(default)]
+    pub reply_sent: usize,
+    /// The platform-level checkpoint of the send that stopped the last
+    /// delivery attempt: the confirmed part prefix and whether the
+    /// stopping part's outcome is uncertain. Recovery seeds the channel
+    /// with it so the resend continues the same logical send; an
+    /// uncertain outcome is refused rather than blindly reposted.
+    #[serde(default)]
+    pub reply_progress: Option<crate::transport::SendProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -180,6 +192,13 @@ impl BindingStore {
             let mut document = read_document(&self.path)?;
             let value = change(&mut document)?;
             let raw = serde_json::to_string_pretty(&document)?;
+            // The file must stay readable under its own bound: a
+            // mutation whose result would exceed the read limit is
+            // refused before it replaces the document, so the store can
+            // never land in a shape the next open rejects. Callers
+            // treat the refusal like a full disk — work it could not
+            // hold stays unconfirmed until the backlog drains.
+            ensure!(raw.len() <= MAX_STATE_BYTES, "a4mc_telegram_state_full");
             atomic_write_private_text(&self.path, &raw)?;
             self.document = document;
             Ok(value)
@@ -433,6 +452,8 @@ impl BindingStore {
             {
                 task.reply = Some(reply.to_owned());
                 task.reply_key = Some(key.to_owned());
+                task.reply_sent = 0;
+                task.reply_progress = None;
             }
             Ok(())
         })
@@ -467,6 +488,8 @@ impl BindingStore {
             {
                 task.reply = Some(reply.to_owned());
                 task.reply_key = Some(key.to_owned());
+                task.reply_sent = 0;
+                task.reply_progress = None;
             }
             Ok(())
         })
@@ -495,9 +518,35 @@ impl BindingStore {
             {
                 task.reply = Some(reply.to_owned());
                 task.reply_key = Some(key.to_owned());
+                task.reply_sent = 0;
+                task.reply_progress = None;
                 return Ok(true);
             }
             Ok(false)
+        })
+    }
+
+    /// Advance a recorded reply's durable delivery checkpoint: `sent`
+    /// counts the contract-level sends confirmed so far, `progress` is
+    /// the platform-level checkpoint of the send that stopped (cleared
+    /// once the reply's fan-out completes a part). The confirmed prefix
+    /// only ever moves forward — a stale write can never drag it back.
+    pub fn record_reply_progress(
+        &mut self,
+        update_id: i64,
+        sent: usize,
+        progress: Option<crate::transport::SendProgress>,
+    ) -> Result<()> {
+        self.mutate(|document| {
+            if let Some(task) = document
+                .pending_updates
+                .iter_mut()
+                .find(|task| task.update_id == update_id)
+            {
+                task.reply_sent = task.reply_sent.max(sent);
+                task.reply_progress = progress;
+            }
+            Ok(())
         })
     }
 
@@ -866,6 +915,8 @@ mod tests {
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
                     }],
                     &[],
                     8,
@@ -903,6 +954,38 @@ mod tests {
                 Some("Started a new conversation: s2")
             );
             assert_eq!(task.reply_key.as_deref(), Some("reply:7"));
+        });
+    }
+
+    #[test]
+    fn a_mutation_over_the_read_limit_is_refused_before_replacing_the_file() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 3,
+                        message: inbound_message(3, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                    }],
+                    &[],
+                    4,
+                )
+                .unwrap();
+            // A reply larger than the bounded read limit must be
+            // refused outright: the file it would have replaced stays
+            // readable, so the unacknowledged work can still drain.
+            let oversized = "x".repeat(MAX_STATE_BYTES);
+            let error = store.record_reply(3, &oversized, "reply:3").unwrap_err();
+            assert_eq!(error.to_string(), "a4mc_telegram_state_full");
+            let reopened = BindingStore::open(store.path.clone()).unwrap();
+            assert_eq!(reopened.poll_offset(), 4);
+            assert!(reopened.pending_updates()[0].reply.is_none());
+            // Shrinking work still commits after the refusal.
+            store.complete_update(3).unwrap();
+            assert!(store.pending_updates().is_empty());
         });
     }
 }

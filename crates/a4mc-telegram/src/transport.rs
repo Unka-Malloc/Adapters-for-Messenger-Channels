@@ -44,7 +44,8 @@ pub struct TelegramApiError {
 
 /// Where a chunked `sendMessage` send stopped, kept by the idempotency
 /// owner so a retry resumes instead of blindly reposting confirmed parts.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SendProgress {
     /// Platform message ids confirmed in send order before the stop.
     pub confirmed: Vec<i64>,

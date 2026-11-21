@@ -16,7 +16,7 @@ use super::bridge::{
     open_session, resolve_session_selector, send_turn,
 };
 use super::channel::TelegramChannel;
-use super::transport::{BotIdentity, BotTransport, InboundMessage, bot_commands};
+use super::transport::{BotIdentity, BotTransport, InboundMessage, SendProgress, bot_commands};
 use crate::binding::{BindingStore, ChatBinding, DroppedUpdate, PairingRecord};
 use crate::control::{
     ControlCommand, ControlOutcome, commands_text, help_text, parse_control_command,
@@ -375,12 +375,32 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                     .lock()
                     .unwrap()
                     .record_fallback_reply(update_id, &text, &key)?;
-                let delivered = deliver_sends(
-                    &processor_channel,
-                    &reply_sends(chat_id, message.message_id, &key, &text),
-                    &processor_stop,
-                )
-                .is_ok();
+                let delivered = if recorded {
+                    deliver_recorded_reply(
+                        &processor_channel,
+                        &processor_store,
+                        chat_id,
+                        message.message_id,
+                        update_id,
+                        &key,
+                        &text,
+                        0,
+                        None,
+                        true,
+                        &processor_stop,
+                    )
+                    .is_ok()
+                } else {
+                    // The slot already holds a finished agent reply
+                    // the report must not shadow — and must not earn
+                    // delivery progress on either.
+                    deliver_sends(
+                        &processor_channel,
+                        &reply_sends(chat_id, message.message_id, &key, &text),
+                        &processor_stop,
+                    )
+                    .is_ok()
+                };
                 // A fallback that was both recorded and delivered ends
                 // the task outright; anything else — an undelivered
                 // report, or a finished agent reply still owed — keeps
@@ -410,46 +430,70 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     // change. A resend the host's policy is holding retries after the
     // store lock drops — parking on its deferral window under the lock
     // would stall every worker's store access.
-    let mut held: Vec<(i64, Vec<a4mc::OutboundMessage>)> = Vec::new();
-    {
-        let mut guard = store.lock().unwrap();
-        for task in guard.pending_updates() {
-            match task.reply {
-                Some(reply) => {
-                    // The resend repeats the delivery key the first
-                    // attempt carried; records that predate the field
-                    // derive the ordinary reply key.
-                    let key = task
-                        .reply_key
-                        .unwrap_or_else(|| reply_key(task.update_id, "reply"));
-                    let parts =
-                        reply_sends(task.message.chat_id, task.message.message_id, &key, &reply);
-                    // Deliver parts in order: a policy hold parks the
-                    // remainder for the off-lock wait below; a
-                    // rejection leaves the record for the next
-                    // restart's resend under the same keys.
-                    let mut sent_count = 0usize;
-                    while sent_count < parts.len() {
-                        match channel.send(&parts[sent_count]) {
-                            Ok(_) => sent_count += 1,
-                            Err(error) if is_outbound_deferral(&error) => {
-                                held.push((task.update_id, parts[sent_count..].to_vec()));
-                                break;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    if sent_count == parts.len() {
-                        let _ = guard.complete_update(task.update_id);
-                    }
-                }
-                None => pending.push_back(task.message),
+    let mut held: Vec<crate::binding::PendingUpdate> = Vec::new();
+    let unfinished = store.lock().unwrap().pending_updates();
+    for task in unfinished {
+        let Some(reply) = task.reply.clone() else {
+            pending.push_back(task.message.clone());
+            continue;
+        };
+        // The resend repeats the delivery key the first attempt
+        // carried and resumes at the persisted checkpoint — the
+        // confirmed prefix is never reposted and a part whose outcome
+        // is uncertain is refused rather than duplicated. Records
+        // that predate the fields derive the ordinary reply key and a
+        // cold start.
+        let key = task
+            .reply_key
+            .clone()
+            .unwrap_or_else(|| reply_key(task.update_id, "reply"));
+        match deliver_recorded_reply(
+            &channel,
+            &store,
+            task.message.chat_id,
+            task.message.message_id,
+            task.update_id,
+            &key,
+            &reply,
+            task.reply_sent,
+            task.reply_progress.clone(),
+            false,
+            &config.stop,
+        ) {
+            Ok(()) => {
+                let _ = store.lock().unwrap().complete_update(task.update_id);
             }
+            // A policy hold parks the remainder for the off-lock wait
+            // below; a rejection leaves the record — and the checkpoint
+            // it earned — for the next restart's resend.
+            Err(error) if is_policy_deferral(&error) => held.push(task),
+            Err(_) => {}
         }
     }
-    for (update_id, parts) in held {
-        if deliver_sends(&channel, &parts, &config.stop).is_ok() {
-            let _ = store.lock().unwrap().complete_update(update_id);
+    for task in held {
+        let Some(reply) = task.reply.clone() else {
+            continue;
+        };
+        let key = task
+            .reply_key
+            .clone()
+            .unwrap_or_else(|| reply_key(task.update_id, "reply"));
+        if deliver_recorded_reply(
+            &channel,
+            &store,
+            task.message.chat_id,
+            task.message.message_id,
+            task.update_id,
+            &key,
+            &reply,
+            task.reply_sent,
+            task.reply_progress.clone(),
+            true,
+            &config.stop,
+        )
+        .is_ok()
+        {
+            let _ = store.lock().unwrap().complete_update(task.update_id);
         }
     }
     let mut on_event = config.on_event.take();
@@ -620,6 +664,8 @@ fn poll_updates<T: BotTransport>(
                                 message: message.clone(),
                                 reply: None,
                                 reply_key: None,
+                                reply_sent: 0,
+                                reply_progress: None,
                             });
                             admitted.push(message);
                         }
@@ -863,6 +909,76 @@ fn deliver_sends<T: BotTransport>(
     Ok(())
 }
 
+/// Deliver one durably-recorded reply's sends, part after part, from
+/// its persisted checkpoint: `sent` counts the contract-level sends
+/// already confirmed (skipped, never reposted), and the send at `sent`
+/// resumes the platform-level progress its last attempt recorded.
+/// Every confirmed part and every mid-flight checkpoint lands in the
+/// store, so a restart resumes instead of reposting confirmed work or
+/// blindly retrying a part whose outcome is uncertain. `wait` parks
+/// on the host's deferral window; without it the first deferral
+/// returns so the caller can wait off any lock it holds.
+#[allow(clippy::too_many_arguments)]
+fn deliver_recorded_reply<T: BotTransport>(
+    channel: &TelegramChannel<T>,
+    store: &Mutex<BindingStore>,
+    chat_id: i64,
+    reply_to_message_id: i64,
+    update_id: i64,
+    key: &str,
+    reply: &str,
+    sent: usize,
+    progress: Option<SendProgress>,
+    wait: bool,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let parts = reply_sends(chat_id, reply_to_message_id, key, reply);
+    if sent >= parts.len() {
+        return Ok(());
+    }
+    let mut resume = progress;
+    for (index, part) in parts.iter().enumerate().skip(sent) {
+        loop {
+            match channel.send_tracked(part, resume.as_ref()) {
+                Ok(_) => {
+                    resume = None;
+                    store
+                        .lock()
+                        .unwrap()
+                        .record_reply_progress(update_id, index + 1, None)?;
+                    break;
+                }
+                Err(tracked) if is_outbound_deferral(&tracked.error) => {
+                    let window = tracked
+                        .error
+                        .retry_after_ms
+                        .map(Duration::from_millis)
+                        .unwrap_or(DEFERRED_RETRY_WAIT);
+                    if !wait || !wait_or_stop(window, stop) {
+                        return Err(channel_err(tracked.error));
+                    }
+                }
+                Err(tracked) => {
+                    // Persist the checkpoint the attempt left behind —
+                    // including the uncertain-outcome flag — so the
+                    // restart drain resumes the same logical send. A
+                    // failure before the transport ran leaves the
+                    // stored checkpoint untouched.
+                    if let Some(progress) = tracked.progress {
+                        store.lock().unwrap().record_reply_progress(
+                            update_id,
+                            index,
+                            Some(progress),
+                        )?;
+                    }
+                    return Err(channel_err(tracked.error));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn send_reply<T: BotTransport>(
     channel: &TelegramChannel<T>,
     message: &InboundMessage,
@@ -975,11 +1091,28 @@ fn handle_command<T: BotTransport>(
             } else {
                 opened
             };
-            store_set_session(store, message.chat_id, Some(session_id.clone()))?;
-            send_reply(
+            // The binding change and its confirmation commit in one
+            // write — the same rule /new follows — so a restart only
+            // ever resumes delivery, never re-opens the selector.
+            let confirmation = format!("Bound session: {session_id}");
+            store_record_reply_and_session(
+                store,
+                message.chat_id,
+                message.update_id,
+                &confirmation,
+                Some(session_id),
+            )?;
+            deliver_recorded_reply(
                 channel,
-                message,
-                &format!("Bound session: {session_id}"),
+                store,
+                message.chat_id,
+                message.message_id,
+                message.update_id,
+                &reply_key(message.update_id, "reply"),
+                &confirmation,
+                0,
+                None,
+                true,
                 stop,
             )?;
         }
@@ -1014,7 +1147,19 @@ fn handle_command<T: BotTransport>(
                     Some(opened.clone())
                 },
             )?;
-            send_reply(channel, message, &confirmation, stop)?;
+            deliver_recorded_reply(
+                channel,
+                store,
+                message.chat_id,
+                message.message_id,
+                message.update_id,
+                &reply_key(message.update_id, "reply"),
+                &confirmation,
+                0,
+                None,
+                true,
+                stop,
+            )?;
         }
         ControlCommand::Stop => {
             send_reply(
@@ -1124,7 +1269,19 @@ fn handle_ordinary<T: BotTransport>(
             Some(next_session),
         )?;
     }
-    send_reply(channel, message, &reply, stop)?;
+    deliver_recorded_reply(
+        channel,
+        store,
+        message.chat_id,
+        message.message_id,
+        message.update_id,
+        &reply_key(message.update_id, "reply"),
+        &reply,
+        0,
+        None,
+        true,
+        stop,
+    )?;
     Ok(())
 }
 
@@ -1218,14 +1375,6 @@ fn store_set_agent(
     agent_id: Option<String>,
 ) -> Result<ChatBinding> {
     store.lock().unwrap().set_agent(chat_id, agent_id)
-}
-
-fn store_set_session(
-    store: &Mutex<BindingStore>,
-    chat_id: i64,
-    session_id: Option<String>,
-) -> Result<ChatBinding> {
-    store.lock().unwrap().set_session(chat_id, session_id)
 }
 
 fn status_text(
@@ -2136,12 +2285,16 @@ mod tests {
                             message: queued,
                             reply: None,
                             reply_key: None,
+                            reply_sent: 0,
+                            reply_progress: None,
                         },
                         crate::binding::PendingUpdate {
                             update_id: 2,
                             message: recorded,
                             reply: Some("agent reply".to_owned()),
                             reply_key: None,
+                            reply_sent: 0,
+                            reply_progress: None,
                         },
                     ],
                     &[],
@@ -2400,6 +2553,8 @@ mod tests {
                         message: text_message(43, 43, Some("bob"), "hello agent", 2),
                         reply: Some("agent reply".to_owned()),
                         reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
                     }],
                     &[],
                     3,
@@ -3460,6 +3615,8 @@ mod tests {
                         message: text_message(7, 7, Some("zed"), "/agent", 2),
                         reply: None,
                         reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
                     }],
                     &[],
                     3,
@@ -3528,6 +3685,8 @@ mod tests {
                         message: text_message(42, 42, Some("alice"), "hello agent", 1),
                         reply: Some("agent reply".into()),
                         reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
                     }],
                     &[],
                     2,
@@ -3654,6 +3813,8 @@ mod tests {
                         message: text_message(43, 43, Some("bob"), "hello agent", 2),
                         reply: Some(big.clone()),
                         reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
                     }],
                     &[],
                     3,
@@ -3699,6 +3860,202 @@ mod tests {
             reopened.pending_updates().is_empty(),
             "the fully delivered recorded reply stayed pending"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_restart_resumes_a_recorded_reply_from_its_persisted_checkpoint() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        a4mc::lane::clear();
+        let root = temp_root();
+        // One contract send whose platform fan-out stopped after part
+        // zero: the checkpoint is durable, so the drain must post only
+        // the unconfirmed tail — never the confirmed prefix again.
+        let big = "x".repeat(5_000);
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 2,
+                        message: text_message(43, 43, Some("bob"), "hello agent", 2),
+                        reply: Some(big.clone()),
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: Some(SendProgress {
+                            confirmed: vec![91],
+                            next_part: 1,
+                            outcome_unknown: false,
+                        }),
+                    }],
+                    &[],
+                    3,
+                )
+                .unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let posts = sent.lock().unwrap();
+        assert_eq!(
+            posts.len(),
+            1,
+            "the confirmed prefix was reposted: {posts:?}"
+        );
+        assert_eq!(
+            posts[0].1.len(),
+            5_000 - 4096,
+            "the resumed send did not continue at the checkpoint"
+        );
+        drop(posts);
+        assert!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .is_empty(),
+            "the resumed reply stayed pending after delivery"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_restart_never_reposts_a_recorded_replys_uncertain_part() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        a4mc::lane::clear();
+        let root = temp_root();
+        // The stopping part's outcome never reached the last run — it
+        // may already be posted, so the drain refuses to resend it
+        // rather than duplicate a delivered message. The record stays
+        // for an operator decision instead of silently settling.
+        let big = "x".repeat(5_000);
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 2,
+                        message: text_message(43, 43, Some("bob"), "hello agent", 2),
+                        reply: Some(big.clone()),
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: Some(SendProgress {
+                            confirmed: vec![91],
+                            next_part: 1,
+                            outcome_unknown: true,
+                        }),
+                    }],
+                    &[],
+                    3,
+                )
+                .unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        // The drain's refusal is immediate; give it one beat, then end.
+        thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a part with an uncertain outcome was reposted"
+        );
+        let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the ambiguous send was settled without delivery: {tasks:?}"
+        );
+        assert!(tasks[0].reply.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stopped_reply_persists_its_checkpoint_for_the_next_restart() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_lane_with_output("x".repeat(5_000));
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        // The platform fan-out of the recorded reply stops at part 1
+        // with a definitive rejection: the run must persist that
+        // checkpoint so a restart resumes instead of reposting.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 5,
+                message: Some(text_message(42, 42, Some("alice"), "hello agent", 5)),
+            }])),
+            fail_send_at_part: Some((
+                1,
+                TelegramApiError::new("a4mc_telegram_api_failed", "fixture rejection"),
+                false,
+            )),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || {
+                BindingStore::open_in(&root)
+                    .unwrap()
+                    .pending_updates()
+                    .first()
+                    .is_some_and(|task| task.reply_progress.is_some())
+            },
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        reset_lane_output();
+
+        let task = BindingStore::open_in(&root).unwrap().pending_updates()[0].clone();
+        assert_eq!(task.reply_sent, 0);
+        let progress = task.reply_progress.expect("checkpoint not persisted");
+        assert_eq!(progress.next_part, 1);
+        assert!(!progress.outcome_unknown);
         let _ = std::fs::remove_dir_all(root);
     }
 }
