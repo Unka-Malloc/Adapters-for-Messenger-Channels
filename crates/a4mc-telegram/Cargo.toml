@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../../README.md"
-version = "0.1.0"
+version = "0.2.0"
 
 # The dialect owns the Telegram side of the boundary only. Bot-token
 # custody resolves through the host-installed `a4mc::custody` port — the

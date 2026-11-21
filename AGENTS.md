@@ -15,10 +15,15 @@ Two layers, one boundary rule each way:
   receive mechanism, update lowering onto `a4mc`, and outbound send
   lowering. A dialect depends on `a4mc` and on no sibling dialect.
 
-Custody, lane work and admission policy stay in the host. A channel
-capability that is only partially implemented is declared and reported
-as such — never claimed supported, and never silently dropped.
+Custody, lane work and admission policy stay in the host. Outbound
+interception (skip, window batching, throttle budget, dedupe-key
+derivation, delivery receipt) is caller-mounted through `OutboundHooks`
+and applied uniformly by every channel's `OutboundPipeline`; the
+contract crate and the dialects embed no Quiet/Already-Told/Digest or
+other business rule. A channel capability that is only partially
+implemented is declared and reported as such — never claimed supported,
+and never silently dropped.
 
 ## Verify
 
-`scripts/verify.sh`
+`scripts/verify.sh`; `scripts/package-check.sh` before tag packaging.

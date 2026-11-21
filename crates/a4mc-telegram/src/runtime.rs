@@ -15,6 +15,7 @@ use super::bridge::{
     ensure_known_agent, format_agent_list, format_session_list, list_agents, list_sessions,
     open_session, resolve_session_selector, send_turn,
 };
+use super::channel::TelegramChannel;
 use super::transport::{BotIdentity, BotTransport, InboundMessage, bot_commands};
 use crate::binding::{BindingStore, ChatBinding, DroppedUpdate, PairingRecord};
 use crate::control::{
@@ -52,6 +53,12 @@ pub struct RuntimeConfig {
     /// runtime persists the update id in the binding store, so the loss
     /// is durable and inspectable rather than silent.
     pub on_event: Option<OnEvent>,
+    /// Outbound send policy for every reply this runtime generates —
+    /// command replies, agent replies and fallback errors are outbound
+    /// sends and run through the same pipeline as host-initiated sends.
+    /// `None` resolves the lane port's hook provider; with neither
+    /// mounted the sends pass through.
+    pub outbound_hooks: Option<Arc<dyn a4mc::OutboundHooks>>,
 }
 
 /// The readiness hook invoked once after a successful Bot API handshake.
@@ -72,6 +79,7 @@ impl Default for RuntimeConfig {
             max_poll_failures: 8,
             on_started: None,
             on_event: None,
+            outbound_hooks: None,
         }
     }
 }
@@ -277,14 +285,23 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         Arc::clone(&config.stop),
     ));
 
-    let processor_transport = Arc::clone(&transport);
+    // Every reply the runtime generates — command, agent and fallback
+    // error alike — is an outbound send: it runs through the channel's
+    // pipeline so a mounted host policy governs it like any other send.
+    let channel = TelegramChannel::new(Arc::clone(&transport));
+    let channel = Arc::new(match config.outbound_hooks.take() {
+        Some(hooks) => channel.with_outbound_hooks(hooks),
+        None => channel,
+    });
+
+    let processor_channel = Arc::clone(&channel);
     let processor_store = Arc::clone(&store);
     let processor_identity = identity.clone();
     let turn_deadline = config.turn_deadline;
     let processor = move |chat_id: i64, message: InboundMessage| {
         let update_id = message.update_id;
         match handle_inbound(
-            &*processor_transport,
+            &processor_channel,
             &processor_store,
             &processor_identity,
             &message,
@@ -295,12 +312,13 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 Ok(())
             }
             Err(error) => {
-                let _ = processor_transport.send_message(
+                let _ = processor_channel.send(&reply_message(
                     chat_id,
+                    message.message_id,
+                    update_id,
+                    "error",
                     &sanitize_error(&error),
-                    Some(message.message_id),
-                    None,
-                );
+                ));
                 // A task whose finished reply never got delivered keeps
                 // its record — restart resumes that stage; anything else
                 // was fully handled and settles here.
@@ -327,13 +345,14 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                     if let Some(session) = task.next_session.filter(|s| !s.is_empty()) {
                         let _ = guard.set_session(task.message.chat_id, Some(session));
                     }
-                    if transport
-                        .send_message(
+                    if channel
+                        .send(&reply_message(
                             task.message.chat_id,
+                            task.message.message_id,
+                            task.update_id,
+                            "reply",
                             &reply,
-                            Some(task.message.message_id),
-                            None,
-                        )
+                        ))
                         .is_ok()
                     {
                         let _ = guard.complete_update(task.update_id);
@@ -551,7 +570,7 @@ fn drain_pending(scheduler: &Scheduler, pending: &mut VecDeque<InboundMessage>) 
 }
 
 fn handle_inbound<T: BotTransport>(
-    transport: &T,
+    channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
     identity: &BotIdentity,
     message: &InboundMessage,
@@ -563,27 +582,57 @@ fn handle_inbound<T: BotTransport>(
     }
     match parse_control_command(&message.control_text()) {
         ControlOutcome::Command(command) => {
-            handle_command(transport, store, identity, message, command)
+            handle_command(channel, store, identity, message, command)
         }
         ControlOutcome::OrdinaryText(_) => {
             let body = message.agent_text();
             if body.trim().is_empty() {
                 return Ok(());
             }
-            handle_ordinary(transport, store, message, &body, turn_deadline)
+            handle_ordinary(channel, store, message, &body, turn_deadline)
         }
     }
 }
 
-fn send_reply<T: BotTransport>(transport: &T, message: &InboundMessage, text: &str) -> Result<()> {
-    transport
-        .send_message(message.chat_id, text, Some(message.message_id), None)
+/// The normalized send for one runtime-generated reply. `purpose`
+/// distinguishes the reply produced by handling the update (`reply`)
+/// from the fallback error report for the same update (`error`), so a
+/// recorded agent reply can never be shadowed by an observed error
+/// receipt under the same dedupe key.
+fn reply_message(
+    chat_id: i64,
+    reply_to_message_id: i64,
+    update_id: i64,
+    purpose: &str,
+    text: &str,
+) -> a4mc::OutboundMessage {
+    let mut outbound =
+        a4mc::OutboundMessage::new(chat_id.to_string(), text, format!("{purpose}:{update_id}"));
+    outbound.reply_to_message_id = Some(a4mc::ExternalMessageId::from(
+        reply_to_message_id.to_string(),
+    ));
+    outbound
+}
+
+fn send_reply<T: BotTransport>(
+    channel: &TelegramChannel<T>,
+    message: &InboundMessage,
+    text: &str,
+) -> Result<()> {
+    channel
+        .send(&reply_message(
+            message.chat_id,
+            message.message_id,
+            message.update_id,
+            "reply",
+            text,
+        ))
         .map(|_| ())
-        .map_err(api_err)
+        .map_err(channel_err)
 }
 
 fn handle_command<T: BotTransport>(
-    transport: &T,
+    channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
     identity: &BotIdentity,
     message: &InboundMessage,
@@ -591,21 +640,21 @@ fn handle_command<T: BotTransport>(
 ) -> Result<()> {
     match command {
         ControlCommand::Help => {
-            send_reply(transport, message, &help_text(&identity.username))?;
+            send_reply(channel, message, &help_text(&identity.username))?;
         }
         ControlCommand::Commands => {
-            send_reply(transport, message, &commands_text())?;
+            send_reply(channel, message, &commands_text())?;
         }
         ControlCommand::Start | ControlCommand::Pair => {
-            handle_pair_request(transport, store, identity, message)?;
+            handle_pair_request(channel, store, identity, message)?;
         }
         ControlCommand::Whoami => {
-            send_reply(transport, message, &whoami_text(message))?;
+            send_reply(channel, message, &whoami_text(message))?;
         }
         ControlCommand::Unpair => {
             let revoked = store_revoke(store, message.chat_id)?;
             send_reply(
-                transport,
+                channel,
                 message,
                 if revoked {
                     "Pairing revoked for this chat. Send /start to pair again."
@@ -617,13 +666,13 @@ fn handle_command<T: BotTransport>(
         ControlCommand::Status => {
             if !store_is_paired(store, message.chat_id, message.user_id)? {
                 send_reply(
-                    transport,
+                    channel,
                     message,
                     "Not paired. Send /start to request a pairing code.",
                 )?;
             } else {
                 send_reply(
-                    transport,
+                    channel,
                     message,
                     &status_text(store, identity, message.chat_id)?,
                 )?;
@@ -632,7 +681,7 @@ fn handle_command<T: BotTransport>(
         ControlCommand::Agent { agent_id: None } => {
             require_paired(store, message)?;
             let agents = list_agents().map_err(|error| anyhow!(error.to_string()))?;
-            send_reply(transport, message, &format_agent_list(&agents))?;
+            send_reply(channel, message, &format_agent_list(&agents))?;
         }
         ControlCommand::Agent {
             agent_id: Some(agent_id),
@@ -641,7 +690,7 @@ fn handle_command<T: BotTransport>(
             ensure_known_agent(&agent_id).map_err(|error| anyhow!(error.to_string()))?;
             let binding = store_set_agent(store, message.chat_id, Some(agent_id.clone()))?;
             send_reply(
-                transport,
+                channel,
                 message,
                 &format!(
                     "Bound agent: {}.\nSession cleared. Use /session or /new, then send a message.",
@@ -653,7 +702,7 @@ fn handle_command<T: BotTransport>(
             require_paired(store, message)?;
             let agent_id = require_agent(store, message.chat_id)?;
             let sessions = list_sessions(&agent_id).map_err(|error| anyhow!(error.to_string()))?;
-            send_reply(transport, message, &format_session_list(&sessions))?;
+            send_reply(channel, message, &format_session_list(&sessions))?;
         }
         ControlCommand::Session {
             selector: Some(selector),
@@ -671,7 +720,7 @@ fn handle_command<T: BotTransport>(
                 opened
             };
             store_set_session(store, message.chat_id, Some(session_id.clone()))?;
-            send_reply(transport, message, &format!("Bound session: {session_id}"))?;
+            send_reply(channel, message, &format!("Bound session: {session_id}"))?;
         }
         ControlCommand::New | ControlCommand::Reset => {
             require_paired(store, message)?;
@@ -688,7 +737,7 @@ fn handle_command<T: BotTransport>(
                 },
             )?;
             send_reply(
-                transport,
+                channel,
                 message,
                 &format!(
                     "Started a new conversation{}.",
@@ -702,14 +751,14 @@ fn handle_command<T: BotTransport>(
         }
         ControlCommand::Stop => {
             send_reply(
-                transport,
+                channel,
                 message,
                 "This channel processes one turn at a time. There is no separate in-flight interrupt yet; wait for the current reply, or use /new for a fresh conversation.",
             )?;
         }
         ControlCommand::Unknown { name } => {
             send_reply(
-                transport,
+                channel,
                 message,
                 &format!("Unknown command /{name}. Use /commands for the catalog."),
             )?;
@@ -719,14 +768,14 @@ fn handle_command<T: BotTransport>(
 }
 
 fn handle_pair_request<T: BotTransport>(
-    transport: &T,
+    channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
     identity: &BotIdentity,
     message: &InboundMessage,
 ) -> Result<()> {
     if store_is_paired(store, message.chat_id, message.user_id)? {
         send_reply(
-            transport,
+            channel,
             message,
             &format!(
                 "Already paired.\n{}",
@@ -741,12 +790,12 @@ fn handle_pair_request<T: BotTransport>(
         message.user_id,
         message.username.clone(),
     )?;
-    send_reply(transport, message, &pairing_code_text(&pending.code))?;
+    send_reply(channel, message, &pairing_code_text(&pending.code))?;
     Ok(())
 }
 
 fn handle_ordinary<T: BotTransport>(
-    transport: &T,
+    channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
     message: &InboundMessage,
     text: &str,
@@ -763,7 +812,7 @@ fn handle_ordinary<T: BotTransport>(
             message.username.clone(),
         )?;
         send_reply(
-            transport,
+            channel,
             message,
             &format!("Pairing required.\n{}", pairing_code_text(&pending.code)),
         )?;
@@ -771,7 +820,7 @@ fn handle_ordinary<T: BotTransport>(
     };
     let Some(agent_id) = binding.agent_id.clone() else {
         send_reply(
-            transport,
+            channel,
             message,
             "No agent bound. Use /agent to list agents, then /agent <id>.",
         )?;
@@ -802,7 +851,7 @@ fn handle_ordinary<T: BotTransport>(
     if !next_session.is_empty() && binding.session_id.as_deref() != Some(next_session.as_str()) {
         store_set_session(store, message.chat_id, Some(next_session))?;
     }
-    send_reply(transport, message, &reply)?;
+    send_reply(channel, message, &reply)?;
     Ok(())
 }
 
@@ -936,7 +985,7 @@ fn pairing_code_text(code: &str) -> String {
     )
 }
 
-fn api_err(error: super::transport::TelegramApiError) -> anyhow::Error {
+fn channel_err(error: a4mc::ChannelError) -> anyhow::Error {
     anyhow!("{}: {}", error.code, error.message)
 }
 
@@ -1034,6 +1083,7 @@ mod tests {
             let _ = params;
             Ok(json!({"sessions": []}))
         }
+        lane::clear();
         let _ = lane::install(LanePort {
             scan_targets,
             conversation_list: empty,
@@ -1052,7 +1102,19 @@ mod tests {
                 let _ = operation;
                 Ok(json!({"ok": true, "output": "synthetic", "sessionId": "synthetic"}))
             },
+            outbound_hooks: None,
         });
+    }
+
+    /// A host policy that suppresses every outbound send: mounting it
+    /// must silence command replies, agent replies and fallback errors
+    /// alike, because they all travel the channel's pipeline.
+    struct SkipAll;
+
+    impl a4mc::OutboundHooks for SkipAll {
+        fn skip(&self, _: &a4mc::SendContext, _: &a4mc::OutboundMessage) -> a4mc::SkipDecision {
+            a4mc::SkipDecision::skip("host fixture policy")
+        }
     }
 
     fn wait_until<F: Fn() -> bool>(condition: F, timeout: Duration) {
@@ -1183,9 +1245,10 @@ mod tests {
             sent: sent.clone(),
             ..MockBotTransport::default()
         };
+        let channel = TelegramChannel::new(Arc::new(transport));
         let message = text_message(99, 77, Some("bob"), "/start", 1);
         handle_inbound(
-            &transport,
+            &channel,
             &store,
             &BotIdentity::default(),
             &message,
@@ -1196,7 +1259,7 @@ mod tests {
         store.lock().unwrap().approve(&code).unwrap();
         let list = text_message(99, 77, Some("bob"), "/agent", 2);
         handle_inbound(
-            &transport,
+            &channel,
             &store,
             &BotIdentity::default(),
             &list,
@@ -1225,12 +1288,13 @@ mod tests {
             sent: sent.clone(),
             ..MockBotTransport::default()
         };
+        let channel = TelegramChannel::new(Arc::new(transport));
         let identity = BotIdentity {
             username: "a4mc_bot".into(),
             ..BotIdentity::default()
         };
         handle_inbound(
-            &transport,
+            &channel,
             &store,
             &identity,
             &text_message(42, 42, Some("alice"), "/whoami", 1),
@@ -1238,7 +1302,7 @@ mod tests {
         )
         .unwrap();
         handle_inbound(
-            &transport,
+            &channel,
             &store,
             &identity,
             &text_message(42, 42, Some("alice"), "/start", 2),
@@ -1248,7 +1312,7 @@ mod tests {
         let code = store.lock().unwrap().pending_pairings()[0].code.clone();
         store.lock().unwrap().approve(&code).unwrap();
         handle_inbound(
-            &transport,
+            &channel,
             &store,
             &identity,
             &text_message(42, 42, Some("alice"), "/unpair", 3),
@@ -1276,6 +1340,7 @@ mod tests {
             sent: sent.clone(),
             ..MockBotTransport::default()
         };
+        let channel = TelegramChannel::new(Arc::new(transport));
         let mut message = text_message(5, 5, None, "", 1);
         message.kind = InboundKind::Photo;
         message.text = None;
@@ -1293,7 +1358,7 @@ mod tests {
             emoji: None,
         }];
         handle_inbound(
-            &transport,
+            &channel,
             &store,
             &BotIdentity::default(),
             &message,
@@ -1650,6 +1715,155 @@ mod tests {
     }
 
     #[test]
+    fn restart_reserves_queued_and_recorded_reply_work() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The replies resumed here must not run under a policy another
+        // test left mounted on the process-wide lane port.
+        a4mc::lane::clear();
+        // A crash after the batch write left one admitted-but-unstarted
+        // message and one finished-but-undelivered reply behind the
+        // durable cursor. Neither may be skipped on the next run.
+        let root = temp_root();
+        let queued = text_message(42, 42, Some("alice"), "/whoami", 1);
+        let recorded = text_message(43, 43, Some("bob"), "hello agent", 2);
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            store
+                .admit_updates(
+                    &[
+                        crate::binding::PendingUpdate {
+                            update_id: 1,
+                            message: queued,
+                            reply: None,
+                            next_session: None,
+                        },
+                        crate::binding::PendingUpdate {
+                            update_id: 2,
+                            message: recorded,
+                            reply: Some("agent reply".to_owned()),
+                            next_session: None,
+                        },
+                    ],
+                    &[],
+                    3,
+                )
+                .unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let messages = sent.lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|(chat, text)| *chat == 42 && text.contains("chatId: 42")),
+            "the queued update was skipped on restart: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|(chat, text)| *chat == 43 && text == "agent reply"),
+            "the recorded reply was not delivered on restart: {messages:?}"
+        );
+        drop(messages);
+        let reopened = BindingStore::open_in(&root).unwrap();
+        assert!(
+            reopened.pending_updates().is_empty(),
+            "resumed work stayed recorded after delivery"
+        );
+        assert_eq!(reopened.poll_offset(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_loop_routes_every_runtime_reply_through_the_mounted_policy() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        // A paired chat bound to an agent, so the "hello" update takes the
+        // agent-reply path; /whoami takes the command-reply path; /agent on
+        // an unpaired chat takes the fallback error-reply path.
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let observed_offsets = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            observed_offsets: Arc::clone(&observed_offsets),
+            updates: Arc::new(Mutex::new(vec![
+                Update {
+                    update_id: 1,
+                    message: Some(text_message(42, 42, Some("alice"), "/whoami", 1)),
+                },
+                Update {
+                    update_id: 2,
+                    message: Some(text_message(7, 7, Some("zed"), "/agent", 2)),
+                },
+                Update {
+                    update_id: 3,
+                    message: Some(text_message(42, 42, Some("alice"), "hello", 3)),
+                },
+            ])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(Arc::new(SkipAll)),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        // Every admitted task finishing — replies suppressed — is the
+        // signal that all three reply paths ran under the policy.
+        wait_until(
+            || {
+                BindingStore::open_in(&root)
+                    .unwrap()
+                    .pending_updates()
+                    .is_empty()
+            },
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a mounted skip policy must suppress every runtime reply"
+        );
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            4,
+            "suppressed replies must not strand admitted work"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn failed_poll_does_not_advance_the_durable_cursor() {
         let root = temp_root();
         let mut store = BindingStore::open_in(&root).unwrap();
@@ -1986,9 +2200,10 @@ mod tests {
             sent: Arc::clone(&sent),
             ..MockBotTransport::default()
         };
+        let channel = TelegramChannel::new(Arc::new(transport));
         let started = Instant::now();
         handle_inbound(
-            &transport,
+            &channel,
             &store,
             &BotIdentity::default(),
             &text_message(42, 42, Some("alice"), BLOCKING_TURN_TEXT, 1),
@@ -2036,9 +2251,10 @@ mod tests {
             sent: Arc::clone(&sent),
             ..MockBotTransport::default()
         };
+        let channel = TelegramChannel::new(Arc::new(transport));
 
         let error = handle_inbound(
-            &transport,
+            &channel,
             &store,
             &BotIdentity::default(),
             &text_message(42, 42, Some("alice"), "hello", 1),

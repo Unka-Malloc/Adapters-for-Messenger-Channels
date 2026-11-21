@@ -12,8 +12,10 @@
 //! already have a resumable home on this side. Once the host has the
 //! work, the ack is sent; if that write fails the socket is dropped and
 //! Slack retries, and the retry is answered with the missing ack
-//! instead of a second dispatch. A `disconnect` frame ends the session
-//! and the loop reconnects with a fresh socket URL.
+//! instead of a second dispatch. A handler failure is surfaced to the
+//! host as `a4mc_slack_handler_failed`; it is not folded into the
+//! reconnect backoff. A `disconnect` frame ends the session and the
+//! loop reconnects with a fresh socket URL.
 
 use crate::transport::{SlackApi, SlackApiError, SocketUrl};
 use a4mc::ChannelEvent;
@@ -491,12 +493,13 @@ pub fn run_socket_session(
                     // The host's durable receive happens before the ack:
                     // an envelope Slack believes consumed must already
                     // have a resumable home here.
-                    if envelope.kind == "events_api" {
+                    let result = if envelope.kind == "events_api" {
                         let event = crate::lower::lower_event(&envelope.payload);
-                        handler.on_event(&event, &envelope)?;
+                        handler.on_event(&event, &envelope)
                     } else {
-                        handler.on_other(&envelope)?;
-                    }
+                        handler.on_other(&envelope)
+                    };
+                    result.map_err(handler_error)?;
                     seen.mark(&envelope.envelope_id);
                 }
                 // First deliveries and ack-recovery retries both end
@@ -505,6 +508,15 @@ pub fn run_socket_session(
             }
         }
     }
+}
+
+/// Give a host handler failure its own code so [`run_socket_mode`] can
+/// return it instead of treating it as a broken socket and reconnecting.
+fn handler_error(error: SlackApiError) -> SlackApiError {
+    SlackApiError::new(
+        "a4mc_slack_handler_failed",
+        format!("{}: {}", error.code, error.message),
+    )
 }
 
 /// Reconnect policy for [`run_socket_mode`].
@@ -578,6 +590,12 @@ pub fn run_socket_mode(
                 config.reconnect_delay
             }
             Err(error) => {
+                // A host handler failure is not a transport outage:
+                // reconnecting cannot undo it and would hide it behind
+                // the backoff loop. Return it to the host.
+                if error.code == "a4mc_slack_handler_failed" {
+                    return Err(error);
+                }
                 if config.max_sessions != 0 && sessions >= config.max_sessions {
                     return Err(error);
                 }
@@ -775,6 +793,7 @@ mod tests {
         let error =
             run_socket_session(&mut connection, &mut handler, &mut seen, &stop).unwrap_err();
         assert_eq!(error.code, "a4mc_slack_handler_failed");
+        assert!(error.message.contains("fixture handler failure"));
         // No ack went out: Slack will redeliver, and the unmarked id
         // re-dispatches instead of being silently dropped.
         assert!(sent.lock().unwrap().is_empty());
@@ -824,6 +843,34 @@ mod tests {
             serde_json::from_str::<Value>(&acks[0]).unwrap()["envelope_id"],
             json!("e1")
         );
+    }
+
+    #[test]
+    fn socket_mode_returns_a_handler_failure_instead_of_folding_it_into_backoff() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let connection = ScriptedConnection::new(
+            vec![envelope(
+                "e1",
+                "events_api",
+                message_payload("1700000000.000001"),
+            )],
+            Arc::clone(&sent),
+        );
+        let connector = ScriptedConnector {
+            connections: Mutex::new(VecDeque::from([
+                Box::new(connection) as Box<dyn SocketConnection>
+            ])),
+        };
+        let api = crate::transport::MockSlackApi::default();
+        let mut handler = FailingHandler;
+        let config = SocketModeConfig {
+            max_sessions: 0,
+            reconnect_delay: Duration::ZERO,
+            ..SocketModeConfig::default()
+        };
+
+        let error = run_socket_mode(&api, &connector, &mut handler, &config).unwrap_err();
+        assert_eq!(error.code, "a4mc_slack_handler_failed");
     }
 
     #[test]

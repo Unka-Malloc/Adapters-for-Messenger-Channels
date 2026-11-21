@@ -11,8 +11,8 @@ draw on belong to the host process.
 
 ```toml
 [dependencies]
-a4mc = "0.1"
-a4mc-telegram = "0.1"
+a4mc = "0.2"
+a4mc-telegram = "0.2"
 a4mc-slack = "0.1"
 a4mc-discord = "0.1"
 a4mc-webhook = "0.1"
@@ -86,6 +86,46 @@ polling, Socket Mode, the Discord Gateway or signed HTTP receive, update
 lowering, outbound sends with idempotency dedupe, and the channel's own
 UX. The host owns where tokens live, agent admission, pairing approval
 and any readiness hook.
+
+## Outbound policy hooks
+
+Outbound policy is the caller's. Mount one `OutboundHooks`
+implementation per channel, or answer `LanePort::outbound_hooks` once and
+every dialect constructed after that shares it:
+
+```rust
+use std::sync::Arc;
+
+struct QuietHours; // caller-owned, no A4MC business logic
+
+impl a4mc::OutboundHooks for QuietHours {
+    fn skip(
+        &self,
+        _ctx: &a4mc::SendContext,
+        _message: &a4mc::OutboundMessage,
+    ) -> a4mc::SkipDecision {
+        a4mc::SkipDecision::skip("quiet hours")
+    }
+}
+
+let channel = a4mc_telegram::TelegramChannel::new(Arc::new(transport))
+    .with_outbound_hooks(Arc::new(QuietHours));
+let receipt = channel.send(&outbound)?;   // skipped: receipt.message_ids is empty
+```
+
+Every send-capable dialect (`telegram`, `slack`, `discord`) drives the
+same `a4mc::OutboundPipeline` in one documented order: `skip` → `batch`
+→ `throttle` → `dedupe_key` → deliver → `on_receipt`. `batch` may return
+a merged replacement message or defer the send; `throttle` may defer with
+a retry hint; `dedupe_key` may derive the effective idempotency key; and
+`on_receipt` observes the receipt each successful non-skipped send
+returns. A deferred send surfaces `a4mc_outbound_batched` or
+`a4mc_outbound_throttled`; a skipped send returns an empty receipt and
+makes no transport call. With no hooks mounted the pipeline is a
+pass-through and the channel behaves exactly as before.
+
+The host mounts policy; the adapters still contain no Quiet,
+Already-Told, Digest or other business rule.
 
 ## Dialect — implement the contract
 

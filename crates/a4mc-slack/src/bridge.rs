@@ -476,6 +476,7 @@ mod tests {
             conversation_list: conversations,
             open_or_resume: open,
             dispatch,
+            outbound_hooks: None,
         };
         lane::clear();
         lane::install(port).unwrap();
@@ -527,6 +528,7 @@ mod tests {
             conversation_list: conversations,
             open_or_resume: open,
             dispatch,
+            outbound_hooks: None,
         })
         .unwrap();
     }

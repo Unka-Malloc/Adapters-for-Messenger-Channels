@@ -90,7 +90,14 @@ impl std::error::Error for TelegramApiError {}
 
 impl From<TelegramApiError> for a4mc::ChannelError {
     fn from(error: TelegramApiError) -> Self {
-        a4mc::ChannelError::new(error.code, error.message)
+        // The platform's retry floor is part of the failure the host
+        // sees: without it a rate-limit error gives callers nothing to
+        // wait on before retrying.
+        let mut converted = a4mc::ChannelError::new(error.code, error.message);
+        if let Some(seconds) = error.retry_after {
+            converted = converted.with_retry_after_ms(seconds.saturating_mul(1000));
+        }
+        converted
     }
 }
 
@@ -706,6 +713,12 @@ fn platform_len(text: &str) -> usize {
 /// unbounded post sequence; what remains is chunked at the platform
 /// limit inside the per-chat part budget.
 fn bounded_send_parts(text: &str) -> Result<Vec<&str>, TelegramApiError> {
+    if text.is_empty() {
+        return Err(TelegramApiError::new(
+            "a4mc_telegram_text_empty",
+            "outbound text is empty",
+        ));
+    }
     if text.chars().count() > a4mc::MAX_OUTBOUND_TEXT_CHARS {
         return Err(TelegramApiError::new(
             "a4mc_telegram_text_too_large",
@@ -727,10 +740,16 @@ fn bounded_send_parts(text: &str) -> Result<Vec<&str>, TelegramApiError> {
 /// the minimal part count for the text — a newline in the tail of the
 /// window is taken as the cut only when it reads better without costing
 /// an extra part.
+///
+/// The dialect posts plain text (no `parse_mode`), so Markdown is carried
+/// literally: a fence or emphasis marker split across two posts is still
+/// the same characters, never a platform parse failure. The function is
+/// total even for a degenerate `limit` smaller than one platform unit.
 pub fn chunk_telegram_text(text: &str, limit: usize) -> Vec<&str> {
     if text.is_empty() {
-        return vec![""];
+        return vec![text];
     }
+    let limit = limit.max(1);
     let minimal = platform_len(text).div_ceil(limit);
     let mut chunks = Vec::with_capacity(minimal);
     let mut rest = text;
@@ -751,6 +770,8 @@ pub fn chunk_telegram_text(text: &str, limit: usize) -> Vec<&str> {
             end = index + ch.len_utf8();
         }
         if end == 0 {
+            // The first scalar is wider than the whole window: emit it
+            // whole rather than looping forever on an empty chunk.
             end = rest.chars().next().map_or(0, char::len_utf8);
         }
         // Prefer a newline in the tail of the window only when the
@@ -777,6 +798,10 @@ pub struct MockBotTransport {
     pub sent: Arc<Mutex<Vec<(i64, String)>>>,
     pub observed_offsets: Arc<Mutex<Vec<i64>>>,
     pub fail_get_updates_with: Option<TelegramApiError>,
+    /// Scripted `sendMessage` failure for the whole call. Shared so a
+    /// test can clear the failure and exercise the caller's retry
+    /// against the same mock.
+    pub fail_send_with: Arc<Mutex<Option<TelegramApiError>>>,
     /// Fail the chunked part at this absolute index with this error and
     /// this unknown-outcome flag — for resume/ambiguous-path coverage.
     /// The fault is transient: each index fires at most once, so a retry
@@ -799,6 +824,7 @@ impl Default for MockBotTransport {
             sent: Arc::new(Mutex::new(Vec::new())),
             observed_offsets: Arc::new(Mutex::new(Vec::new())),
             fail_get_updates_with: None,
+            fail_send_with: Arc::new(Mutex::new(None)),
             fail_send_at_part: None,
             fired_parts: Mutex::new(HashSet::new()),
             commands: Arc::new(Mutex::new(Vec::new())),
@@ -857,6 +883,9 @@ impl BotTransport for MockBotTransport {
         _reply_to_message_id: Option<i64>,
         resume: Option<&SendProgress>,
     ) -> Result<Vec<i64>, TelegramApiError> {
+        if let Some(error) = self.fail_send_with.lock().unwrap().clone() {
+            return Err(error);
+        }
         let parts = bounded_send_parts(text)?;
         let start = resume.map_or(0, |progress| progress.next_part);
         if start > parts.len() {
@@ -894,53 +923,80 @@ impl BotTransport for MockBotTransport {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
+
+    /// Read one complete HTTP request (headers plus declared body) so a
+    /// loopback close never resets an in-flight client write. Returns the
+    /// request body as UTF-8 text.
+    fn read_request_body(stream: &mut TcpStream) -> Option<String> {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return None;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(position) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let header = String::from_utf8_lossy(&request[..header_end]);
+        let body_len: usize = header
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + body_len {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return None;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        Some(String::from_utf8_lossy(&request[header_end..header_end + body_len]).into_owned())
+    }
+
+    /// Serve a scripted sequence of responses, one fresh connection per
+    /// response, and return the captured request bodies in order.
+    fn serve_scripted(
+        responses: Vec<(u16, &'static str, &'static str, &'static str)>,
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut bodies = Vec::with_capacity(responses.len());
+            for (status, content_type, extra_headers, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                bodies.push(read_request_body(&mut stream).expect("complete request"));
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            bodies
+        });
+        (port, handle)
+    }
 
     fn serve_once(
         status: u16,
         content_type: &'static str,
         body: &'static str,
-    ) -> (u16, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            // Consume the full request (headers plus declared body) so the
-            // close below never resets an in-flight client write.
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 2048];
-            let header_end = loop {
-                let read = stream.read(&mut chunk).unwrap_or(0);
-                if read == 0 {
-                    return;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(position) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break position + 4;
-                }
-            };
-            let header = String::from_utf8_lossy(&request[..header_end]);
-            let body_len: usize = header
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("Content-Length:")
-                        .and_then(|value| value.trim().parse().ok())
-                })
-                .unwrap_or(0);
-            while request.len() < header_end + body_len {
-                let read = stream.read(&mut chunk).unwrap_or(0);
-                if read == 0 {
-                    return;
-                }
-                request.extend_from_slice(&chunk[..read]);
-            }
-            let response = format!(
-                "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        (port, handle)
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        serve_scripted(vec![(status, content_type, "", body)])
+    }
+
+    fn serve_once_with_headers(
+        status: u16,
+        content_type: &'static str,
+        headers: &'static str,
+        body: &'static str,
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        serve_scripted(vec![(status, content_type, headers, body)])
     }
 
     #[test]
@@ -1001,6 +1057,51 @@ mod tests {
     }
 
     #[test]
+    fn chunks_multibyte_text_without_splitting_a_scalar() {
+        let text = "😀".repeat(2_500);
+        let chunks = chunk_telegram_text(&text, TELEGRAM_TEXT_LIMIT);
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| platform_len(chunk) <= TELEGRAM_TEXT_LIMIT)
+        );
+        // Telegram counts UTF-16 units: every astral character costs two,
+        // so an emoji part holds at most half the platform limit in chars.
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 2_048));
+    }
+
+    #[test]
+    fn chunking_is_total_for_degenerate_limits() {
+        let text = "a😀é中";
+        for limit in [0, 1, 2, 3] {
+            let chunks = chunk_telegram_text(text, limit);
+            assert_eq!(chunks.concat(), text, "lossy at limit {limit}");
+            assert!(
+                chunks.iter().all(|chunk| !chunk.is_empty()),
+                "empty chunk at limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunking_prefers_a_newline_in_the_trailing_window() {
+        let text = format!("{}\n{}", "a".repeat(30), "b".repeat(30));
+        let chunks = chunk_telegram_text(&text, 40);
+        assert_eq!(chunks[0], format!("{}\n", "a".repeat(30)));
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 40));
+    }
+
+    #[test]
+    fn send_parts_reject_empty_text() {
+        let error = bounded_send_parts("").unwrap_err();
+        assert_eq!(error.code, "a4mc_telegram_text_empty");
+    }
+
+    #[test]
     fn send_parts_reject_text_above_the_contract_bound() {
         let oversized = "x".repeat(a4mc::MAX_OUTBOUND_TEXT_CHARS + 1);
         let error = bounded_send_parts(&oversized).unwrap_err();
@@ -1050,6 +1151,112 @@ mod tests {
         }
         LiveBotTransport::new("token", None).unwrap();
         LiveBotTransport::new("token", Some("https://api.telegram.org")).unwrap();
+    }
+
+    #[test]
+    fn long_markdown_is_split_verbatim_and_sent_as_plain_text() {
+        let markdown = format!(
+            "```rust\n{}\n```\n\n## tail\n{}",
+            "let value = \"数据\";\n".repeat(400),
+            "😀".repeat(600)
+        );
+        let parts = chunk_telegram_text(&markdown, TELEGRAM_TEXT_LIMIT);
+        assert!(parts.len() >= 2);
+        assert_eq!(parts.concat(), markdown);
+        assert!(
+            parts
+                .iter()
+                .all(|part| platform_len(part) <= TELEGRAM_TEXT_LIMIT)
+        );
+
+        let expected_parts = parts.len();
+        let responses = (0..expected_parts)
+            .map(|_| {
+                (
+                    200u16,
+                    "application/json",
+                    "",
+                    "{\"ok\":true,\"result\":{\"message_id\":1}}",
+                )
+            })
+            .collect();
+        let (port, handle) = serve_scripted(responses);
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let ids = transport
+            .send_message(42, &markdown, Some(7), None)
+            .unwrap();
+        assert_eq!(ids.len(), expected_parts);
+
+        let bodies = handle.join().unwrap();
+        assert_eq!(bodies.len(), expected_parts);
+        let mut reassembled = String::new();
+        for (index, body) in bodies.iter().enumerate() {
+            let value: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(value["chat_id"].as_i64(), Some(42));
+            // No parse_mode is attached: Markdown markers are literal
+            // text, so a split fence can never fail platform parsing.
+            assert!(value.get("parse_mode").is_none());
+            let chunk = value["text"].as_str().unwrap();
+            assert!(platform_len(chunk) <= TELEGRAM_TEXT_LIMIT);
+            reassembled.push_str(chunk);
+            if index == 0 {
+                assert_eq!(value["reply_to_message_id"].as_i64(), Some(7));
+            } else {
+                assert!(value.get("reply_to_message_id").is_none());
+            }
+        }
+        assert_eq!(reassembled, markdown);
+    }
+
+    #[test]
+    fn throttled_status_carries_retry_after_header() {
+        let body = "{\"ok\":false,\"error_code\":429}";
+        let (port, handle) =
+            serve_once_with_headers(429, "application/json", "Retry-After: 7\r\n", body);
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let error = transport.get_updates(0, 1).unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_throttled");
+        assert_eq!(error.retry_after, Some(7));
+    }
+
+    #[test]
+    fn throttled_status_carries_body_retry_after() {
+        let body = "{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":11}}";
+        let (port, handle) = serve_once_with_headers(429, "application/json", "", body);
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let error = transport.get_updates(0, 1).unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_throttled");
+        assert_eq!(error.retry_after, Some(11));
+    }
+
+    #[test]
+    fn ok_false_throttled_body_carries_retry_after() {
+        let body = "{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":13}}";
+        let (port, handle) = serve_once(200, "application/json", body);
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let error = transport.get_updates(0, 1).unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_throttled");
+        assert_eq!(error.retry_after, Some(13));
+    }
+
+    #[test]
+    fn send_throttle_surfaces_retry_after_without_posting_twice() {
+        let body = "{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":9}}";
+        let (port, handle) = serve_once_with_headers(429, "application/json", "", body);
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let error = transport.send_message(42, "hello", None, None).unwrap_err();
+        let bodies = handle.join().unwrap();
+        assert_eq!(bodies.len(), 1, "a throttle must not retry post blindly");
+        assert_eq!(error.code, "a4mc_telegram_throttled");
+        assert_eq!(error.retry_after, Some(9));
     }
 
     #[test]

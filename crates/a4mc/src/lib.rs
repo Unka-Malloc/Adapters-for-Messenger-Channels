@@ -7,6 +7,10 @@
 //!   and reaction events, lowered into one enum;
 //! * [`send`] — outbound sends carrying an idempotency key, and their
 //!   delivery receipts;
+//! * [`outbound`] — the optional caller-mounted send policy: skip,
+//!   window batching, throttle budget, dedupe-key derivation and receipt
+//!   observation. No policy is mounted by default, and the pipeline
+//!   carries no business policy of its own;
 //! * [`identity`] — external channel identity: who the *platform* says
 //!   a user or chat is. It never asserts a host principal — mapping
 //!   channel identity to host principals is host policy;
@@ -29,6 +33,7 @@ pub mod error;
 pub mod identity;
 pub mod lane;
 pub mod mechanism;
+pub mod outbound;
 pub mod send;
 pub mod update;
 
@@ -41,6 +46,10 @@ pub use identity::{
 };
 pub use lane::LanePort;
 pub use mechanism::LaneMechanism;
+pub use outbound::{
+    BatchDecision, DeferSource, OutboundHooks, OutboundPipeline, PreparedSend, SendContext,
+    SendPlan, SkipDecision, ThrottleDecision, unix_now_ms,
+};
 pub use send::{MAX_IDEMPOTENCY_KEY_CHARS, MAX_OUTBOUND_TEXT_CHARS, OutboundMessage, SendReceipt};
 pub use update::{
     AttachmentRef, ChannelEvent, ContentKind, DeletedMessage, GeoPoint, InboundMessage,
@@ -196,6 +205,7 @@ mod tests {
             conversation_list: empty,
             open_or_resume: empty,
             dispatch: |_, _| Ok(json!({"ok": true})),
+            outbound_hooks: None,
         };
         lane::install(port).unwrap();
         lane::install(port).unwrap(); // same answers: idempotent
@@ -257,6 +267,66 @@ mod tests {
         assert!(custody::install(other).is_err());
         custody::clear();
         assert!(custody::require().is_err());
+    }
+
+    #[test]
+    fn lane_port_mounts_one_outbound_policy_for_every_channel() {
+        use crate::outbound::{OutboundHooks, OutboundPipeline, SendContext, SkipDecision};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        struct CountingHooks;
+        impl OutboundHooks for CountingHooks {
+            fn skip(&self, _: &SendContext, _: &OutboundMessage) -> SkipDecision {
+                let calls = HOOK_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+                if calls == 1 {
+                    SkipDecision::Send
+                } else {
+                    SkipDecision::skip("mounted policy")
+                }
+            }
+        }
+
+        fn hooks() -> Arc<dyn OutboundHooks> {
+            Arc::new(CountingHooks)
+        }
+
+        let _guard = PORT_LOCK.lock().unwrap();
+        lane::clear();
+        HOOK_CALLS.store(0, Ordering::SeqCst);
+        fn scan() -> Result<Value, ChannelError> {
+            Ok(json!({"candidates": []}))
+        }
+        fn empty(_: &Value) -> Result<Value, ChannelError> {
+            Ok(json!({}))
+        }
+        lane::install(LanePort {
+            scan_targets: scan,
+            conversation_list: empty,
+            open_or_resume: empty,
+            dispatch: |_, _| Ok(json!({})),
+            outbound_hooks: Some(hooks),
+        })
+        .unwrap();
+
+        let message = OutboundMessage::new("7", "hello", "key-1");
+        for channel in ["telegram", "slack", "discord"] {
+            let pipeline = OutboundPipeline::from_lane(channel);
+            assert!(pipeline.hooks().is_some());
+        }
+        let pipeline = OutboundPipeline::from_lane("telegram");
+        assert!(matches!(
+            pipeline.plan(&message, &SendContext::at("telegram", 1)),
+            Ok(crate::outbound::SendPlan::Send(_))
+        ));
+        assert!(matches!(
+            pipeline.plan(&message, &SendContext::at("telegram", 2)),
+            Ok(crate::outbound::SendPlan::Skipped { .. })
+        ));
+        assert_eq!(HOOK_CALLS.load(Ordering::SeqCst), 2);
+        lane::clear();
+        assert!(OutboundPipeline::from_lane("telegram").hooks().is_none());
     }
 
     #[test]
