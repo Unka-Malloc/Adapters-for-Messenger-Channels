@@ -112,6 +112,12 @@ pub struct PairingRecord {
     pub username: Option<String>,
     pub created_at: u64,
     pub expires_at: u64,
+    /// The document revision the offer was minted at — compared against
+    /// the chat's revocation tombstone so an offer recorded before a
+    /// revocation stays refused once the guard that refused it is gone.
+    /// `0` predates the field.
+    #[serde(default)]
+    pub minted_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -274,6 +280,13 @@ struct BindingDocument {
     /// work from a dead one. `0` predates the field.
     #[serde(default)]
     poll_sequence: u64,
+    /// Chats whose pairing/binding was revoked — chat id to the
+    /// document revision the revocation committed at. A staged offer
+    /// minted at or before the tombstone must never re-publish: the
+    /// binding whose removal freed document space is exactly the guard
+    /// that kept the older offer refused.
+    #[serde(default)]
+    revoked_chats: BTreeMap<String, u64>,
 }
 
 /// A staged reply completion: one atomic record carrying the payload,
@@ -634,6 +647,7 @@ impl BindingStore {
                 username,
                 created_at: now,
                 expires_at: now + PAIRING_TTL.as_secs(),
+                minted_revision: next_revision(document),
             };
             document.pairings.push(record.clone());
             Ok(record)
@@ -674,7 +688,15 @@ impl BindingStore {
             let removed = document.chats.remove(&chat_id.to_string()).is_some();
             let before = document.pairings.len();
             document.pairings.retain(|record| record.chat_id != chat_id);
-            Ok(removed || document.pairings.len() != before)
+            let revoked = removed || document.pairings.len() != before;
+            if revoked {
+                // Tombstone the revocation at its own revision: a
+                // staged offer minted before it can never re-publish
+                // now that the binding that refused it is gone.
+                let revision = next_revision(document);
+                document.revoked_chats.insert(chat_id.to_string(), revision);
+            }
+            Ok(revoked)
         })
     }
 
@@ -1236,6 +1258,7 @@ impl BindingStore {
                 username,
                 created_at: now,
                 expires_at: now + PAIRING_TTL.as_secs(),
+                minted_revision: next_revision(document),
             };
             let reply = text(&record);
             ensure!(
@@ -1517,8 +1540,12 @@ impl BindingStore {
     /// outcome. A send the platform may already have seen keeps the
     /// text its checkpoint was earned on — substituting under it would
     /// restart the remaining parts as a different message and strand
-    /// the resume.
-    pub fn reply_text(&self, task: &PendingUpdate) -> Result<Option<String>> {
+    /// the resume. A substitution the resolver selects is committed
+    /// before it can be sent: the first checkpoint the reply earns must
+    /// resolve the same payload on the next read, or recovery would
+    /// resume the refusal's progress against the recorded offer text
+    /// and refuse the send forever.
+    pub fn reply_text(&mut self, task: &PendingUpdate) -> Result<Option<String>> {
         if let Some(reply) = &task.reply {
             return Ok(Some(reply.clone()));
         }
@@ -1532,8 +1559,13 @@ impl BindingStore {
                 && task.reply_progress.as_ref().is_none_or(|progress| {
                     progress.confirmed.is_empty() && !progress.outcome_unknown
                 });
-            let refused = task.reply_refused
-                || (substitutable && pairing_offer_lapsed(&self.document, &staged.effect));
+            let lapsed = !task.reply_refused
+                && substitutable
+                && pairing_offer_lapsed(&self.document, &staged.effect);
+            if lapsed {
+                self.persist_refused_reply(task.key(), &staged.effect)?;
+            }
+            let refused = task.reply_refused || lapsed;
             return if refused {
                 staged.refused_text.or(staged.text)
             } else {
@@ -1551,6 +1583,30 @@ impl BindingStore {
         read_reply_payload(&self.path, name, task.key(), false)?
             .map(Some)
             .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))
+    }
+
+    /// Commit the durable form of a lapsed offer's refused-variant
+    /// selection — re-validated against the reloaded document so a
+    /// checkpoint another store instance earned between the resolve
+    /// and this write keeps the text it was earned on instead of being
+    /// repointed under it.
+    fn persist_refused_reply(&mut self, key: TaskKey, effect: &StagedEffect) -> Result<()> {
+        self.mutate(|document| {
+            let lapsed = pairing_offer_lapsed(document, effect);
+            if let Some(task) = document
+                .pending_updates
+                .iter_mut()
+                .find(|task| task.key() == key)
+                && task.reply_sent == 0
+                && task.reply_progress.as_ref().is_none_or(|progress| {
+                    progress.confirmed.is_empty() && !progress.outcome_unknown
+                })
+                && lapsed
+            {
+                task.reply_refused = true;
+            }
+            Ok(())
+        })
     }
 
     /// Persist one update id the runtime could not hand to the host as a
@@ -1715,6 +1771,10 @@ fn pairing_offer_lapsed(document: &BindingDocument, effect: &StagedEffect) -> bo
             .chats
             .get(&record.chat_id.to_string())
             .is_some_and(|binding| binding.paired && binding.user_id == record.user_id)
+        || document
+            .revoked_chats
+            .get(&record.chat_id.to_string())
+            .is_some_and(|revoked_at| record.minted_revision <= *revoked_at)
         || !document.pairings.iter().any(|held| {
             held.code == record.code
                 && held.chat_id == record.chat_id
@@ -2069,7 +2129,15 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
             document.pairings.retain(|record| {
                 record.chat_id != *chat_id || user_id.is_some_and(|held| record.user_id != held)
             });
-            removed || document.pairings.len() != before
+            let revoked = removed || document.pairings.len() != before;
+            if revoked {
+                // Tombstone the revocation like `revoke` does: a staged
+                // offer minted before it can never re-publish through
+                // the space the removal freed.
+                let revision = next_revision(document);
+                document.revoked_chats.insert(chat_id.to_string(), revision);
+            }
+            revoked
         }
         StagedEffect::ReplyAgent {
             chat_id,
@@ -2116,6 +2184,16 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
             {
                 // The user holds a full pairing now — the staged code
                 // offer is superseded, never re-published.
+                return false;
+            }
+            if document
+                .revoked_chats
+                .get(&record.chat_id.to_string())
+                .is_some_and(|revoked_at| record.minted_revision <= *revoked_at)
+            {
+                // The chat was revoked after this offer was minted —
+                // the space its revocation freed must never restore an
+                // offer minted before it.
                 return false;
             }
             document
@@ -2229,6 +2307,7 @@ fn read_document(path: &Path) -> Result<BindingDocument> {
             settled_updates: Vec::new(),
             revision_counter: 0,
             poll_sequence: 0,
+            revoked_chats: BTreeMap::new(),
         }),
     }
 }
@@ -2638,7 +2717,7 @@ mod tests {
             let task = store.pending_updates().pop().unwrap();
             assert!(task.has_reply());
             assert!(task.reply.is_none());
-            let reopened = BindingStore::open(store.path.clone()).unwrap();
+            let mut reopened = BindingStore::open(store.path.clone()).unwrap();
             assert_eq!(
                 reopened.reply_text(&task).unwrap().as_deref(),
                 Some(&*reply)
@@ -3491,7 +3570,7 @@ mod tests {
             std::fs::create_dir_all(&legacy).unwrap();
             std::fs::write(legacy.join("reply-7.txt"), "legacy payload").unwrap();
 
-            let reopened = BindingStore::open(store.path.clone()).unwrap();
+            let mut reopened = BindingStore::open(store.path.clone()).unwrap();
             let task = reopened.pending_update(7).unwrap();
             assert_eq!(
                 reopened.reply_text(&task).unwrap().as_deref(),
@@ -3891,6 +3970,7 @@ mod tests {
                         username: Some("alice".to_owned()),
                         created_at: 1,
                         expires_at: 2,
+                        minted_revision: 0,
                     },
                 },
                 text: Some("Pairing code: ABCD-EFGH".to_owned()),
@@ -3962,6 +4042,7 @@ mod tests {
                         username: Some("alice".to_owned()),
                         created_at: now_secs(),
                         expires_at: now_secs() + PAIRING_TTL.as_secs(),
+                        minted_revision: 0,
                     },
                 },
                 text: Some("Pairing code: WXYZ-1234".to_owned()),
@@ -4465,6 +4546,158 @@ mod tests {
                 store.reply_text(&task).unwrap().as_deref(),
                 Some(refused),
                 "a zero-progress send kept its lapsed offer's dead code"
+            );
+        });
+    }
+
+    #[test]
+    fn a_lapsed_offer_marks_its_refusal_before_the_first_send() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            let refused = "That pairing offer did not hold — send /start to request a fresh code.";
+            store
+                .record_pairing_and_reply(
+                    9,
+                    9,
+                    Some("alice".into()),
+                    7,
+                    "reply:7",
+                    |record| format!("Pairing code: {}", record.code),
+                    refused,
+                )
+                .unwrap();
+            // A newer request lapses the exact offer the reply carries.
+            store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert!(!task.reply_refused);
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(refused),
+                "the lapsed offer's send did not resolve its refusal"
+            );
+            // The selection is durable on the task before the first
+            // send: a checkpoint the refusal earns — even confirmed
+            // progress — resolves the same payload on the next read,
+            // never the lapsed offer's dead code.
+            store
+                .record_reply_progress(
+                    7,
+                    0,
+                    Some(crate::transport::SendProgress {
+                        confirmed: vec![11],
+                        next_part: 1,
+                        outcome_unknown: false,
+                        binding: None,
+                    }),
+                )
+                .unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert!(task.reply_refused, "the lapsed selection never committed");
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(refused),
+                "a checkpointed refusal resolved the lapsed offer's code"
+            );
+        });
+    }
+
+    #[test]
+    fn a_revoked_chat_keeps_its_older_offer_refused_after_the_space_frees() {
+        temp_store(|mut store| {
+            // Minted exactly as a staged reply commit mints it — while
+            // the chat was still unpaired.
+            let minted_revision = store
+                .request_pairing(5, 5, Some("earlier".into()))
+                .unwrap()
+                .minted_revision;
+            // The user then pairs fully: the approved binding is the
+            // guard that refuses the staged offer — and the record
+            // that pins the document full.
+            let pending = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            admit_filler(&mut store, 7);
+            fill_document(&mut store, 6, 4);
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = StagedCompletion {
+                update_id: 7,
+                sequence: 0,
+                payload: "reply-7.json".to_owned(),
+                key: "reply:7".to_owned(),
+                effect: StagedEffect::ReplyPairing {
+                    record: PairingRecord {
+                        code: "WXYZ-1234".to_owned(),
+                        chat_id: 9,
+                        user_id: 9,
+                        username: Some("alice".to_owned()),
+                        created_at: now_secs(),
+                        expires_at: now_secs() + PAIRING_TTL.as_secs(),
+                        minted_revision,
+                    },
+                },
+                text: Some("Pairing code: WXYZ-1234".to_owned()),
+                refused_text: Some(
+                    "That pairing offer did not hold — send /start to request a fresh code."
+                        .to_owned(),
+                ),
+            };
+            std::fs::write(
+                dir.join("reply-7.json"),
+                serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+            assert!(store.staged_reply_unbound(7));
+            // The revocation frees the binding whose guard refused the
+            // offer — its tombstone keeps the older offer refused: the
+            // reply binds its refusal text and the dead code is never
+            // re-published through the freed space.
+            assert!(store.revoke(9).unwrap());
+            let task = store.pending_update(7).unwrap();
+            assert!(
+                task.reply_refused,
+                "a revoked chat's older offer bound its live variant"
+            );
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some("That pairing offer did not hold — send /start to request a fresh code."),
+                "a revoked chat's older offer resolved its code"
+            );
+            assert!(
+                store
+                    .pending_pairings()
+                    .iter()
+                    .all(|held| held.code != "WXYZ-1234"),
+                "a revoked chat's older offer was re-published: {:?}",
+                store.pending_pairings()
+            );
+            // An offer minted after the revocation binds normally —
+            // free the padding chat first so the fresh record has room.
+            assert!(store.revoke(6).unwrap());
+            let fresh = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            assert!(
+                store
+                    .pending_pairings()
+                    .iter()
+                    .any(|held| held.code == fresh.code),
+                "a post-revocation offer was refused with the old ones"
             );
         });
     }

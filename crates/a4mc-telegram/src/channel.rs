@@ -165,13 +165,16 @@ impl<T: BotTransport> TelegramChannel<T> {
     /// reply that checkpoint was earned on has been safely replaced
     /// before any part was confirmed, so the stale position would only
     /// refuse the replacement's send as a resume mismatch. A partial
-    /// whose stopping outcome is unknown stays — it is the dedupe
-    /// record that keeps a possibly-posted part from being sent twice.
+    /// holding confirmed parts or an uncertain outcome stays —
+    /// confirmed chunks are never reposted, and an uncertain record is
+    /// the dedupe record that keeps a possibly-posted part from being
+    /// sent twice.
     pub(crate) fn discard_partial(&self, key: &str) {
         let mut cache = self.sent_keys.lock().unwrap();
         if matches!(
             cache.entries.get(key),
-            Some(SendState::Partial(progress)) if !progress.outcome_unknown
+            Some(SendState::Partial(progress))
+                if progress.confirmed.is_empty() && !progress.outcome_unknown
         ) {
             cache.entries.remove(key);
         }
@@ -302,6 +305,13 @@ impl<T: BotTransport> TelegramChannel<T> {
                             return Err(ambiguous_send_error());
                         }
                         if !binding_applies(progress.binding.as_ref(), &expected) {
+                            // Hand the refused checkpoint back to the
+                            // caller: its confirmed prefix and the
+                            // effective key its binding names decide
+                            // whether dropping it is safe — a binding
+                            // mismatch alone never proves the platform
+                            // confirmed nothing.
+                            *observed = Some(Box::new(progress.clone()));
                             return Err(resume_mismatch_error());
                         }
                         cache.mark_in_flight(key.clone());
@@ -415,7 +425,9 @@ fn resume_mismatch_error() -> ChannelError {
 /// The failure of one [`TelegramChannel::send_tracked`] call: the
 /// normalized error plus the mid-flight checkpoint the transport
 /// recorded — `None` for failures outside a chunked send or before
-/// the transport ran.
+/// the transport ran. A resume-mismatch refusal instead carries the
+/// cached checkpoint that could not apply, so the caller can inspect
+/// the progress it would have to discard.
 #[derive(Debug)]
 pub(crate) struct TrackedSendError {
     pub error: ChannelError,
