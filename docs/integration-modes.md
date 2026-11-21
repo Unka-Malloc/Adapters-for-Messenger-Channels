@@ -76,20 +76,26 @@ a4mc_discord::run_gateway(
 A webhook host owns the HTTP server and adapts its request into
 `WebhookRequest`; the dialect verifies the HMAC-SHA256 signature and
 timestamp window before parsing, then lowers the contract JSON. Custody
-answers `webhook` with the signing secret. Replay suppression commits
-only after the host has accepted the event — stored it durably or
-handled it successfully — so a failed handler answers an error and the
-sender's retry verifies as a fresh event; once committed, exact replays
-inside the window are acknowledged without running the update again.
+answers `webhook` with the signing secret. The receiver is built once
+at server startup and shared by every request — the replay cache lives
+inside it, so a receiver created per request would suppress nothing.
+Replay suppression commits only after the host has accepted the event —
+stored it durably or handled it successfully — so a failed handler
+answers an error and the sender's retry verifies as a fresh event; once
+committed, exact replays inside the window are acknowledged without
+running the update again.
 
 ```rust
-let receiver = a4mc_webhook::WebhookReceiver::from_custody(300)?;
+// Once, at server startup — the shared receiver owns the replay cache.
+let receiver = std::sync::Arc::new(a4mc_webhook::WebhookReceiver::from_custody(300)?);
+
+// Per request, inside the HTTP handler the receiver was shared into:
 let request = a4mc_webhook::WebhookRequest::new(method, body)
     .with_header(a4mc_webhook::TIMESTAMP_HEADER, timestamp)
     .with_header(a4mc_webhook::SIGNATURE_HEADER, signature);
 match receiver.receive(&request, now_unix)? {
     a4mc_webhook::DeliveryOutcome::Event(delivery) => {
-        handle(delivery.event)?;                 // durable host acceptance
+        handle(&delivery.event)?;                // handler takes &a4mc::ChannelEvent
         receiver.commit(&delivery);              // only then suppress replays
     }
     a4mc_webhook::DeliveryOutcome::Duplicate => {}          // answer 2xx

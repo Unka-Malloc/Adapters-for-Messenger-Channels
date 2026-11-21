@@ -48,13 +48,17 @@ a4mc_discord::run_gateway(
 )?;
 
 // A webhook host owns the HTTP server; the dialect verifies and lowers.
-let receiver = a4mc_webhook::WebhookReceiver::from_custody(300)?;
+// Build the receiver once at startup and share it across requests —
+// the replay cache lives inside it.
+let receiver = Arc::new(a4mc_webhook::WebhookReceiver::from_custody(300)?);
+
+// Per request, inside the HTTP handler:
 let request = a4mc_webhook::WebhookRequest::new(method, body)
     .with_header(a4mc_webhook::TIMESTAMP_HEADER, timestamp)
     .with_header(a4mc_webhook::SIGNATURE_HEADER, signature);
 match receiver.receive(&request, now_unix)? {
     a4mc_webhook::DeliveryOutcome::Event(delivery) => {
-        handle(delivery.event)?;                  // durable host acceptance
+        handle(&delivery.event)?;                 // handler takes &a4mc::ChannelEvent
         receiver.commit(&delivery);               // only then suppress replays
     }
     a4mc_webhook::DeliveryOutcome::Duplicate => {}           // answer 2xx
