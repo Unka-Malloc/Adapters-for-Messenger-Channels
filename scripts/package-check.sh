@@ -13,14 +13,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-rm -f target/package/a4mc-*.crate
-cargo package --locked --allow-dirty -p a4mc
-
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/a4mc-package-check.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
+# Package into a scratch target dir so a custom CARGO_TARGET_DIR or
+# build.target-dir cannot move the archives away from where we read them.
+target_dir="$scratch/target"
+
+cargo package --locked --allow-dirty -p a4mc --target-dir "$target_dir"
 
 cargo vendor "$scratch/vendor" >/dev/null
-packed="$(echo target/package/a4mc-[0-9]*.crate)"
+packed="$(echo "$target_dir"/package/a4mc-[0-9]*.crate)"
 tar -xzf "$packed" -C "$scratch/vendor"
 mv "$scratch"/vendor/a4mc-[0-9]* "$scratch/vendor/a4mc"
 python3 - "$scratch/vendor/a4mc" "$packed" <<'PY'
@@ -44,5 +46,5 @@ PY
 for crate in a4mc-telegram a4mc-slack a4mc-discord a4mc-webhook; do
     cargo --config 'source.crates-io.replace-with="vendored-sources"' \
         --config "source.vendored-sources.directory=\"$scratch/vendor\"" \
-        package --locked --allow-dirty -p "$crate"
+        package --locked --allow-dirty -p "$crate" --target-dir "$target_dir"
 done
