@@ -39,6 +39,9 @@ const MAX_STAGED_BYTES: usize = 8 * 1024 * 1024;
 /// admissions for the last bytes.
 const LIFECYCLE_RESERVE_BYTES: usize = 16 * 1024;
 const MAX_DROPPED_UPDATES: usize = 256;
+/// Bound on the settled-id tail: comfortably beyond one long-poll
+/// batch, which is the widest window a cursor rollback can refetch.
+const MAX_SETTLED_UPDATES: usize = 512;
 /// Bound on admitted-but-unfinished tasks: far beyond one long-poll
 /// batch; a fuller backlog cannot be confirmed anyway, so a new admit
 /// is refused rather than silently confirmed.
@@ -122,12 +125,14 @@ pub struct PendingUpdate {
     /// `None` means the reply (if any) is inline in `reply`.
     #[serde(default)]
     pub reply_file: Option<String>,
-    /// Unix seconds before which the recorded reply must not be
+    /// Unix milliseconds before which the recorded reply must not be
     /// attempted again — the durable form of a platform `Retry-After`
     /// or policy deferral a delivery attempt escaped with. `None`
-    /// means no wait is owed.
+    /// means no wait is owed. Millisecond precision keeps a restart
+    /// from retrying inside the sub-second the whole-second form
+    /// truncated away.
     #[serde(default)]
-    pub reply_retry_at: Option<u64>,
+    pub reply_retry_at_ms: Option<u64>,
 }
 
 impl PendingUpdate {
@@ -163,16 +168,23 @@ struct BindingDocument {
     dropped_updates: Vec<DroppedUpdate>,
     /// Fetched updates the cursor already confirmed as host-callback
     /// events but whose callback outcome is not yet durable. Settled
-    /// the moment the hook answers — consumed events are released,
-    /// rejected ones become dropped records; a record still pending
-    /// on restart is settled as dropped, since the lowered event
-    /// cannot be replayed.
+    /// the moment the hook answers — a consumed event is released,
+    /// a rejected one keeps its marker while the cursor rolls back
+    /// before it for redelivery; only a marker the cursor has moved
+    /// past on restart is settled as dropped, since that lowered
+    /// event cannot be replayed.
     #[serde(default)]
     pending_events: Vec<DroppedUpdate>,
     /// Admitted-but-unfinished message updates: the durable inbox every
     /// confirmed update goes through before the cursor advances.
     #[serde(default)]
     pending_updates: Vec<PendingUpdate>,
+    /// Bounded tail of update ids whose task record was settled —
+    /// completed or dropped. A cursor rollback for a rejected event
+    /// refetches them, and the remembered id keeps confirmed work from
+    /// re-entering the scheduler.
+    #[serde(default)]
+    settled_updates: Vec<i64>,
 }
 
 /// A staged reply completion: one atomic record carrying the payload,
@@ -220,6 +232,11 @@ enum StagedEffect {
         user_id: Option<i64>,
         #[serde(default)]
         agent_id: Option<String>,
+        /// The session the binding carried when the turn ran: `Some`
+        /// records the precondition, `None` marks a record staged
+        /// before it existed, which applies unverifiable.
+        #[serde(default)]
+        prior_session: Option<Option<String>>,
     },
     /// The chat's pairing/binding revocation lands with the reply —
     /// only against the binding it was recorded for, never a pairing
@@ -260,6 +277,8 @@ pub struct BindingStore {
     document: BindingDocument,
     #[cfg(test)]
     fail_next_write: bool,
+    #[cfg(test)]
+    fail_next_admit_capacity: bool,
 }
 
 impl BindingStore {
@@ -281,6 +300,8 @@ impl BindingStore {
             document,
             #[cfg(test)]
             fail_next_write: false,
+            #[cfg(test)]
+            fail_next_admit_capacity: false,
         };
         Ok(store)
     }
@@ -541,6 +562,15 @@ impl BindingStore {
         self.fail_next_write = true;
     }
 
+    /// Make the next admission answer a capacity refusal without
+    /// writing — the shape a probe against a momentarily full document
+    /// takes, so a caller's drain-and-retry path can be exercised
+    /// without timing a real backlog.
+    #[cfg(test)]
+    pub fn fail_next_admit_capacity_for_test(&mut self) {
+        self.fail_next_admit_capacity = true;
+    }
+
     /// Persist the poll cursor under the same lock-reload-merge-write
     /// protocol as every mutation. A crash before this write replays at
     /// most the in-flight batch; after it, a restart resumes instead of
@@ -569,6 +599,10 @@ impl BindingStore {
         events: &[DroppedUpdate],
         offset: i64,
     ) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_admit_capacity) {
+            return Err(anyhow!("a4mc_telegram_state_full"));
+        }
         self.mutate_bounded(LIFECYCLE_RESERVE_BYTES, |document| {
             for task in tasks {
                 // Re-admission keeps the existing record: a finished
@@ -621,49 +655,27 @@ impl BindingStore {
         })
     }
 
-    /// Settle an event the host callback rejected — or one a restart
-    /// found still pending, since the lowered event cannot be
-    /// replayed: it becomes the durable dropped record either way.
-    /// `raw_kind` labels the record when no pending marker is found.
-    pub fn settle_event_dropped(&mut self, update_id: i64, raw_kind: &str) -> Result<()> {
-        let raw_kind: String = raw_kind.chars().take(MAX_RAW_KIND_CHARS).collect();
-        self.mutate(|document| {
-            let event = document
-                .pending_events
-                .iter()
-                .position(|item| item.update_id == update_id)
-                .map(|index| document.pending_events.remove(index))
-                .unwrap_or(DroppedUpdate {
-                    update_id,
-                    raw_kind,
-                });
-            document
-                .dropped_updates
-                .retain(|item| item.update_id != update_id);
-            document.dropped_updates.push(event);
-            let excess = document
-                .dropped_updates
-                .len()
-                .saturating_sub(MAX_DROPPED_UPDATES);
-            if excess > 0 {
-                document.dropped_updates.drain(..excess);
-            }
-            Ok(())
-        })
-    }
-
-    /// Settle every event still awaiting its callback — the restart
-    /// path: the cursor already confirmed them and the lowered events
-    /// cannot be replayed, so each becomes its durable dropped record.
-    /// Nothing pending means nothing to write.
+    /// Settle the events a restart found still pending — but only the
+    /// ones the stored cursor already confirmed: a marker at or above
+    /// the cursor is still refetchable — the platform will redeliver
+    /// its update and the callback gets its chance — so it stays
+    /// pending. A marker the cursor has moved past cannot be replayed
+    /// and becomes its durable dropped record. Nothing stale means
+    /// nothing to write.
     pub fn settle_unconsumed_events(&mut self) -> Result<()> {
-        if self.document.pending_events.is_empty() {
+        if self
+            .document
+            .pending_events
+            .iter()
+            .all(|item| item.update_id >= self.document.poll_offset)
+        {
             return Ok(());
         }
         self.mutate(|document| {
             let ids: Vec<i64> = document
                 .pending_events
                 .iter()
+                .filter(|item| item.update_id < document.poll_offset)
                 .map(|item| item.update_id)
                 .collect();
             for update_id in ids {
@@ -723,8 +735,13 @@ impl BindingStore {
     /// and the resumable result land or fail together, so a restart
     /// never finds a committed session change on an unfinished task
     /// and re-runs it — or reapplies a session a later committed write
-    /// already replaced. The session is applied only while the chat
-    /// still has an agent bound; the reply record never depends on it.
+    /// already replaced. `expected` is the binding the caller's turn
+    /// ran under: the session lands only while the current binding
+    /// still matches it — user, agent and session — so a rebind that
+    /// raced an in-flight turn can never have the stale session
+    /// written over it. The reply record itself never depends on the
+    /// effect: a refused routing change still keeps its finished
+    /// reply.
     pub fn record_reply_and_session(
         &mut self,
         chat_id: i64,
@@ -732,6 +749,7 @@ impl BindingStore {
         reply: &str,
         key: &str,
         session_id: Option<String>,
+        expected: &ChatBinding,
     ) -> Result<()> {
         ensure!(
             reply.len() <= MAX_REPLY_BYTES,
@@ -739,14 +757,12 @@ impl BindingStore {
         );
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
-            // Capture the binding the session is recorded under so a
-            // staged replay can never attach it to a newer binding.
-            let binding = document.chats.get(&chat_id.to_string());
             let effect = StagedEffect::ReplySession {
                 chat_id,
                 session_id,
-                user_id: binding.map(|binding| binding.user_id),
-                agent_id: binding.and_then(|binding| binding.agent_id.clone()),
+                user_id: Some(expected.user_id),
+                agent_id: expected.agent_id.clone(),
+                prior_session: Some(expected.session_id.clone()),
             };
             apply_effect(document, &effect);
             stage_reply(document, &dir, update_id, reply, key, effect)
@@ -892,7 +908,7 @@ impl BindingStore {
                 task.reply_key = Some(key.to_owned());
                 task.reply_sent = 0;
                 task.reply_progress = None;
-                task.reply_retry_at = None;
+                task.reply_retry_at_ms = None;
                 return Ok(true);
             }
             Ok(false)
@@ -918,7 +934,7 @@ impl BindingStore {
             {
                 task.reply_sent = task.reply_sent.max(sent);
                 task.reply_progress = progress;
-                task.reply_retry_at = None;
+                task.reply_retry_at_ms = None;
             }
             Ok(())
         })
@@ -927,10 +943,10 @@ impl BindingStore {
     /// Persist a delivery attempt's checkpoint and owed retry deadline
     /// as one durable write: `progress` replaces the stored checkpoint
     /// (`None` leaves it untouched — a failure before the transport
-    /// ran has none to record), `not_before` sets the instant the
-    /// reply must not be attempted before. Persisting both together
-    /// before the wait means an exit inside it can never leave a
-    /// retryable checkpoint missing its deadline.
+    /// ran has none to record), `not_before` sets the Unix-millisecond
+    /// instant the reply must not be attempted before. Persisting both
+    /// together before the wait means an exit inside it can never
+    /// leave a retryable checkpoint missing its deadline.
     pub fn record_reply_checkpoint(
         &mut self,
         update_id: i64,
@@ -947,7 +963,7 @@ impl BindingStore {
                     task.reply_progress = Some(progress);
                 }
                 if let Some(deadline) = not_before {
-                    task.reply_retry_at = Some(deadline);
+                    task.reply_retry_at_ms = Some(deadline);
                 }
             }
             Ok(())
@@ -973,6 +989,26 @@ impl BindingStore {
         staged_update_ids(&replies_dir(&self.path))
     }
 
+    /// Whether a recoverable staged completion for the update is still
+    /// waiting to bind — the durable reply exists, so the task counts
+    /// as holding a finished reply even while its document pointer has
+    /// not committed.
+    pub fn staged_reply_pending(&self, update_id: i64) -> bool {
+        staged_exists(&replies_dir(&self.path), update_id)
+    }
+
+    /// The update ids this store already durably claimed — admitted
+    /// tasks still pending, and tasks already settled. A refetched
+    /// update naming one is confirmed work, never re-queued.
+    pub fn claimed_update_ids(&self) -> std::collections::HashSet<i64> {
+        self.document
+            .pending_updates
+            .iter()
+            .map(|task| task.update_id)
+            .chain(self.document.settled_updates.iter().copied())
+            .collect()
+    }
+
     /// Apply every staged completion that commits, then report the
     /// ones still waiting — with the stable refusal code — so the
     /// runtime can surface them instead of silently retaining them.
@@ -991,12 +1027,15 @@ impl BindingStore {
         })
     }
 
-    /// Drop an admitted task once it is fully processed.
+    /// Drop an admitted task once it is fully processed. Its id stays
+    /// on the bounded settled tail: a cursor rollback that refetches
+    /// the update skips it instead of re-running confirmed work.
     pub fn complete_update(&mut self, update_id: i64) -> Result<()> {
         self.mutate(|document| {
             document
                 .pending_updates
                 .retain(|task| task.update_id != update_id);
+            note_settled(document, update_id);
             Ok(())
         })
     }
@@ -1004,13 +1043,19 @@ impl BindingStore {
     /// Settle a task whose handling failed: the record is dropped
     /// unless it still holds an undelivered finished reply — committed
     /// or staged — since that result is the only unfinished stage and
-    /// is resumed on restart instead of re-running the turn.
+    /// is resumed on restart instead of re-running the turn. A
+    /// retained record stays claimed; a removed one's id joins the
+    /// settled tail so a refetch skips it either way.
     pub fn settle_failed_update(&mut self, update_id: i64) -> Result<()> {
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
+            let before = document.pending_updates.len();
             document.pending_updates.retain(|task| {
                 task.update_id != update_id || task.has_reply() || staged_exists(&dir, update_id)
             });
+            if document.pending_updates.len() != before {
+                note_settled(document, update_id);
+            }
             Ok(())
         })
     }
@@ -1077,6 +1122,21 @@ fn generate_pairing_code() -> String {
         .iter()
         .map(|byte| ALPHABET[(*byte as usize) % ALPHABET.len()] as char)
         .collect()
+}
+
+/// Remember a task's update id on the bounded settled tail: a cursor
+/// rollback for a rejected event refetches it, and the remembered id
+/// keeps confirmed work out of the scheduler.
+fn note_settled(document: &mut BindingDocument, update_id: i64) {
+    document.settled_updates.retain(|id| *id != update_id);
+    document.settled_updates.push(update_id);
+    let excess = document
+        .settled_updates
+        .len()
+        .saturating_sub(MAX_SETTLED_UPDATES);
+    if excess > 0 {
+        document.settled_updates.drain(..excess);
+    }
 }
 
 fn lock_path(path: &Path) -> PathBuf {
@@ -1187,6 +1247,27 @@ fn staged_payload_name_ok(staged: &StagedCompletion, update_id: i64) -> bool {
     staged.payload == reply_file_name(update_id) || staged.payload == manifest_file_name(update_id)
 }
 
+/// The document bytes a staged record contributes once bound — the
+/// payload pointer and delivery key it writes on its task plus the
+/// binding fields its effect carries. When that contribution alone
+/// exceeds the document bound the record can never commit, however
+/// much slack the rest of the document frees.
+fn staged_doc_cost(staged: &StagedCompletion) -> usize {
+    let effect = match &staged.effect {
+        StagedEffect::Reply | StagedEffect::ReplyRevoke { .. } => 0,
+        StagedEffect::ReplySession {
+            session_id,
+            agent_id,
+            ..
+        } => session_id.as_deref().map_or(0, str::len) + agent_id.as_deref().map_or(0, str::len),
+        StagedEffect::ReplyAgent { agent_id, .. } => agent_id.len(),
+        StagedEffect::ReplyPairing { record } => {
+            record.code.len() + record.username.as_deref().map_or(0, str::len)
+        }
+    };
+    staged.payload.len() + staged.key.len() + effect
+}
+
 fn staged_update_ids(dir: &Path) -> Vec<i64> {
     let mut ids = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1244,6 +1325,14 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
         if staged.text.is_none() && !dir.join(&staged.payload).is_file() {
             continue;
         }
+        // A record whose own document contribution can never fit the
+        // bound — an oversized session id is the reachable shape —
+        // stays unbound: it is retained on disk and reported by
+        // `stranded_staged` instead of letting every mutation that
+        // replays it fail on a document that can never commit.
+        if staged_doc_cost(&staged) > MAX_STATE_BYTES {
+            continue;
+        }
         let Some(index) = document
             .pending_updates
             .iter()
@@ -1261,7 +1350,7 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
         task.reply_key = Some(staged.key.clone());
         task.reply_sent = 0;
         task.reply_progress = None;
-        task.reply_retry_at = None;
+        task.reply_retry_at_ms = None;
     }
 }
 
@@ -1348,7 +1437,7 @@ fn stage_reply(
     task.reply_key = Some(key.to_owned());
     task.reply_sent = 0;
     task.reply_progress = None;
-    task.reply_retry_at = None;
+    task.reply_retry_at_ms = None;
     Ok(())
 }
 
@@ -1364,6 +1453,7 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
             session_id,
             user_id,
             agent_id,
+            prior_session,
         } => {
             if let Some(binding) = document.chats.get_mut(&chat_id.to_string())
                 && binding.agent_id.is_some()
@@ -1371,6 +1461,9 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
                 && agent_id
                     .as_ref()
                     .is_none_or(|held| binding.agent_id.as_ref() == Some(held))
+                && prior_session
+                    .as_ref()
+                    .is_none_or(|held| binding.session_id == *held)
             {
                 binding.session_id = session_id.clone();
                 binding.updated_at = now_secs();
@@ -1526,6 +1619,7 @@ fn read_document(path: &Path) -> Result<BindingDocument> {
             dropped_updates: Vec::new(),
             pending_events: Vec::new(),
             pending_updates: Vec::new(),
+            settled_updates: Vec::new(),
         }),
     }
 }
@@ -1789,7 +1883,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -1800,6 +1894,7 @@ mod tests {
             // binding on an unfinished task is exactly the state that
             // let a restart re-run the command or revert a later
             // session.
+            let expected = store.binding(9).cloned().unwrap();
             store.fail_next_write_for_test();
             store
                 .record_reply_and_session(
@@ -1808,6 +1903,7 @@ mod tests {
                     "Started a new conversation: s2",
                     "reply:7",
                     Some("s2".into()),
+                    &expected,
                 )
                 .unwrap_err();
             assert_eq!(store.binding(9).unwrap().session_id, None);
@@ -1819,6 +1915,7 @@ mod tests {
                     "Started a new conversation: s2",
                     "reply:7",
                     Some("s2".into()),
+                    &expected,
                 )
                 .unwrap();
             assert_eq!(store.binding(9).unwrap().session_id.as_deref(), Some("s2"));
@@ -1844,7 +1941,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -1867,7 +1964,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -1897,7 +1994,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -1946,7 +2043,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -1968,6 +2065,7 @@ mod tests {
                     session_id: Some("staged-session".to_owned()),
                     user_id: None,
                     agent_id: None,
+                    prior_session: None,
                 },
                 text: None,
             };
@@ -2013,7 +2111,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2103,7 +2201,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2148,7 +2246,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2167,7 +2265,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2196,7 +2294,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2231,7 +2329,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2286,7 +2384,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2307,6 +2405,7 @@ mod tests {
                     session_id: Some("staged-session".to_owned()),
                     user_id: Some(42),
                     agent_id: None,
+                    prior_session: None,
                 },
                 text: Some("self-contained reply".to_owned()),
             };
@@ -2348,7 +2447,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2394,7 +2493,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2413,6 +2512,7 @@ mod tests {
                     session_id: Some("staged-session".to_owned()),
                     user_id: Some(42),
                     agent_id: Some("codex".to_owned()),
+                    prior_session: None,
                 },
                 text: Some("reply body".to_owned()),
             };
@@ -2487,6 +2587,10 @@ mod tests {
                 "a consumed event was recorded dropped"
             );
 
+            // A rejected event rolls the cursor back before it for
+            // redelivery: its marker stays pending — never recorded
+            // dropped — and a restart settles only markers the cursor
+            // has moved past.
             store
                 .admit_updates(
                     &[],
@@ -2498,13 +2602,23 @@ mod tests {
                     8,
                 )
                 .unwrap();
-            store.settle_event_dropped(7, "reaction").unwrap();
+            store.set_poll_offset(7).unwrap();
+            let mut reopened = BindingStore::open(store.path.clone()).unwrap();
+            reopened.settle_unconsumed_events().unwrap();
             assert!(
-                store
+                !reopened
                     .dropped_updates()
                     .iter()
-                    .any(|item| item.update_id == 7 && item.raw_kind == "reaction"),
-                "a rejected event lost its durable dropped record"
+                    .any(|item| item.update_id == 7),
+                "a redeliverable event was recorded dropped on restart"
+            );
+            reopened.settle_event(7).unwrap();
+            assert!(
+                !reopened
+                    .dropped_updates()
+                    .iter()
+                    .any(|item| item.update_id == 7),
+                "a consumed event was recorded dropped"
             );
         });
     }
@@ -2522,7 +2636,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: None,
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],
@@ -2546,10 +2660,122 @@ mod tests {
             assert!(progress.outcome_unknown);
             assert_eq!(progress.confirmed, vec![91]);
             assert_eq!(
-                task.reply_retry_at,
+                task.reply_retry_at_ms,
                 Some(1_700_000_000),
                 "the retry deadline did not commit with its checkpoint"
             );
+        });
+    }
+
+    #[test]
+    fn a_turn_reply_never_overwrites_a_binding_that_moved_on() {
+        temp_store(|mut store| {
+            let pending = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(9, Some("codex".into())).unwrap();
+            store.set_session(9, Some("s-old".into())).unwrap();
+            // The binding the turn ran under.
+            let expected = store.binding(9).cloned().unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // The host rebinds mid-turn: the agent switch clears the
+            // session, so the in-flight turn's session effect is stale.
+            store.set_agent(9, Some("claude".into())).unwrap();
+            store
+                .record_reply_and_session(
+                    9,
+                    7,
+                    "turn reply",
+                    "reply:7",
+                    Some("turn-session".into()),
+                    &expected,
+                )
+                .unwrap();
+            let binding = store.binding(9).cloned().unwrap();
+            assert_eq!(binding.agent_id.as_deref(), Some("claude"));
+            assert_eq!(
+                binding.session_id, None,
+                "a stale turn's session overwrote the newer binding"
+            );
+            // The finished reply is retained regardless: its record
+            // never depends on the routing effect applying.
+            let task = store.pending_update(7).unwrap();
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some("turn reply")
+            );
+            assert_eq!(task.reply_key.as_deref(), Some("reply:7"));
+        });
+    }
+
+    #[test]
+    fn an_uncommittable_staged_record_is_reported_while_mutations_proceed() {
+        temp_store(|mut store| {
+            let pending = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(9, Some("codex".into())).unwrap();
+            let expected = store.binding(9).cloned().unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // A session id that fits the staged record but can never
+            // fit the bounded document: the record is retained while
+            // its document contribution is refused.
+            let error = store
+                .record_reply_and_session(
+                    9,
+                    7,
+                    "reply body",
+                    "reply:7",
+                    Some("x".repeat(MAX_STATE_BYTES)),
+                    &expected,
+                )
+                .unwrap_err();
+            assert_eq!(error.to_string(), "a4mc_telegram_state_full");
+            // Unrelated mutations are not blocked by the record every
+            // replay would otherwise force into the document.
+            store.set_poll_offset(9).unwrap();
+            let stranded = store.reconcile_staged().unwrap();
+            assert!(
+                stranded
+                    .iter()
+                    .any(|item| item.update_id == 7 && item.code == "a4mc_telegram_state_full"),
+                "the uncommittable completion was not reported: {stranded:?}"
+            );
+            // Retained: the record stays on disk for its task and the
+            // binding is untouched by the oversized session.
+            assert!(store.staged_reply_pending(7));
+            assert!(store.pending_update(7).is_some());
+            assert_eq!(store.binding(9).unwrap().session_id, None);
         });
     }
 
@@ -2569,7 +2795,7 @@ mod tests {
                         reply_sent: 0,
                         reply_progress: None,
                         reply_file: Some("reply-7.txt".to_owned()),
-                        reply_retry_at: None,
+                        reply_retry_at_ms: None,
                     }],
                     &[],
                     &[],

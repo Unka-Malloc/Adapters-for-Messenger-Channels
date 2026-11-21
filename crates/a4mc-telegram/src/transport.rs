@@ -524,14 +524,21 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
     let raw_cap = MAX_RESPONSE_BYTES + 64 * 1024;
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8192];
+    // The head bound is enforced at the terminator itself — body
+    // bytes that arrive inside the same read never count against it,
+    // so a valid head under the limit cannot be hidden by the body
+    // that followed it.
     let head_end = loop {
-        if let Some(position) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position + 4;
-        }
         match stream.read(&mut chunk) {
             Ok(0) => return Err(failed()),
             Ok(read) => {
                 raw.extend_from_slice(&chunk[..read]);
+                if let Some(position) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                    if position + 4 > MAX_HEAD_BYTES {
+                        return Err(failed());
+                    }
+                    break position + 4;
+                }
                 if raw.len() > MAX_HEAD_BYTES {
                     return Err(failed());
                 }
@@ -1542,5 +1549,57 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(error.code, "a4mc_telegram_throttled");
         assert_eq!(error.retry_after, Some(6));
+    }
+
+    /// A scripted reader whose `read` calls return bounded chunk
+    /// sizes — the network delivering the head's tail and the body
+    /// inside one read.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        reads: std::collections::VecDeque<usize>,
+        offset: usize,
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let size = self
+                .reads
+                .pop_front()
+                .unwrap_or(usize::MAX)
+                .min(self.data.len().saturating_sub(self.offset))
+                .min(buf.len());
+            buf[..size].copy_from_slice(&self.data[self.offset..self.offset + size]);
+            self.offset += size;
+            Ok(size)
+        }
+    }
+
+    #[test]
+    fn a_body_in_the_final_head_read_cannot_hide_a_throttle() {
+        // A head just under the bound completes inside one read that
+        // also carries enough body to push the buffer past it: the
+        // limit is enforced at the terminator, so the valid 429 head
+        // is still classified — the buffer size is not the head size.
+        let head = format!(
+            "HTTP/1.1 429 X\r\nContent-Type: application/json\r\nRetry-After: 6\r\nX-Pad: {}\r\n\r\n",
+            "h".repeat(15_000)
+        );
+        let head_len = head.len();
+        assert!(head_len <= MAX_HEAD_BYTES, "fixture head is oversized");
+        let body = "b".repeat(9_000);
+        let mut response = head.into_bytes();
+        response.extend_from_slice(body.as_bytes());
+        // Two short head reads, then one read covering the head's tail
+        // and most of the body — past the head bound while the
+        // terminator is still inside the same read.
+        let mut stream = ChunkedReader {
+            data: response,
+            reads: std::collections::VecDeque::from([8_000, 8_000]),
+            offset: 0,
+        };
+        let parsed = read_response(&mut stream).unwrap();
+        assert_eq!(parsed.status, 429);
+        assert_eq!(parsed.retry_after, Some(6));
+        assert_eq!(parsed.body, body.as_bytes());
     }
 }
