@@ -10,9 +10,11 @@
 //!
 //! Discord caps one message's content at 2,000 characters, below the
 //! contract's 32 KiB bound. Sends split on a safe boundary and report
-//! every part's message id; a failure after a prefix was posted releases
-//! the idempotency key, so a retry can repeat that prefix — the platform
-//! offers no transaction across parts.
+//! every part's message id. A send that stops mid-flight keeps its
+//! confirmed prefix and next part index under the idempotency key, so a
+//! same-key retry resumes at the failed part instead of reposting the
+//! prefix; a part whose outcome is unclear is resent under the same
+//! deterministic nonce, which `enforce_nonce` dedupes server-side.
 
 use crate::transport::{DiscordApi, PostMessageRequest};
 use a4mc::{
@@ -78,6 +80,14 @@ pub struct DiscordChannel<A: DiscordApi> {
 #[derive(Clone)]
 enum SendState {
     InFlight,
+    /// A send that stopped mid-flight: the confirmed prefix and the
+    /// next part to attempt. Retrying parts under the same key reposts
+    /// the next part with its deterministic nonce — confirmed parts
+    /// never leave the adapter twice.
+    Partial {
+        confirmed: Vec<ExternalMessageId>,
+        next_part: usize,
+    },
     Done(SendReceipt),
 }
 
@@ -102,6 +112,19 @@ impl IdempotencyCache {
         self.entries.insert(key, SendState::InFlight);
     }
 
+    /// Record a send that stopped mid-flight: the confirmed prefix and
+    /// the part index to resume at stay under the key so a same-key
+    /// retry does not repost confirmed parts.
+    fn set_partial(&mut self, key: String, confirmed: Vec<ExternalMessageId>, next_part: usize) {
+        self.entries.insert(
+            key,
+            SendState::Partial {
+                confirmed,
+                next_part,
+            },
+        );
+    }
+
     fn complete(&mut self, key: String, receipt: SendReceipt) {
         while self.order.len() >= IDEMPOTENCY_CACHE_CAP {
             if let Some(oldest) = self.order.pop_front() {
@@ -110,10 +133,6 @@ impl IdempotencyCache {
         }
         self.order.push_back(key.clone());
         self.entries.insert(key, SendState::Done(receipt));
-    }
-
-    fn release(&mut self, key: &str) {
-        self.entries.remove(key);
     }
 }
 
@@ -135,8 +154,13 @@ impl<A: DiscordApi> DiscordChannel<A> {
     /// The contract validates first; the idempotency key is reserved
     /// under the cache lock before the first API call, so a repeat key
     /// while a send is in flight waits and replays the observed receipt
-    /// instead of double-posting. A failed send releases its reservation
-    /// so the waiter or a later retry performs its own call.
+    /// instead of double-posting. A send that stops mid-flight leaves a
+    /// partial record — confirmed part ids plus the next part index —
+    /// under the key, so the retry (or a waiter that takes over)
+    /// resumes at the failed part. A part with an unclear outcome is
+    /// resent under its deterministic nonce, which `enforce_nonce`
+    /// dedupes server-side; the completed receipt returns every
+    /// confirmed and newly posted id.
     pub fn send(&self, outbound: &OutboundMessage) -> Result<SendReceipt, ChannelError> {
         outbound.validate()?;
         let channel = outbound.chat_id.as_str().trim();
@@ -162,7 +186,8 @@ impl<A: DiscordApi> DiscordChannel<A> {
             Some(reply) => Some(reply.as_str().to_owned()),
             None => None,
         };
-        {
+        let parts = split_content(&outbound.text);
+        let (mut message_ids, start_part) = {
             let mut cache = self.sent_keys.lock().unwrap();
             loop {
                 match cache.get(&outbound.idempotency_key) {
@@ -170,30 +195,39 @@ impl<A: DiscordApi> DiscordChannel<A> {
                     Some(SendState::InFlight) => {
                         cache = self.send_wake.wait(cache).unwrap();
                     }
+                    Some(SendState::Partial {
+                        confirmed,
+                        next_part,
+                    }) => {
+                        cache.mark_in_flight(outbound.idempotency_key.clone());
+                        break (confirmed, next_part.min(parts.len()));
+                    }
                     None => {
                         cache.mark_in_flight(outbound.idempotency_key.clone());
-                        break;
+                        break (Vec::with_capacity(parts.len()), 0);
                     }
                 }
             }
-        }
+        };
 
-        let parts = split_content(&outbound.text);
-        let mut message_ids = Vec::with_capacity(parts.len());
-        for (index, part) in parts.iter().enumerate() {
+        for (index, part) in parts.iter().enumerate().skip(start_part) {
             let request = PostMessageRequest {
                 channel_id: channel.to_owned(),
                 content: (*part).to_owned(),
                 reply_to_message_id: if index == 0 { reply_to.clone() } else { None },
+                // One deterministic nonce per (key, part): reposting a
+                // part whose earlier outcome is unclear is deduped by
+                // the platform's enforce_nonce rather than blind.
                 nonce: client_nonce(&outbound.idempotency_key, index),
             };
             match self.api.post_message(&request) {
                 Ok(posted) => message_ids.push(ExternalMessageId::from(posted.id)),
                 Err(error) => {
-                    self.sent_keys
-                        .lock()
-                        .unwrap()
-                        .release(&outbound.idempotency_key);
+                    self.sent_keys.lock().unwrap().set_partial(
+                        outbound.idempotency_key.clone(),
+                        message_ids,
+                        index,
+                    );
                     self.send_wake.notify_all();
                     return Err(ChannelError::from(error));
                 }

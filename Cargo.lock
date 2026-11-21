@@ -16,9 +16,13 @@ name = "a4mc-discord"
 version = "0.1.0"
 dependencies = [
  "a4mc",
+ "base64",
+ "rand_core 0.6.4",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha1",
  "tungstenite",
  "ureq",
  "zeroize",
@@ -29,9 +33,13 @@ name = "a4mc-slack"
 version = "0.1.0"
 dependencies = [
  "a4mc",
+ "base64",
+ "rand_core 0.6.4",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha1",
  "tungstenite",
  "ureq",
  "zeroize",
@@ -45,9 +53,10 @@ dependencies = [
  "anyhow",
  "fs2",
  "rand_core 0.6.4",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
- "ureq",
  "zeroize",
 ]
 

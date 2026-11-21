@@ -18,11 +18,14 @@
 use crate::transport::DiscordApiError;
 use crate::transport::DiscordToken;
 use a4mc::{ChannelEvent, SecretToken};
+use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
 use std::fmt;
-use std::net::TcpStream;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
 /// Discord Gateway protocol version and JSON encoding.
@@ -172,6 +175,13 @@ pub enum GatewayRead {
 pub trait GatewayConnection: Send {
     fn read_frame(&mut self, timeout: Duration) -> Result<GatewayRead, DiscordApiError>;
     fn send_text(&mut self, text: &str) -> Result<(), DiscordApiError>;
+    /// Send one frame whose payload is credential material. The default
+    /// delegates to `send_text`; the live implementation writes the
+    /// masked frame itself so no dependency diagnostic can ever echo a
+    /// token-bearing payload.
+    fn send_secret(&mut self, text: &str) -> Result<(), DiscordApiError> {
+        self.send_text(text)
+    }
     fn close(&mut self) {}
 }
 
@@ -180,41 +190,248 @@ pub trait GatewayConnector: Send + Sync {
     fn connect(&self, url: &GatewayUrl) -> Result<Box<dyn GatewayConnection>, DiscordApiError>;
 }
 
+/// Authorities a credentialed Gateway connection may target: the
+/// provider's own domain family only. Resume URLs from `READY` stay on
+/// the same family; anything else — a plaintext scheme or a foreign
+/// authority — is refused before handshake data leaves the process.
+const APPROVED_GATEWAY_AUTHORITIES: &[&str] = &["discord.gg"];
+
+fn endpoint_refused() -> DiscordApiError {
+    DiscordApiError::new(
+        "a4mc_discord_gateway_endpoint_refused",
+        "Gateway URL is outside the approved endpoint policy",
+    )
+}
+
+/// One validated Gateway endpoint. `tls` is `true` for `wss://`; a
+/// plaintext `ws://` endpoint is only constructible for a loopback host,
+/// so the token can never travel unencrypted off the machine.
+#[derive(Debug)]
+struct GatewayEndpoint {
+    host: String,
+    port: u16,
+    /// Path plus query for the upgrade `GET` line.
+    target: String,
+    tls: bool,
+}
+
+fn loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// Validate a Gateway URL against the endpoint policy: `wss://` on a
+/// Discord authority, or `ws://` loopback for local fixtures. Redirects
+/// are never followed, so the policy holds for every byte sent.
+fn parse_gateway_endpoint(url: &str) -> Result<GatewayEndpoint, DiscordApiError> {
+    let (tls, rest) = url
+        .trim()
+        .strip_prefix("wss://")
+        .map(|rest| (true, rest))
+        .or_else(|| url.trim().strip_prefix("ws://").map(|rest| (false, rest)))
+        .ok_or_else(endpoint_refused)?;
+    let (authority, path) = rest
+        .split_once('/')
+        .map_or((rest, "/"), |(authority, path)| {
+            (authority, if path.is_empty() { "/" } else { path })
+        });
+    let target = if path == "/" {
+        "/".to_owned()
+    } else {
+        format!("/{path}")
+    };
+    if authority.is_empty() || authority.contains('@') {
+        return Err(endpoint_refused());
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().map_err(|_| endpoint_refused())?),
+        None => (authority, if tls { 443 } else { 80 }),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(endpoint_refused());
+    }
+    let approved = if tls {
+        APPROVED_GATEWAY_AUTHORITIES
+            .iter()
+            .any(|authority| host == *authority || host.ends_with(&format!(".{authority}")))
+    } else {
+        // Plaintext may only ever reach loopback — a credential can
+        // never leave the machine unencrypted.
+        loopback_host(&host)
+    };
+    if !approved {
+        return Err(endpoint_refused());
+    }
+    Ok(GatewayEndpoint {
+        host,
+        port,
+        target,
+        tls,
+    })
+}
+
+/// The byte stream under a live websocket. Exposes the read timeout the
+/// session needs to interleave heartbeats with idle waits.
+trait GatewayStream: Read + Write + Send {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl GatewayStream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+}
+
+impl GatewayStream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const IO_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_HANDSHAKE_RESPONSE: usize = 16 * 1024;
+
+/// Open the websocket with the upgrade handshake written by this
+/// adapter. tungstenite's connect helper logs the request URI at debug
+/// and the full request — including a ticket-bearing target — at trace,
+/// and follows redirects to authorities the endpoint policy never
+/// approved; none of that can happen on this path. TLS peer verification
+/// uses the platform root store.
+fn connect_websocket(
+    endpoint: &GatewayEndpoint,
+) -> Result<tungstenite::WebSocket<Box<dyn GatewayStream>>, DiscordApiError> {
+    let failed = || {
+        DiscordApiError::new(
+            "a4mc_discord_gateway_connect_failed",
+            "Gateway connection failed",
+        )
+    };
+    let tcp = (endpoint.host.as_str(), endpoint.port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|addrs| {
+            addrs
+                .into_iter()
+                .find_map(|addr| TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok())
+        })
+        .ok_or_else(failed)?;
+    let _ = tcp.set_nodelay(true);
+    let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
+    let mut stream: Box<dyn GatewayStream> = if endpoint.tls {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(cert);
+        }
+        if roots.is_empty() {
+            return Err(failed());
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name =
+            rustls::pki_types::ServerName::try_from(endpoint.host.clone()).map_err(|_| failed())?;
+        let conn =
+            rustls::ClientConnection::new(Arc::new(config), server_name).map_err(|_| failed())?;
+        Box::new(rustls::StreamOwned::new(conn, tcp))
+    } else {
+        Box::new(tcp)
+    };
+
+    // Upgrade handshake written directly: the request target never
+    // enters a dependency's diagnostics.
+    use base64::Engine;
+    let mut nonce = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce);
+    let key = base64::engine::general_purpose::STANDARD.encode(nonce);
+    let host_header = if endpoint.port == 443 && endpoint.tls {
+        endpoint.host.clone()
+    } else {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    };
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        endpoint.target
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|_| failed())?;
+
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let boundary = loop {
+        let read = stream.read(&mut chunk).map_err(|_| failed())?;
+        if read == 0 {
+            return Err(failed());
+        }
+        head.extend_from_slice(&chunk[..read]);
+        if head.len() > MAX_HANDSHAKE_RESPONSE {
+            return Err(failed());
+        }
+        if let Some(at) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at + 4;
+        }
+    };
+    // One read can coalesce the 101 response and the peer's first frame;
+    // bytes after the header belong to the websocket, not the handshake.
+    let leftover = head.split_off(boundary);
+    let head = String::from_utf8_lossy(&head);
+    let mut lines = head.lines();
+    let accepted = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .is_some_and(|status| status == "101");
+    let expect = {
+        use sha1::Digest;
+        let mut digest = sha1::Sha1::new();
+        digest.update(key.as_bytes());
+        digest.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        base64::engine::general_purpose::STANDARD.encode(digest.finalize())
+    };
+    let accepted = accepted
+        && lines.any(|line| {
+            line.split_once(':')
+                .map(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("sec-websocket-accept")
+                        && value.trim() == expect
+                })
+                .unwrap_or(false)
+        });
+    if !accepted {
+        return Err(failed());
+    }
+    Ok(tungstenite::WebSocket::from_partially_read(
+        stream,
+        leftover,
+        tungstenite::protocol::Role::Client,
+        None,
+    ))
+}
+
 /// tungstenite-backed live connector. TLS roots come from the platform
-/// store; the Gateway URL never appears in errors.
+/// store; the Gateway URL never appears in errors or diagnostics.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LiveGatewayConnector;
 
 impl GatewayConnector for LiveGatewayConnector {
     fn connect(&self, url: &GatewayUrl) -> Result<Box<dyn GatewayConnection>, DiscordApiError> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let (socket, _response) = tungstenite::connect(url.expose()).map_err(|_| {
-            DiscordApiError::new(
-                "a4mc_discord_gateway_connect_failed",
-                "Gateway connection failed",
-            )
-        })?;
+        let endpoint = parse_gateway_endpoint(url.expose())?;
+        let socket = connect_websocket(&endpoint)?;
         Ok(Box::new(LiveGatewayConnection { socket }))
     }
 }
 
 struct LiveGatewayConnection {
-    socket: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    socket: tungstenite::WebSocket<Box<dyn GatewayStream>>,
 }
 
 impl LiveGatewayConnection {
     fn set_read_timeout(&self, timeout: Duration) -> Result<(), DiscordApiError> {
-        let stream = match self.socket.get_ref() {
-            tungstenite::stream::MaybeTlsStream::Plain(stream) => stream,
-            tungstenite::stream::MaybeTlsStream::Rustls(stream) => &stream.sock,
-            _ => {
-                return Err(DiscordApiError::new(
-                    "a4mc_discord_gateway_failed",
-                    "Gateway stream does not expose a TCP socket",
-                ));
-            }
-        };
-        stream
+        self.socket
+            .get_ref()
             .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
             .map_err(|_| {
                 DiscordApiError::new(
@@ -223,6 +440,38 @@ impl LiveGatewayConnection {
                 )
             })
     }
+}
+
+/// Encode one client text frame (FIN, masked) and write it straight to
+/// the stream. tungstenite's send path traces the full frame payload —
+/// hex, but still the bytes — so a token-bearing `IDENTIFY`/`RESUME`
+/// never goes through it.
+fn write_masked_text_frame(stream: &mut dyn Write, payload: &[u8]) -> Result<(), DiscordApiError> {
+    let mut mask = [0u8; 4];
+    OsRng.fill_bytes(&mut mask);
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(0x81);
+    let len = payload.len();
+    if len <= 125 {
+        frame.push(0x80 | len as u8);
+    } else if len <= u16::MAX as usize {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .zip(mask.iter().cycle())
+            .map(|(byte, mask)| byte ^ mask),
+    );
+    stream
+        .write_all(&frame)
+        .and_then(|()| stream.flush())
+        .map_err(|_| DiscordApiError::new("a4mc_discord_gateway_failed", "Gateway write failed"))
 }
 
 impl GatewayConnection for LiveGatewayConnection {
@@ -270,14 +519,23 @@ impl GatewayConnection for LiveGatewayConnection {
             })
     }
 
+    fn send_secret(&mut self, text: &str) -> Result<(), DiscordApiError> {
+        // The masked frame is written to the stream directly: no
+        // dependency code path ever handles — or logs — the
+        // credential-bearing payload.
+        write_masked_text_frame(self.socket.get_mut(), text.as_bytes())
+    }
+
     fn close(&mut self) {
         let _ = self.socket.close(None);
         let _ = self.socket.flush();
     }
 }
 
-/// The host's answer to one Gateway dispatch.
-pub trait GatewayHandler {
+/// The host's answer to one Gateway dispatch. Handlers run on a worker
+/// thread fed by a bounded handoff so a slow host turn can never stall
+/// the connection's heartbeat schedule.
+pub trait GatewayHandler: Send {
     /// A lowered dispatch. `payload` carries the raw data and event name
     /// for host policy.
     fn on_dispatch(
@@ -353,6 +611,30 @@ pub enum SessionOutcome {
     Stopped,
 }
 
+/// Bound on dispatches queued for the host worker. One further dispatch
+/// can wait in the session's deferred slot; load beyond that ends the
+/// session — the uncommitted cursor replays the work on reconnect —
+/// instead of growing an unbounded queue inside the connection loop.
+const DISPATCH_HANDOFF_BOUND: usize = 64;
+
+/// Error code for host work arriving faster than the bounded handoff
+/// can absorb. Reconnectable: the dispatches stay unconfirmed and the
+/// platform replays them.
+const HANDLER_OVERLOADED_CODE: &str = "a4mc_discord_handler_overloaded";
+
+/// One dispatch handed to the host worker: the lowered events plus the
+/// sequence the resume cursor advances to once the host accepts them.
+struct DispatchWork {
+    events: Vec<ChannelEvent>,
+    payload: GatewayPayload,
+}
+
+/// The worker's answer for one dispatch, in receive order.
+struct DispatchAck {
+    sequence: Option<u64>,
+    result: Result<(), DiscordApiError>,
+}
+
 /// Run one already-connected Gateway session until reconnect, close or
 /// stop.
 ///
@@ -360,6 +642,10 @@ pub enum SessionOutcome {
 /// `session` carries a session id and sequence), sends a heartbeat on the
 /// advertised interval, and treats a missing heartbeat acknowledgement
 /// as a zombie connection rather than piling up more heartbeats.
+/// Heartbeat sends and their acknowledgement checks are scheduled on
+/// independent monotonic deadlines, and host dispatch work runs on a
+/// worker fed through a bounded handoff, so a slow handler can never
+/// stall the connection's heartbeat cadence.
 pub fn run_gateway_session(
     connection: &mut dyn GatewayConnection,
     token: &SecretToken,
@@ -368,9 +654,76 @@ pub fn run_gateway_session(
     config: &GatewayConfig,
     stop: &AtomicBool,
 ) -> Result<SessionOutcome, DiscordApiError> {
+    let (work_tx, work_rx) = sync_channel::<DispatchWork>(DISPATCH_HANDOFF_BOUND);
+    let (ack_tx, ack_rx) = sync_channel::<DispatchAck>(DISPATCH_HANDOFF_BOUND);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            while let Ok(work) = work_rx.recv() {
+                let mut result = Ok(());
+                for event in &work.events {
+                    if let Err(error) = handler.on_dispatch(event, &work.payload) {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                if ack_tx
+                    .send(DispatchAck {
+                        sequence: work.payload.sequence,
+                        result,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let outcome = session_loop(connection, token, session, config, stop, &work_tx, &ack_rx);
+        // No more work will be handed off; let the worker finish what it
+        // queued so a resumed session does not rerun work the host
+        // actually accepted, then collect every late answer.
+        drop(work_tx);
+        let panicked = worker.join().is_err();
+        let mut first_failure = None;
+        while let Ok(ack) = ack_rx.try_recv() {
+            match ack.result {
+                Ok(()) => commit_dispatch(session, ack.sequence),
+                Err(error) => {
+                    if first_failure.is_none() {
+                        first_failure = Some(error);
+                    }
+                }
+            }
+        }
+        if panicked {
+            return Err(DiscordApiError::new(
+                HANDLER_FAILED_CODE,
+                "Gateway handler worker panicked",
+            ));
+        }
+        if let Some(error) = first_failure {
+            return Err(handler_failure(error));
+        }
+        outcome
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn session_loop(
+    connection: &mut dyn GatewayConnection,
+    token: &SecretToken,
+    session: &mut GatewaySession,
+    config: &GatewayConfig,
+    stop: &AtomicBool,
+    work_tx: &SyncSender<DispatchWork>,
+    ack_rx: &Receiver<DispatchAck>,
+) -> Result<SessionOutcome, DiscordApiError> {
     let mut heartbeat_interval = Duration::from_secs(60);
+    // Two independent monotonic deadlines: when the next heartbeat is
+    // due, and when the last heartbeat's acknowledgement is expected.
+    // Other traffic (a server HEARTBEAT request, dispatches) can touch
+    // one without masking the other.
     let mut next_heartbeat: Option<Instant> = None;
-    let mut awaiting_ack = false;
+    let mut ack_due: Option<Instant> = None;
     let mut hello_seen = false;
     // Frames received advance this local cursor for heartbeats and
     // duplicate detection. `session.sequence` only advances after the
@@ -379,17 +732,45 @@ pub fn run_gateway_session(
     if session.last_dispatched.is_none() {
         session.last_dispatched = session.sequence;
     }
+    // One dispatch deferred because the bounded handoff was full. It is
+    // retried every iteration; a second deferral means the host cannot
+    // keep up and the session ends so the platform replays the backlog.
+    let mut deferred: Option<DispatchWork> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(SessionOutcome::Stopped);
         }
-        let timeout = match next_heartbeat {
-            Some(at) => at
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1)),
-            None => Duration::from_secs(60),
-        };
+        // Commit accepted dispatches and surface host failures. The
+        // resume cursor never passes work the host did not take.
+        while let Ok(ack) = ack_rx.try_recv() {
+            match ack.result {
+                Ok(()) => commit_dispatch(session, ack.sequence),
+                Err(error) => return Err(handler_failure(error)),
+            }
+        }
+        if let Some(work) = deferred.take() {
+            match work_tx.try_send(work) {
+                Ok(()) => {}
+                Err(TrySendError::Full(work)) => deferred = Some(work),
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(DiscordApiError::new(
+                        HANDLER_FAILED_CODE,
+                        "Gateway handler worker stopped",
+                    ));
+                }
+            }
+        }
+        let now = Instant::now();
+        let timeout = [next_heartbeat, ack_due]
+            .into_iter()
+            .flatten()
+            .map(|at| {
+                at.saturating_duration_since(now)
+                    .max(Duration::from_millis(1))
+            })
+            .min()
+            .unwrap_or(Duration::from_secs(60));
         match connection.read_frame(timeout)? {
             GatewayRead::Closed(code) => {
                 if let Some(code) = code.filter(|code| is_terminal_close_code(*code)) {
@@ -401,15 +782,21 @@ pub fn run_gateway_session(
                 return Ok(SessionOutcome::Reconnect);
             }
             GatewayRead::Timeout => {
+                // The read waited out the earliest of the scheduled
+                // deadlines. When that was the acknowledgement check,
+                // the server stopped acknowledging heartbeats: a
+                // zombie connection is reconnected, not fed more
+                // heartbeats.
+                let ack_fired =
+                    ack_due.is_some_and(|due| next_heartbeat.is_none_or(|at| due <= at));
+                if ack_fired {
+                    return Ok(SessionOutcome::Reconnect);
+                }
                 if next_heartbeat.is_some() {
-                    if awaiting_ack {
-                        // The server stopped acknowledging heartbeats:
-                        // reconnect instead of treating a zombie as live.
-                        return Ok(SessionOutcome::Reconnect);
-                    }
                     send_heartbeat(connection, last_received)?;
-                    awaiting_ack = true;
-                    next_heartbeat = Some(Instant::now() + heartbeat_interval);
+                    let now = Instant::now();
+                    next_heartbeat = Some(now + heartbeat_interval);
+                    ack_due = Some(now + heartbeat_interval);
                 }
             }
             GatewayRead::Text(text) => {
@@ -435,15 +822,17 @@ pub fn run_gateway_session(
                         heartbeat_interval = Duration::from_millis(millis);
                         send_handshake(connection, token, session, config)?;
                         send_heartbeat(connection, last_received)?;
-                        awaiting_ack = true;
-                        next_heartbeat = Some(Instant::now() + heartbeat_interval);
+                        let now = Instant::now();
+                        next_heartbeat = Some(now + heartbeat_interval);
+                        ack_due = Some(now + heartbeat_interval);
                     }
                     OP_HEARTBEAT => {
                         send_heartbeat(connection, last_received)?;
-                        awaiting_ack = true;
-                        next_heartbeat = Some(Instant::now() + heartbeat_interval);
+                        let now = Instant::now();
+                        next_heartbeat = Some(now + heartbeat_interval);
+                        ack_due = Some(now + heartbeat_interval);
                     }
-                    OP_HEARTBEAT_ACK => awaiting_ack = false,
+                    OP_HEARTBEAT_ACK => ack_due = None,
                     OP_RECONNECT => return Ok(SessionOutcome::Reconnect),
                     OP_INVALID_SESSION => {
                         if !payload.data.as_bool().unwrap_or(false) {
@@ -477,18 +866,27 @@ pub fn run_gateway_session(
                             commit_dispatch(session, payload.sequence);
                             continue;
                         }
-                        for event in
-                            crate::lower::lower_events(event_name, &payload.data, payload.sequence)
-                        {
-                            handler
-                                .on_dispatch(&event, &payload)
-                                .map_err(handler_failure)?;
+                        let events =
+                            crate::lower::lower_events(event_name, &payload.data, payload.sequence);
+                        let work = DispatchWork { events, payload };
+                        if deferred.is_some() {
+                            // One deferral already waits for room; a
+                            // second means the host cannot keep up.
+                            return Err(DiscordApiError::new(
+                                HANDLER_OVERLOADED_CODE,
+                                "Gateway handler fell behind the dispatch stream",
+                            ));
                         }
-                        // Only a fully accepted dispatch advances the
-                        // resume cursor. A handler failure leaves it at
-                        // the previous event, so reconnecting replays the
-                        // event the host never observed.
-                        commit_dispatch(session, payload.sequence);
+                        match work_tx.try_send(work) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(work)) => deferred = Some(work),
+                            Err(TrySendError::Disconnected(_)) => {
+                                return Err(DiscordApiError::new(
+                                    HANDLER_FAILED_CODE,
+                                    "Gateway handler worker stopped",
+                                ));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -550,7 +948,7 @@ fn send_handshake(
             }
         })
     };
-    connection.send_text(&payload.to_string())
+    connection.send_secret(&payload.to_string())
 }
 
 fn send_heartbeat(
@@ -1165,5 +1563,214 @@ mod tests {
     fn default_intents_leave_privileged_member_events_opt_in() {
         assert_eq!(DEFAULT_INTENTS & INTENT_GUILD_MEMBERS, 0);
         assert_eq!(GatewayConfig::default().intents & INTENT_GUILD_MEMBERS, 0);
+    }
+
+    #[test]
+    fn endpoint_policy_requires_wss_on_a_discord_authority() {
+        assert_eq!(
+            parse_gateway_endpoint("ws://gateway.discord.gg/?v=10")
+                .unwrap_err()
+                .code,
+            "a4mc_discord_gateway_endpoint_refused"
+        );
+        assert_eq!(
+            parse_gateway_endpoint("http://gateway.discord.gg/")
+                .unwrap_err()
+                .code,
+            "a4mc_discord_gateway_endpoint_refused"
+        );
+        assert_eq!(
+            parse_gateway_endpoint("wss://evil.example/?v=10")
+                .unwrap_err()
+                .code,
+            "a4mc_discord_gateway_endpoint_refused"
+        );
+        assert_eq!(
+            parse_gateway_endpoint("wss://user:pw@gateway.discord.gg/")
+                .unwrap_err()
+                .code,
+            "a4mc_discord_gateway_endpoint_refused"
+        );
+        assert_eq!(
+            parse_gateway_endpoint("wss://nodiscord.gg.evil.example/")
+                .unwrap_err()
+                .code,
+            "a4mc_discord_gateway_endpoint_refused"
+        );
+        // Plaintext may only reach loopback — local fixtures stay
+        // possible while a credential can never leave the machine
+        // unencrypted.
+        let loopback = parse_gateway_endpoint("ws://127.0.0.1:8080/?v=10").unwrap();
+        assert!(!loopback.tls);
+        assert_eq!(loopback.port, 8080);
+        assert!(
+            parse_gateway_endpoint("ws://10.0.0.5/?v=10")
+                .unwrap_err()
+                .code
+                == "a4mc_discord_gateway_endpoint_refused"
+        );
+        // The provider authority and its regional resume hosts pass.
+        for url in [
+            "wss://gateway.discord.gg/?v=10&encoding=json",
+            "wss://gateway-us-east1-b.discord.gg/?v=10&encoding=json",
+            "wss://discord.gg/",
+        ] {
+            let endpoint = parse_gateway_endpoint(url).unwrap();
+            assert!(endpoint.tls);
+            assert_eq!(endpoint.port, 443);
+            assert!(endpoint.target.starts_with('/'));
+        }
+    }
+
+    #[test]
+    fn secret_frames_are_client_masked_text_frames() {
+        let mut bytes = Vec::new();
+        write_masked_text_frame(&mut bytes, br#"{"op":2,"d":{"token":"secret"}}"#).unwrap();
+        assert_eq!(bytes[0], 0x81, "FIN + text opcode");
+        assert_eq!(bytes[1] & 0x80, 0x80, "client frames must be masked");
+        let len = usize::from(bytes[1] & 0x7f);
+        let mask = &bytes[2..6];
+        let payload: Vec<u8> = bytes[6..6 + len]
+            .iter()
+            .zip(mask.iter().cycle())
+            .map(|(byte, mask)| byte ^ mask)
+            .collect();
+        assert_eq!(payload, br#"{"op":2,"d":{"token":"secret"}}"#);
+        assert_eq!(bytes.len(), 6 + len, "no trailing bytes");
+    }
+
+    /// A scripted connection that paces its reads so the handler worker
+    /// has time to park before heartbeat deadlines fire.
+    struct PacedConnection {
+        inner: ScriptedConnection,
+    }
+
+    impl GatewayConnection for PacedConnection {
+        fn read_frame(&mut self, timeout: Duration) -> Result<GatewayRead, DiscordApiError> {
+            std::thread::sleep(Duration::from_millis(10));
+            self.inner.read_frame(timeout)
+        }
+        fn send_text(&mut self, text: &str) -> Result<(), DiscordApiError> {
+            self.inner.send_text(text)
+        }
+    }
+
+    /// The host turn parks until released; it records how many
+    /// heartbeats had already been sent when it blocked, so the test
+    /// can prove later beats flowed while it was parked.
+    struct BlockingHandler {
+        entered: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        sent: Arc<Mutex<Vec<Value>>>,
+        beats_at_enter: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GatewayHandler for BlockingHandler {
+        fn on_dispatch(
+            &mut self,
+            _event: &ChannelEvent,
+            _payload: &GatewayPayload,
+        ) -> Result<(), DiscordApiError> {
+            self.beats_at_enter.store(
+                self.sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|payload| payload["op"] == json!(OP_HEARTBEAT))
+                    .count(),
+                Ordering::SeqCst,
+            );
+            self.entered.store(true, Ordering::SeqCst);
+            let (mutex, condvar) = &*self.release;
+            let mut released = mutex.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_blocked_handler_does_not_stall_the_heartbeat_schedule() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = PacedConnection {
+            inner: ScriptedConnection::new(
+                [
+                    hello(),
+                    message(2),
+                    GatewayRead::Text(json!({"op": OP_HEARTBEAT_ACK}).to_string()),
+                    // Each scripted Timeout is the earliest deadline
+                    // firing; with the handler parked these must still
+                    // produce heartbeats (each acknowledged before the
+                    // next deadline).
+                    GatewayRead::Timeout,
+                    GatewayRead::Text(json!({"op": OP_HEARTBEAT_ACK}).to_string()),
+                    GatewayRead::Timeout,
+                    GatewayRead::Text(json!({"op": OP_HEARTBEAT_ACK}).to_string()),
+                    GatewayRead::Timeout,
+                    reconnect(),
+                ],
+                Arc::clone(&sent),
+            ),
+        };
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let beats_at_enter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handler = BlockingHandler {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            sent: Arc::clone(&sent),
+            beats_at_enter: Arc::clone(&beats_at_enter),
+        };
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let runner = std::thread::spawn(move || {
+            let outcome = run_gateway_session(
+                &mut connection,
+                &token,
+                &mut handler,
+                &mut session,
+                &GatewayConfig::default(),
+                &stop,
+            );
+            (outcome, session)
+        });
+        // The dispatch parks the worker while the paced connection keeps
+        // reading; the heartbeat deadlines fire inside the block before
+        // it is released.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "dispatch never reached the handler"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(80));
+        {
+            let (mutex, condvar) = &*release;
+            *mutex.lock().unwrap() = true;
+            condvar.notify_all();
+        }
+        let (outcome, session) = runner.join().unwrap();
+        let outcome = outcome.unwrap();
+
+        assert_eq!(outcome, SessionOutcome::Reconnect);
+        let beats = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|payload| payload["op"] == json!(OP_HEARTBEAT))
+            .count();
+        // HELLO's initial heartbeat plus one per fired deadline.
+        assert_eq!(beats, 4);
+        assert!(
+            beats_at_enter.load(Ordering::SeqCst) < beats,
+            "no heartbeat flowed while the handler was parked"
+        );
+        // The parked dispatch was committed after the handler accepted.
+        assert_eq!(session.sequence, Some(2));
     }
 }

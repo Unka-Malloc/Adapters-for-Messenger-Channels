@@ -7,17 +7,21 @@
 //! ingress is involved, so the dialect works inside an enterprise
 //! firewall that forbids public callbacks.
 //!
-//! Every delivered envelope is acknowledged before it is handed to the
-//! host. That keeps the three-second acknowledgement budget independent
-//! of agent work; delivery is at-most-once locally, with a bounded
-//! envelope-id cache so a Slack retry is acknowledged again but not
-//! re-dispatched. A `disconnect` frame ends the session and the loop
-//! reconnects with a fresh socket URL.
+//! The host must durably receive each envelope before the
+//! acknowledgement goes out — an envelope Slack believes consumed must
+//! already have a resumable home on this side. Once the host has the
+//! work, the ack is sent; if that write fails the socket is dropped and
+//! Slack retries, and the retry is answered with the missing ack
+//! instead of a second dispatch. A `disconnect` frame ends the session
+//! and the loop reconnects with a fresh socket URL.
 
 use crate::transport::{SlackApi, SlackApiError, SocketUrl};
 use a4mc::ChannelEvent;
+use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -129,30 +133,223 @@ pub trait SocketConnector: Send + Sync {
     fn connect(&self, url: &SocketUrl) -> Result<Box<dyn SocketConnection>, SlackApiError>;
 }
 
+/// Authorities a socket URL may target: Slack's own domain family only.
+/// A `ws://` (plaintext) endpoint is only constructible for a loopback
+/// host so a Socket Mode ticket can never travel unencrypted off the
+/// machine.
+const APPROVED_SOCKET_AUTHORITIES: &[&str] = &["slack.com"];
+
+fn endpoint_refused() -> SlackApiError {
+    SlackApiError::new(
+        "a4mc_slack_socket_endpoint_refused",
+        "Socket Mode URL is outside the approved endpoint policy",
+    )
+}
+
+#[derive(Debug)]
+struct SocketEndpoint {
+    host: String,
+    port: u16,
+    /// Path plus query for the upgrade `GET` line.
+    target: String,
+    tls: bool,
+}
+
+fn loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// Validate a socket URL against the endpoint policy: `wss://` on a
+/// Slack authority, or `ws://` loopback for local fixtures.
+fn parse_socket_endpoint(url: &str) -> Result<SocketEndpoint, SlackApiError> {
+    let (tls, rest) = url
+        .trim()
+        .strip_prefix("wss://")
+        .map(|rest| (true, rest))
+        .or_else(|| url.trim().strip_prefix("ws://").map(|rest| (false, rest)))
+        .ok_or_else(endpoint_refused)?;
+    let (authority, path) = rest
+        .split_once('/')
+        .map_or((rest, "/"), |(authority, path)| {
+            (authority, if path.is_empty() { "/" } else { path })
+        });
+    let target = if path == "/" {
+        "/".to_owned()
+    } else {
+        format!("/{path}")
+    };
+    if authority.is_empty() || authority.contains('@') {
+        return Err(endpoint_refused());
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().map_err(|_| endpoint_refused())?),
+        None => (authority, if tls { 443 } else { 80 }),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(endpoint_refused());
+    }
+    let approved = if tls {
+        APPROVED_SOCKET_AUTHORITIES
+            .iter()
+            .any(|authority| host == *authority || host.ends_with(&format!(".{authority}")))
+    } else {
+        loopback_host(&host)
+    };
+    if !approved {
+        return Err(endpoint_refused());
+    }
+    Ok(SocketEndpoint {
+        host,
+        port,
+        target,
+        tls,
+    })
+}
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const IO_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_HANDSHAKE_RESPONSE: usize = 16 * 1024;
+
+/// Open the socket with the upgrade handshake written by this adapter.
+/// tungstenite's connect helper logs the request URI at debug and the
+/// full request — including the unconsumed Socket Mode ticket in its
+/// target — at trace; neither diagnostic exists on this path. TLS peer
+/// verification uses the platform root store.
+fn connect_websocket(
+    endpoint: &SocketEndpoint,
+) -> Result<tungstenite::WebSocket<Box<dyn SocketStream>>, SlackApiError> {
+    let failed = || {
+        SlackApiError::new(
+            "a4mc_slack_socket_connect_failed",
+            "Socket Mode connection failed",
+        )
+    };
+    let tcp = (endpoint.host.as_str(), endpoint.port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|addrs| {
+            addrs
+                .into_iter()
+                .find_map(|addr| TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok())
+        })
+        .ok_or_else(failed)?;
+    let _ = tcp.set_nodelay(true);
+    let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
+    let mut stream: Box<dyn SocketStream> = if endpoint.tls {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(cert);
+        }
+        if roots.is_empty() {
+            return Err(failed());
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name =
+            rustls::pki_types::ServerName::try_from(endpoint.host.clone()).map_err(|_| failed())?;
+        let conn =
+            rustls::ClientConnection::new(Arc::new(config), server_name).map_err(|_| failed())?;
+        Box::new(rustls::StreamOwned::new(conn, tcp))
+    } else {
+        Box::new(tcp)
+    };
+
+    // Upgrade handshake written directly: the ticket-bearing request
+    // target never enters a dependency's diagnostics.
+    use base64::Engine;
+    let mut nonce = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce);
+    let key = base64::engine::general_purpose::STANDARD.encode(nonce);
+    let host_header = if endpoint.port == 443 && endpoint.tls {
+        endpoint.host.clone()
+    } else {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    };
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        endpoint.target
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|_| failed())?;
+
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let boundary = loop {
+        let read = stream.read(&mut chunk).map_err(|_| failed())?;
+        if read == 0 {
+            return Err(failed());
+        }
+        head.extend_from_slice(&chunk[..read]);
+        if head.len() > MAX_HANDSHAKE_RESPONSE {
+            return Err(failed());
+        }
+        if let Some(at) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at + 4;
+        }
+    };
+    // One read can coalesce the 101 response and the peer's first frame;
+    // bytes after the header belong to the websocket, not the handshake.
+    let leftover = head.split_off(boundary);
+    let head = String::from_utf8_lossy(&head);
+    let mut lines = head.lines();
+    let accepted = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .is_some_and(|status| status == "101");
+    let expect = {
+        use sha1::Digest;
+        let mut digest = sha1::Sha1::new();
+        digest.update(key.as_bytes());
+        digest.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        base64::engine::general_purpose::STANDARD.encode(digest.finalize())
+    };
+    let accepted = accepted
+        && lines.any(|line| {
+            line.split_once(':')
+                .map(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("sec-websocket-accept")
+                        && value.trim() == expect
+                })
+                .unwrap_or(false)
+        });
+    if !accepted {
+        return Err(failed());
+    }
+    Ok(tungstenite::WebSocket::from_partially_read(
+        stream,
+        leftover,
+        tungstenite::protocol::Role::Client,
+        None,
+    ))
+}
+
 /// tungstenite-backed live connector. TLS roots come from the platform
-/// store; the Socket Mode URL (and its ticket) never appears in errors.
+/// store; the Socket Mode URL (and its ticket) never appears in errors
+/// or diagnostics.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LiveSocketConnector;
 
+/// The byte stream under a live socket: TCP, or rustls over TCP.
+trait SocketStream: Read + Write + Send {}
+impl SocketStream for TcpStream {}
+impl SocketStream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {}
+
 impl SocketConnector for LiveSocketConnector {
     fn connect(&self, url: &SocketUrl) -> Result<Box<dyn SocketConnection>, SlackApiError> {
-        // The crate enables rustls' ring provider. Install it as the
-        // process default so a host that unifies features with another
-        // rustls user still has a provider before tungstenite builds its
-        // client config. An already-installed provider wins.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let (socket, _response) = tungstenite::connect(url.expose()).map_err(|_| {
-            SlackApiError::new(
-                "a4mc_slack_socket_connect_failed",
-                "Socket Mode connection failed",
-            )
-        })?;
+        let endpoint = parse_socket_endpoint(url.expose())?;
+        let socket = connect_websocket(&endpoint)?;
         Ok(Box::new(LiveSocketConnection { socket }))
     }
 }
 
 struct LiveSocketConnection {
-    socket: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    socket: tungstenite::WebSocket<Box<dyn SocketStream>>,
 }
 
 impl SocketConnection for LiveSocketConnection {
@@ -197,7 +394,10 @@ impl SocketConnection for LiveSocketConnection {
 }
 
 /// Bounded envelope-id cache. Slack retries an unacknowledged envelope;
-/// acknowledging twice is harmless, dispatching twice is not.
+/// acknowledging twice is harmless, dispatching twice is not. An id is
+/// marked only after the host durably received the envelope, so a lost
+/// ack write re-delivers a retry that only re-acks rather than skipping
+/// work the host never took.
 #[derive(Debug)]
 pub struct SeenEnvelopes {
     capacity: usize,
@@ -214,23 +414,26 @@ impl SeenEnvelopes {
         }
     }
 
-    /// Mark `envelope_id` seen and report whether this is its first
-    /// delivery. Empty ids are always first (there is nothing to dedupe).
-    pub fn is_first(&mut self, envelope_id: &str) -> bool {
+    /// Whether this envelope id was already durably received by the host.
+    pub fn contains(&self, envelope_id: &str) -> bool {
+        !envelope_id.is_empty() && self.seen.contains(envelope_id)
+    }
+
+    /// Mark `envelope_id` durably received. Call only after the host has
+    /// taken the work; empty ids are never marked (nothing to dedupe).
+    pub fn mark(&mut self, envelope_id: &str) {
         if envelope_id.is_empty() {
-            return true;
+            return;
         }
-        if self.seen.contains(envelope_id) {
-            return false;
+        if !self.seen.insert(envelope_id.to_owned()) {
+            return;
         }
-        self.seen.insert(envelope_id.to_owned());
         self.order.push_back(envelope_id.to_owned());
         while self.order.len() > self.capacity {
             if let Some(oldest) = self.order.pop_front() {
                 self.seen.remove(&oldest);
             }
         }
-        true
     }
 }
 
@@ -261,9 +464,12 @@ pub enum SessionOutcome {
 }
 
 /// Run one already-connected Socket Mode session until disconnect, close
-/// or stop. Every envelope is acknowledged before the handler runs; a
-/// duplicate envelope id is acknowledged again but dispatched at most
-/// once.
+/// or stop. A first-seen envelope is handed to the host — its durable
+/// receive — before the acknowledgement goes out: if the ack write then
+/// fails, the socket is dropped, Slack retries, and the retry is
+/// answered with the missing ack and no second dispatch. A handler
+/// failure keeps the id unmarked so the retry re-dispatches the work
+/// the host never took.
 pub fn run_socket_session(
     connection: &mut dyn SocketConnection,
     handler: &mut dyn SocketHandler,
@@ -281,17 +487,21 @@ pub fn run_socket_session(
             SocketFrame::Hello { .. } | SocketFrame::Unknown { .. } => {}
             SocketFrame::Disconnect { .. } => return Ok(SessionOutcome::Reconnect),
             SocketFrame::Envelope(envelope) => {
-                let first = seen.is_first(&envelope.envelope_id);
+                if !seen.contains(&envelope.envelope_id) {
+                    // The host's durable receive happens before the ack:
+                    // an envelope Slack believes consumed must already
+                    // have a resumable home here.
+                    if envelope.kind == "events_api" {
+                        let event = crate::lower::lower_event(&envelope.payload);
+                        handler.on_event(&event, &envelope)?;
+                    } else {
+                        handler.on_other(&envelope)?;
+                    }
+                    seen.mark(&envelope.envelope_id);
+                }
+                // First deliveries and ack-recovery retries both end
+                // here: one dispatch per envelope id at most.
                 connection.send_text(&ack_frame(&envelope.envelope_id))?;
-                if !first {
-                    continue;
-                }
-                if envelope.kind == "events_api" {
-                    let event = crate::lower::lower_event(&envelope.payload);
-                    handler.on_event(&event, &envelope)?;
-                } else {
-                    handler.on_other(&envelope)?;
-                }
             }
         }
     }
@@ -440,6 +650,7 @@ mod tests {
         incoming: VecDeque<String>,
         sent: Arc<Mutex<Vec<String>>>,
         fail_read: Option<SlackApiError>,
+        fail_send: Option<SlackApiError>,
     }
 
     impl ScriptedConnection {
@@ -448,6 +659,7 @@ mod tests {
                 incoming: incoming.into(),
                 sent,
                 fail_read: None,
+                fail_send: None,
             }
         }
     }
@@ -461,6 +673,9 @@ mod tests {
         }
 
         fn send_text(&mut self, text: &str) -> Result<(), SlackApiError> {
+            if let Some(error) = self.fail_send.clone() {
+                return Err(error);
+            }
             self.sent.lock().unwrap().push(text.to_owned());
             Ok(())
         }
@@ -508,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledges_before_dispatch_and_dedupes_retries() {
+    fn receives_then_acknowledges_and_dedupes_retries() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut connection = ScriptedConnection::new(
             vec![
@@ -543,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn handler_failure_happens_after_ack_and_is_reported() {
+    fn handler_failure_happens_before_ack_and_is_reported() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut connection = ScriptedConnection::new(
             vec![envelope(
@@ -560,7 +775,55 @@ mod tests {
         let error =
             run_socket_session(&mut connection, &mut handler, &mut seen, &stop).unwrap_err();
         assert_eq!(error.code, "a4mc_slack_handler_failed");
-        assert_eq!(sent.lock().unwrap().len(), 1);
+        // No ack went out: Slack will redeliver, and the unmarked id
+        // re-dispatches instead of being silently dropped.
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(!seen.contains("e1"));
+    }
+
+    #[test]
+    fn a_retry_after_a_lost_ack_only_resends_the_ack() {
+        let first_sent = Arc::new(Mutex::new(Vec::new()));
+        let mut first = ScriptedConnection::new(
+            vec![envelope(
+                "e1",
+                "events_api",
+                message_payload("1700000000.000001"),
+            )],
+            Arc::clone(&first_sent),
+        );
+        first.fail_send = Some(SlackApiError::new(
+            "a4mc_slack_socket_failed",
+            "fixture ack write failure",
+        ));
+        let mut handler = RecordingHandler::default();
+        let mut seen = SeenEnvelopes::new(4);
+        let stop = AtomicBool::new(false);
+
+        // The envelope is durably received, then the ack write fails:
+        // the session ends so Slack redelivers.
+        assert!(run_socket_session(&mut first, &mut handler, &mut seen, &stop).is_err());
+        assert_eq!(handler.events.len(), 1);
+        assert!(seen.contains("e1"));
+
+        let second_sent = Arc::new(Mutex::new(Vec::new()));
+        let mut second = ScriptedConnection::new(
+            vec![
+                envelope("e1", "events_api", message_payload("1700000000.000001")),
+                json!({"type": "disconnect", "reason": "test_done"}).to_string(),
+            ],
+            Arc::clone(&second_sent),
+        );
+        let outcome = run_socket_session(&mut second, &mut handler, &mut seen, &stop).unwrap();
+        assert_eq!(outcome, SessionOutcome::Reconnect);
+        // The retry only makes up the lost ack — no second dispatch.
+        assert_eq!(handler.events.len(), 1);
+        let acks = second_sent.lock().unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&acks[0]).unwrap()["envelope_id"],
+            json!("e1")
+        );
     }
 
     #[test]
@@ -579,16 +842,52 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_policy_requires_wss_on_a_slack_authority() {
+        for refused in [
+            "ws://wss-primary.slack.com/link/?ticket=t",
+            "http://wss-primary.slack.com/",
+            "wss://evil.example/link/?ticket=t",
+            "wss://user:pw@wss-primary.slack.com/",
+            "wss://noslack.com.evil.example/",
+            "ws://10.0.0.5/",
+        ] {
+            assert_eq!(
+                parse_socket_endpoint(refused).unwrap_err().code,
+                "a4mc_slack_socket_endpoint_refused",
+                "{refused} was not refused"
+            );
+        }
+        // Plaintext may only reach loopback — local fixtures stay
+        // possible while a ticket can never leave the machine
+        // unencrypted.
+        let loopback = parse_socket_endpoint("ws://127.0.0.1:8080/link/?ticket=t").unwrap();
+        assert!(!loopback.tls);
+        assert_eq!(loopback.port, 8080);
+        assert_eq!(loopback.target, "/link/?ticket=t");
+        for url in [
+            "wss://wss-primary.slack.com/link/?ticket=t&app_id=A1",
+            "wss://slack.com/",
+        ] {
+            let endpoint = parse_socket_endpoint(url).unwrap();
+            assert!(endpoint.tls);
+            assert_eq!(endpoint.port, 443);
+            assert!(endpoint.target.starts_with('/'));
+        }
+    }
+
+    #[test]
     fn seen_cache_is_bounded() {
         let mut seen = SeenEnvelopes::new(2);
-        assert!(seen.is_first("a"));
-        assert!(!seen.is_first("a"));
-        assert!(seen.is_first("b"));
-        assert!(seen.is_first("c")); // evicts `a`
-        assert!(!seen.is_first("c"));
-        assert!(seen.is_first("a")); // evicts `b`
-        assert!(!seen.is_first("a"));
-        assert!(seen.is_first("b")); // `b` had been evicted
+        seen.mark("a");
+        assert!(seen.contains("a"));
+        seen.mark("a");
+        seen.mark("b");
+        seen.mark("c"); // evicts `a`
+        assert!(!seen.contains("a"));
+        assert!(seen.contains("c"));
+        seen.mark("d"); // evicts `b`
+        assert!(!seen.contains("b"));
+        assert!(seen.contains("d"));
     }
 
     #[test]

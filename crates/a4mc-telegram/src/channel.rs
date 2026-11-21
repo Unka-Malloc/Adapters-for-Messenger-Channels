@@ -8,7 +8,7 @@
 //! observed receipt when it completes; a repeat send joins the in-flight
 //! attempt or replays the receipt instead of double-posting.
 
-use crate::transport::BotTransport;
+use crate::transport::{BotTransport, SendProgress};
 use a4mc::{
     ChannelAdapter, ChannelDescriptor, ChannelError, ChannelId, ExternalMessageId, LaneMechanism,
     OutboundMessage, SendFeature, SendReceipt, Support, UpdateKind,
@@ -63,11 +63,14 @@ pub struct TelegramChannel<T: BotTransport> {
 }
 
 /// One idempotency-key slot: a reservation held across an in-flight
-/// send, or the receipt of an observed send.
+/// send, the receipt of an observed send, or the progress of a send
+/// that stopped mid-flight — its confirmed prefix and the part that
+/// stopped it, so a same-key retry resumes instead of reposting.
 #[derive(Clone)]
 enum SendState {
     InFlight,
     Done(SendReceipt),
+    Partial(SendProgress),
 }
 
 struct IdempotencyCache {
@@ -103,11 +106,18 @@ impl IdempotencyCache {
         self.entries.insert(key, SendState::Done(receipt));
     }
 
-    /// Drop a reservation whose send failed: only *observed* sends are
-    /// deduped, so a failed attempt frees the key for its waiters or a
-    /// later retry to perform their own transport call.
+    /// Drop a reservation whose send failed before any part could be
+    /// confirmed: only *observed* sends are deduped, so a fully failed
+    /// attempt frees the key for its waiters or a later retry.
     fn release(&mut self, key: &str) {
         self.entries.remove(key);
+    }
+
+    /// Record a send that stopped mid-flight: the confirmed prefix and
+    /// resume point stay under the key so a retry continues the same
+    /// logical send instead of reposting delivered parts.
+    fn set_partial(&mut self, key: String, progress: SendProgress) {
+        self.entries.insert(key, SendState::Partial(progress));
     }
 }
 
@@ -156,7 +166,7 @@ impl<T: BotTransport> TelegramChannel<T> {
                 })
             })
             .transpose()?;
-        {
+        let progress = {
             let mut cache = self.sent_keys.lock().unwrap();
             loop {
                 match cache.get(&outbound.idempotency_key) {
@@ -164,22 +174,38 @@ impl<T: BotTransport> TelegramChannel<T> {
                     Some(SendState::InFlight) => {
                         cache = self.send_wake.wait(cache).unwrap();
                     }
+                    Some(SendState::Partial(progress)) => {
+                        if progress.outcome_unknown {
+                            // The stopping part may already be posted;
+                            // resending it could duplicate a delivered
+                            // message, so the key refuses rather than
+                            // blindly reposting.
+                            return Err(ChannelError::new(
+                                "a4mc_telegram_send_ambiguous",
+                                "send stopped with an unconfirmed part; its delivery cannot be verified or safely retried",
+                            ));
+                        }
+                        cache.mark_in_flight(outbound.idempotency_key.clone());
+                        break progress;
+                    }
                     None => {
                         cache.mark_in_flight(outbound.idempotency_key.clone());
-                        break;
+                        break SendProgress::default();
                     }
                 }
             }
-        }
+        };
         match self
             .transport
-            .send_message(chat_id, &outbound.text, reply_to)
+            .send_message(chat_id, &outbound.text, reply_to, Some(&progress))
         {
             Ok(message_ids) => {
                 let receipt = SendReceipt {
                     idempotency_key: outbound.idempotency_key.clone(),
-                    message_ids: message_ids
+                    message_ids: progress
+                        .confirmed
                         .into_iter()
+                        .chain(message_ids)
                         .map(ExternalMessageId::from)
                         .collect(),
                 };
@@ -191,10 +217,15 @@ impl<T: BotTransport> TelegramChannel<T> {
                 Ok(receipt)
             }
             Err(error) => {
-                self.sent_keys
-                    .lock()
-                    .unwrap()
-                    .release(&outbound.idempotency_key);
+                {
+                    let mut cache = self.sent_keys.lock().unwrap();
+                    match error.send_progress.clone() {
+                        Some(progress) => {
+                            cache.set_partial(outbound.idempotency_key.clone(), progress)
+                        }
+                        None => cache.release(&outbound.idempotency_key),
+                    }
+                }
                 self.send_wake.notify_all();
                 Err(ChannelError::from(error))
             }
@@ -260,6 +291,7 @@ mod tests {
             chat_id: i64,
             text: &str,
             reply_to_message_id: Option<i64>,
+            resume: Option<&SendProgress>,
         ) -> Result<Vec<i64>, TelegramApiError> {
             self.entered.store(true, Ordering::SeqCst);
             let (mutex, condvar) = &*self.release;
@@ -268,7 +300,8 @@ mod tests {
                 released = condvar.wait(released).unwrap();
             }
             drop(released);
-            self.inner.send_message(chat_id, text, reply_to_message_id)
+            self.inner
+                .send_message(chat_id, text, reply_to_message_id, resume)
         }
     }
 
@@ -348,6 +381,57 @@ mod tests {
         let second = second.join().unwrap().unwrap();
         assert_eq!(first, second);
         assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn same_key_retry_resumes_at_the_rejected_part() {
+        let transport = MockBotTransport {
+            fail_send_at_part: Some((
+                1,
+                TelegramApiError::new("a4mc_telegram_api_failed", "fixture rejection"),
+                false,
+            )),
+            ..Default::default()
+        };
+        let sent = Arc::clone(&transport.sent);
+        let channel = TelegramChannel::new(Arc::new(transport));
+        let text = "x".repeat(5000); // two platform parts
+        let outbound = OutboundMessage::new("42", &text, "send-partial");
+
+        let error = channel.send(&outbound).unwrap_err();
+        assert_eq!(error.code, "a4mc_telegram_api_failed");
+        assert_eq!(sent.lock().unwrap().len(), 1, "only the prefix posted");
+
+        let receipt = channel.send(&outbound).unwrap();
+        let posts = sent.lock().unwrap();
+        assert_eq!(posts.len(), 2, "the confirmed prefix was not reposted");
+        assert_eq!(posts[1].1.len(), 5000 - 4096);
+        assert_eq!(receipt.message_ids.len(), 2);
+    }
+
+    #[test]
+    fn same_key_retry_does_not_blindly_repost_an_unknown_outcome() {
+        let transport = MockBotTransport {
+            fail_send_at_part: Some((
+                1,
+                TelegramApiError::new("a4mc_telegram_network_failed", "fixture outage"),
+                true,
+            )),
+            ..Default::default()
+        };
+        let sent = Arc::clone(&transport.sent);
+        let channel = TelegramChannel::new(Arc::new(transport));
+        let text = "x".repeat(5000);
+        let outbound = OutboundMessage::new("42", &text, "send-ambiguous");
+
+        channel.send(&outbound).unwrap_err();
+        let error = channel.send(&outbound).unwrap_err();
+        assert_eq!(error.code, "a4mc_telegram_send_ambiguous");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "an unconfirmed part must never be blindly reposted"
+        );
     }
 
     #[test]

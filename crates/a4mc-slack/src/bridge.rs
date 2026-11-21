@@ -13,8 +13,8 @@
 
 use a4mc::lane;
 use serde_json::{Value, json};
-use std::collections::HashSet;
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
 /// One bounded lane failure at the Slack boundary.
@@ -161,51 +161,146 @@ pub fn open_session(agent_id: &str, session_id: Option<&str>) -> Result<String, 
         .to_owned())
 }
 
-/// Serializes callers that ask for the same turn while it is running.
+/// Coalesces duplicate dispatches of the same platform event.
 ///
 /// The lane dispatch is synchronous and uninterruptible, so returning a
 /// local timeout used to leave the original dispatch alive while the
-/// caller was free to retry it. A caller now keeps its turn reserved
-/// until the lane returns: a duplicate caller waits for the in-flight
-/// turn to finish instead of starting a second dispatch over it.
-static IN_FLIGHT_TURNS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-static TURN_WAKE: Condvar = Condvar::new();
+/// caller was free to retry it. Now a turn is keyed by its authorized
+/// scope — agent and session — plus the platform's stable event id:
+/// a genuinely redelivered event waits for the in-flight dispatch and
+/// reuses its result instead of paying a second agent execution, while
+/// a distinct event (even with identical text) dispatches on its own.
+static TURN_GATE: LazyLock<Mutex<TurnGate>> = LazyLock::new(|| Mutex::new(TurnGate::new()));
 
-struct TurnPermit {
-    key: String,
+/// Bound on finished results retained for late redeliveries; oldest
+/// evict FIFO.
+const TURN_RESULT_CACHE: usize = 256;
+
+struct TurnGate {
+    entries: HashMap<String, Arc<SharedTurn>>,
+    /// Keys of retained finished entries, oldest first, for eviction.
+    done_order: VecDeque<String>,
 }
 
-impl TurnPermit {
-    fn acquire(key: String) -> Self {
-        let mut in_flight = IN_FLIGHT_TURNS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while in_flight.contains(&key) {
-            in_flight = TURN_WAKE
-                .wait(in_flight)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+impl TurnGate {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            done_order: VecDeque::new(),
         }
-        in_flight.insert(key.clone());
-        Self { key }
     }
 }
 
-impl Drop for TurnPermit {
-    fn drop(&mut self) {
-        let mut in_flight = IN_FLIGHT_TURNS
+/// One dedupable turn's shared outcome: `Running` until the leader's
+/// dispatch returns, then every waiter reuses the finished result.
+struct SharedTurn {
+    state: Mutex<TurnState>,
+    wake: Condvar,
+}
+
+enum TurnState {
+    Running,
+    Finished(Result<(String, String), BridgeError>),
+}
+
+/// The caller's role for one turn: leader runs the lane dispatch,
+/// waiter reuses its result.
+enum TurnEntry {
+    Leader {
+        shared: Arc<SharedTurn>,
+        /// `None` when the turn carries no event id: it is unique and
+        /// leaves nothing to dedupe.
+        key: Option<String>,
+    },
+    Waiter(Arc<SharedTurn>),
+}
+
+impl SharedTurn {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(TurnState::Running),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Block until the leader's dispatch finishes, then reuse its
+    /// result — a duplicate event never pays a second execution.
+    fn wait_for_result(&self) -> Result<(String, String), BridgeError> {
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        in_flight.remove(&self.key);
-        TURN_WAKE.notify_all();
+        loop {
+            match &*state {
+                TurnState::Finished(result) => return result.clone(),
+                TurnState::Running => {
+                    state = self
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+        }
+    }
+
+    /// Publish the leader's result and wake every waiter. Successful
+    /// results stay dedupable (bounded) so a slightly later redelivery
+    /// still reuses them; a failure frees the key so the platform's
+    /// retry gets a fresh dispatch.
+    fn finish(&self, key: Option<String>, result: Result<(String, String), BridgeError>) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *state = TurnState::Finished(result.clone());
+        }
+        self.wake.notify_all();
+        let Some(key) = key else { return };
+        let mut gate = TURN_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if result.is_err() {
+            gate.entries.remove(&key);
+            return;
+        }
+        gate.done_order.push_back(key.clone());
+        while gate.done_order.len() > TURN_RESULT_CACHE {
+            if let Some(oldest) = gate.done_order.pop_front() {
+                gate.entries.remove(&oldest);
+            }
+        }
     }
 }
 
-fn turn_key(agent_id: &str, session_id: Option<&str>, text: &str) -> String {
-    format!(
-        "{agent_id}\u{1f}{}\u{1f}{text}",
+/// Reserve the turn for (agent, session, event): the first caller leads
+/// and dispatches; later callers of the same event wait and reuse.
+fn begin_turn(agent_id: &str, session_id: Option<&str>, event_id: Option<&str>) -> TurnEntry {
+    let shared = || Arc::new(SharedTurn::new());
+    let Some(event_id) = event_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        // No stable event id: nothing can prove this call duplicates
+        // another, so it dispatches independently and never reuses.
+        return TurnEntry::Leader {
+            shared: shared(),
+            key: None,
+        };
+    };
+    let key = format!(
+        "{agent_id}\u{1f}{}\u{1f}{event_id}",
         session_id.filter(|value| !value.is_empty()).unwrap_or("")
-    )
+    );
+    let mut gate = TURN_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(turn) = gate.entries.get(&key) {
+        return TurnEntry::Waiter(Arc::clone(turn));
+    }
+    let turn = shared();
+    gate.entries.insert(key.clone(), Arc::clone(&turn));
+    TurnEntry::Leader {
+        shared: turn,
+        key: Some(key),
+    }
 }
 
 /// Run one agent turn and wait for the lane to finish it.
@@ -215,7 +310,30 @@ fn turn_key(agent_id: &str, session_id: Option<&str>, text: &str) -> String {
 /// while the original turn still runs. `deadline` is forwarded as
 /// `timeoutMs` — bounding a turn is the lane's responsibility, not a
 /// local elapsed-time cutoff that abandons viable agent work.
+///
+/// `event_id` is the platform's stable event or operation id (Slack's
+/// `event_id`, or the envelope id when the payload lacks one). A caller
+/// repeating the same event within its agent/session scope reuses the
+/// first dispatch's result instead of paying a second execution; a
+/// distinct event — even with identical text — always dispatches on
+/// its own. `None` marks a unique turn that never reuses.
 pub fn send_turn(
+    agent_id: &str,
+    session_id: Option<&str>,
+    text: &str,
+    deadline: Duration,
+    event_id: Option<&str>,
+) -> Result<(String, String), BridgeError> {
+    let turn = match begin_turn(agent_id, session_id, event_id) {
+        TurnEntry::Waiter(shared) => return shared.wait_for_result(),
+        TurnEntry::Leader { shared, key } => (shared, key),
+    };
+    let result = send_turn_dispatch(agent_id, session_id, text, deadline);
+    turn.0.finish(turn.1, result.clone());
+    result
+}
+
+fn send_turn_dispatch(
     agent_id: &str,
     session_id: Option<&str>,
     text: &str,
@@ -230,7 +348,6 @@ pub fn send_turn(
         params["sessionId"] = json!(session_id);
     }
     let port = lane_port()?;
-    let _permit = TurnPermit::acquire(turn_key(agent_id, session_id, text));
     let result = (port.dispatch)("send", &params)
         .map_err(|_| BridgeError::new("a4mc_slack_send_failed", "conversation lane send failed"))?;
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
@@ -378,12 +495,23 @@ mod tests {
         }))
     }
 
+    static BLOCK_GATE: Mutex<bool> = Mutex::new(false);
+    static BLOCK_WAKE: Condvar = Condvar::new();
+
+    /// A dispatch parked on `BLOCK_GATE` until the test releases it: the
+    /// overlap window is held open deterministically instead of trusting
+    /// a wall-clock sleep to outlive an assertion.
     fn dispatch_with_observable_overlap(operation: &str, _: &Value) -> Result<Value, ChannelError> {
         assert_eq!(operation, "send");
         DISPATCH_CALLS.fetch_add(1, Ordering::SeqCst);
         let active = ACTIVE_DISPATCHES.fetch_add(1, Ordering::SeqCst) + 1;
         MAX_ACTIVE_DISPATCHES.fetch_max(active, Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(150));
+        {
+            let mut gate = BLOCK_GATE.lock().unwrap();
+            while !*gate {
+                gate = BLOCK_WAKE.wait(gate).unwrap();
+            }
+        }
         ACTIVE_DISPATCHES.fetch_sub(1, Ordering::SeqCst);
         Ok(json!({
             "ok": true,
@@ -455,8 +583,14 @@ mod tests {
         assert_eq!(sessions[1].title, "Second");
 
         assert_eq!(open_session("cursor", None).unwrap(), "sess-1");
-        let (output, session) =
-            send_turn("cursor", Some("sess-1"), "hello", Duration::from_secs(5)).unwrap();
+        let (output, session) = send_turn(
+            "cursor",
+            Some("sess-1"),
+            "hello",
+            Duration::from_secs(5),
+            Some("ev-1"),
+        )
+        .unwrap();
         assert_eq!(output, "agent reply");
         assert_eq!(session, "sess-1");
 
@@ -482,6 +616,7 @@ mod tests {
             Some("sess-slow"),
             "long running turn",
             Duration::from_millis(1),
+            None,
         )
         .unwrap();
         let elapsed = started.elapsed();
@@ -498,12 +633,13 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_turn_waits_instead_of_dispatching_concurrently() {
+    fn duplicate_event_waits_and_reuses_the_dispatch_result() {
         let _guard = LANE_LOCK.lock().unwrap();
         ACTIVE_DISPATCHES.store(0, Ordering::SeqCst);
         MAX_ACTIVE_DISPATCHES.store(0, Ordering::SeqCst);
         DISPATCH_CALLS.store(0, Ordering::SeqCst);
         install_fixture_with_dispatch(dispatch_with_observable_overlap);
+        *BLOCK_GATE.lock().unwrap() = false;
 
         let first = thread::spawn(|| {
             send_turn(
@@ -511,6 +647,7 @@ mod tests {
                 Some("sess-overlap"),
                 "same turn",
                 Duration::from_secs(5),
+                Some("ev-dup"),
             )
         });
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -525,22 +662,77 @@ mod tests {
                 Some("sess-overlap"),
                 "same turn",
                 Duration::from_secs(5),
+                Some("ev-dup"),
             )
         });
-        thread::sleep(Duration::from_millis(40));
+        // The leader is provably parked inside the dispatch, so the
+        // duplicate can only be waiting on it — no timing margin.
         assert!(
             !second.is_finished(),
-            "a duplicate caller returned while the original dispatch was active"
+            "a duplicate caller returned while the original dispatch was parked"
         );
+        *BLOCK_GATE.lock().unwrap() = true;
+        BLOCK_WAKE.notify_all();
 
         let first = first.join().unwrap().unwrap();
         let second = second.join().unwrap().unwrap();
-        lane::clear();
 
+        // One paid execution; both callers of the same event reuse it —
+        // and a redelivery arriving after completion reuses it too.
+        let third = send_turn(
+            "cursor",
+            Some("sess-overlap"),
+            "same turn",
+            Duration::from_secs(5),
+            Some("ev-dup"),
+        )
+        .unwrap();
         assert_eq!(first.0, "overlap fixture reply");
         assert_eq!(second.0, "overlap fixture reply");
+        assert_eq!(third.0, "overlap fixture reply");
+        assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(MAX_ACTIVE_DISPATCHES.load(Ordering::SeqCst), 1);
-        assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn distinct_events_with_identical_text_dispatch_independently() {
+        let _guard = LANE_LOCK.lock().unwrap();
+        ACTIVE_DISPATCHES.store(0, Ordering::SeqCst);
+        MAX_ACTIVE_DISPATCHES.store(0, Ordering::SeqCst);
+        DISPATCH_CALLS.store(0, Ordering::SeqCst);
+        install_fixture_with_dispatch(dispatch_with_observable_overlap);
+        *BLOCK_GATE.lock().unwrap() = true;
+        BLOCK_WAKE.notify_all();
+
+        send_turn(
+            "cursor",
+            Some("sess-overlap"),
+            "same turn",
+            Duration::from_secs(5),
+            Some("ev-a"),
+        )
+        .unwrap();
+        send_turn(
+            "cursor",
+            Some("sess-overlap"),
+            "same turn",
+            Duration::from_secs(5),
+            Some("ev-b"),
+        )
+        .unwrap();
+        send_turn(
+            "cursor",
+            Some("sess-other"),
+            "same turn",
+            Duration::from_secs(5),
+            Some("ev-a"),
+        )
+        .unwrap();
+        lane::clear();
+
+        // Same text but different events, and the same event id under a
+        // different session scope: three independent dispatches.
+        assert_eq!(DISPATCH_CALLS.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -556,7 +748,7 @@ mod tests {
             "a4mc_slack_lane_unavailable"
         );
         assert_eq!(
-            send_turn("cursor", None, "hello", Duration::from_millis(10))
+            send_turn("cursor", None, "hello", Duration::from_millis(10), None)
                 .unwrap_err()
                 .code,
             "a4mc_slack_lane_unavailable"

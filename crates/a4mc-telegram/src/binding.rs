@@ -9,6 +9,7 @@
 //! across reload-merge-write so concurrent writers never silently
 //! overwrite each other.
 
+use crate::inbound::InboundMessage;
 use crate::private_io::{
     atomic_write_private_text, ensure_private_dir, open_private_lock_file,
     read_private_text_bounded,
@@ -25,6 +26,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const STATE_FILE: &str = "bindings.json";
 const MAX_STATE_BYTES: usize = 256 * 1024;
 const MAX_DROPPED_UPDATES: usize = 256;
+/// Bound on admitted-but-unfinished tasks: far beyond one long-poll
+/// batch; a fuller backlog cannot be confirmed anyway, so a new admit
+/// is refused rather than silently confirmed.
+const MAX_PENDING_UPDATES: usize = 4096;
 const MAX_RAW_KIND_CHARS: usize = 64;
 const PAIRING_TTL: Duration = Duration::from_secs(60 * 60);
 pub const BINDING_SCHEMA: &str = "a4mc.telegram-bindings.v1";
@@ -64,7 +69,27 @@ pub struct ChatBinding {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// One fetched message update admitted for processing: persisted in the
+/// same write that confirms the poll cursor, keyed by update id so a
+/// restart resumes exactly its unfinished stage instead of re-running
+/// or skipping paid work.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingUpdate {
+    pub update_id: i64,
+    pub message: InboundMessage,
+    /// The finished turn's reply, recorded before delivery so an exit
+    /// after the agent returned still has the result to resend. `None`
+    /// means the message was admitted but never processed.
+    #[serde(default)]
+    pub reply: Option<String>,
+    /// The session the finished turn produced, when it differs from
+    /// what the binding already holds.
+    #[serde(default)]
+    pub next_session: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct BindingDocument {
     schema_version: String,
@@ -79,6 +104,10 @@ struct BindingDocument {
     /// host-visible messages. Older readers ignore the field.
     #[serde(default)]
     dropped_updates: Vec<DroppedUpdate>,
+    /// Admitted-but-unfinished message updates: the durable inbox every
+    /// confirmed update goes through before the cursor advances.
+    #[serde(default)]
+    pending_updates: Vec<PendingUpdate>,
 }
 
 #[derive(Debug)]
@@ -308,6 +337,103 @@ impl BindingStore {
         })
     }
 
+    /// Persist one fetched batch atomically: newly admitted message
+    /// tasks and any unhandled-update records land in the same write
+    /// that confirms the poll cursor, so a crash can never leave a
+    /// confirmed update without its work record.
+    pub fn admit_updates(
+        &mut self,
+        tasks: &[PendingUpdate],
+        dropped: &[DroppedUpdate],
+        offset: i64,
+    ) -> Result<()> {
+        self.mutate(|document| {
+            for task in tasks {
+                // Re-admission keeps the existing record: a finished
+                // reply must survive a stale transport redelivery.
+                if !document
+                    .pending_updates
+                    .iter()
+                    .any(|held| held.update_id == task.update_id)
+                {
+                    document.pending_updates.push(task.clone());
+                }
+            }
+            ensure!(
+                document.pending_updates.len() <= MAX_PENDING_UPDATES,
+                "a4mc_telegram_pending_updates_full"
+            );
+            for dropped in dropped {
+                document
+                    .dropped_updates
+                    .retain(|item| item.update_id != dropped.update_id);
+                document.dropped_updates.push(dropped.clone());
+            }
+            let excess = document
+                .dropped_updates
+                .len()
+                .saturating_sub(MAX_DROPPED_UPDATES);
+            if excess > 0 {
+                document.dropped_updates.drain(..excess);
+            }
+            document.poll_offset = offset;
+            Ok(())
+        })
+    }
+
+    /// The admitted-but-unfinished work, oldest update first.
+    pub fn pending_updates(&self) -> Vec<PendingUpdate> {
+        let mut tasks = self.document.pending_updates.clone();
+        tasks.sort_by_key(|task| task.update_id);
+        tasks
+    }
+
+    /// Record a finished turn's reply — and the session it produced —
+    /// on the admitted task *before* delivery, so an exit between the
+    /// lane returning and the send completing leaves a resumable result
+    /// instead of losing paid agent work.
+    pub fn record_reply(
+        &mut self,
+        update_id: i64,
+        reply: &str,
+        next_session: Option<String>,
+    ) -> Result<()> {
+        self.mutate(|document| {
+            if let Some(task) = document
+                .pending_updates
+                .iter_mut()
+                .find(|task| task.update_id == update_id)
+            {
+                task.reply = Some(reply.to_owned());
+                task.next_session = next_session;
+            }
+            Ok(())
+        })
+    }
+
+    /// Drop an admitted task once it is fully processed.
+    pub fn complete_update(&mut self, update_id: i64) -> Result<()> {
+        self.mutate(|document| {
+            document
+                .pending_updates
+                .retain(|task| task.update_id != update_id);
+            Ok(())
+        })
+    }
+
+    /// Settle a task whose handling failed: the record is dropped
+    /// unless it still holds an undelivered finished reply — that
+    /// result is the only unfinished stage and is resumed on restart
+    /// instead of re-running the turn.
+    pub fn settle_failed_update(&mut self, update_id: i64) -> Result<()> {
+        self.mutate(|document| {
+            document
+                .pending_updates
+                .retain(|task| task.update_id != update_id || task.reply.is_some());
+            Ok(())
+        })
+    }
+
     /// Persist one update id the runtime could not hand to the host as a
     /// message, bounded to the newest [`MAX_DROPPED_UPDATES`] entries.
     /// Writing this record before the cursor advances is what keeps a
@@ -388,6 +514,7 @@ fn read_document(path: &Path) -> Result<BindingDocument> {
             chats: BTreeMap::new(),
             poll_offset: 0,
             dropped_updates: Vec::new(),
+            pending_updates: Vec::new(),
         }),
     }
 }

@@ -16,7 +16,7 @@ use super::bridge::{
     open_session, resolve_session_selector, send_turn,
 };
 use super::transport::{BotIdentity, BotTransport, InboundMessage, bot_commands};
-use crate::binding::{BindingStore, ChatBinding, PairingRecord};
+use crate::binding::{BindingStore, ChatBinding, DroppedUpdate, PairingRecord};
 use crate::control::{
     ControlCommand, ControlOutcome, commands_text, help_text, parse_control_command,
 };
@@ -281,26 +281,68 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     let processor_store = Arc::clone(&store);
     let processor_identity = identity.clone();
     let turn_deadline = config.turn_deadline;
-    let processor = move |chat_id: i64, message: InboundMessage| match handle_inbound(
-        &*processor_transport,
-        &processor_store,
-        &processor_identity,
-        &message,
-        turn_deadline,
-    ) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = processor_transport.send_message(
-                chat_id,
-                &sanitize_error(&error),
-                Some(message.message_id),
-            );
-            Ok(())
+    let processor = move |chat_id: i64, message: InboundMessage| {
+        let update_id = message.update_id;
+        match handle_inbound(
+            &*processor_transport,
+            &processor_store,
+            &processor_identity,
+            &message,
+            turn_deadline,
+        ) {
+            Ok(()) => {
+                let _ = processor_store.lock().unwrap().complete_update(update_id);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = processor_transport.send_message(
+                    chat_id,
+                    &sanitize_error(&error),
+                    Some(message.message_id),
+                    None,
+                );
+                // A task whose finished reply never got delivered keeps
+                // its record — restart resumes that stage; anything else
+                // was fully handled and settles here.
+                let _ = processor_store
+                    .lock()
+                    .unwrap()
+                    .settle_failed_update(update_id);
+                Ok(())
+            }
         }
     };
     let workers = scheduler.spawn_workers(config.worker_count, processor)?;
 
     let mut pending: VecDeque<InboundMessage> = VecDeque::new();
+    // Resume admitted-but-unfinished work before polling: finished turns
+    // only need their recorded reply delivered; unstarted messages are
+    // re-queued whole. Records survive only while their stage is
+    // unfinished, so nothing paid or already confirmed runs twice.
+    {
+        let mut guard = store.lock().unwrap();
+        for task in guard.pending_updates() {
+            match task.reply {
+                Some(reply) => {
+                    if let Some(session) = task.next_session.filter(|s| !s.is_empty()) {
+                        let _ = guard.set_session(task.message.chat_id, Some(session));
+                    }
+                    if transport
+                        .send_message(
+                            task.message.chat_id,
+                            &reply,
+                            Some(task.message.message_id),
+                            None,
+                        )
+                        .is_ok()
+                    {
+                        let _ = guard.complete_update(task.update_id);
+                    }
+                }
+                None => pending.push_back(task.message),
+            }
+        }
+    }
     let mut on_event = config.on_event.take();
     let poll_result = poll_updates(
         &*transport,
@@ -322,8 +364,10 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     Ok(identity)
 }
 
-/// Ceiling on one retry wait, applied after the platform's
-/// `retry_after` hint is honored — a wild hint cannot park the poller.
+/// Ceiling on the adapter-computed backoff only. A platform
+/// `retry_after` floor is never capped down: waiting less than the
+/// server-specified window means predictably firing a request that is
+/// still inside its rate-limit window.
 const MAX_RETRY_WAIT_SECS: u64 = 120;
 
 fn poll_updates<T: BotTransport>(
@@ -366,7 +410,10 @@ fn poll_updates<T: BotTransport>(
                     continue;
                 }
             };
-            let mut advanced = false;
+            let mut tasks = Vec::new();
+            let mut dropped = Vec::new();
+            let mut admitted = Vec::new();
+            let mut next_offset = *offset;
             for update in updates {
                 // The cursor is monotonic: a transport that redelivers an
                 // update below the durable cursor must not drag the offset
@@ -390,27 +437,41 @@ fn poll_updates<T: BotTransport>(
                                 anyhow!("a4mc_telegram_unhandled_event: {error}")
                             })?;
                         } else {
-                            store
-                                .lock()
-                                .unwrap()
-                                .record_dropped_update(update.update_id, raw_kind)?;
+                            dropped.push(DroppedUpdate {
+                                update_id: update.update_id,
+                                raw_kind: raw_kind.to_owned(),
+                            });
                         }
                     }
                     None => {
                         if let Some(message) = update.message {
-                            pending.push_back(message);
+                            // Admit the task BEFORE the cursor confirms
+                            // it: a crash after confirmation must find
+                            // the work record, not a silent skip.
+                            tasks.push(crate::binding::PendingUpdate {
+                                update_id: update.update_id,
+                                message: message.clone(),
+                                reply: None,
+                                next_session: None,
+                            });
+                            admitted.push(message);
                         }
                     }
                 }
-                *offset = next;
-                advanced = true;
+                next_offset = next;
             }
-            if advanced {
-                // Durable cursor: the platform has been told everything
-                // below `offset`, so persist that acknowledgement. A
-                // write failure surfaces rather than silently recreating
-                // the replay-a-restart bug it exists to prevent.
-                store.lock().unwrap().set_poll_offset(*offset)?;
+            if next_offset != *offset {
+                // One write confirms the cursor together with the work
+                // records of the batch — confirmed updates are never
+                // left without their task record, and a write failure
+                // surfaces rather than silently recreating the
+                // replay-a-restart bug it exists to prevent.
+                store
+                    .lock()
+                    .unwrap()
+                    .admit_updates(&tasks, &dropped, next_offset)?;
+                *offset = next_offset;
+                pending.extend(admitted);
             }
         }
         admit_available(scheduler, pending);
@@ -442,13 +503,16 @@ fn unhandled_kind(update: &crate::transport::Update) -> Option<&'static str> {
 }
 
 /// Next poll retry wait: exponential backoff (2s, doubling, capped)
-/// with up-to-half jitter so restart waves don't synchronize, raised
-/// to the platform's `retry_after` hint when one was sent.
+/// with up-to-half jitter so restart waves don't synchronize. A
+/// platform `retry_after` floor is honored at full length — only the
+/// self-computed backoff is capped — so a retry never lands inside the
+/// rate-limit window it was told to wait out; `stop` still ends the
+/// wait early via `wait_or_stop`'s slices.
 fn retry_wait(failures: u32, retry_after: Option<u64>) -> Duration {
     let base = 1u64 << failures.min(5);
     let jitter = OsRng.next_u64() % (base / 2 + 1);
-    let secs = (base + jitter).max(retry_after.unwrap_or(0));
-    Duration::from_secs(secs.min(MAX_RETRY_WAIT_SECS))
+    let own = (base + jitter).min(MAX_RETRY_WAIT_SECS);
+    Duration::from_secs(own.max(retry_after.unwrap_or(0)))
 }
 
 /// Sleep `duration` in short slices so a raised `stop` ends the wait
@@ -513,7 +577,7 @@ fn handle_inbound<T: BotTransport>(
 
 fn send_reply<T: BotTransport>(transport: &T, message: &InboundMessage, text: &str) -> Result<()> {
     transport
-        .send_message(message.chat_id, text, Some(message.message_id))
+        .send_message(message.chat_id, text, Some(message.message_id), None)
         .map(|_| ())
         .map_err(api_err)
 }
@@ -688,7 +752,10 @@ fn handle_ordinary<T: BotTransport>(
     text: &str,
     turn_deadline: Duration,
 ) -> Result<()> {
-    if !store_is_paired(store, message.chat_id, message.user_id)? {
+    // One refresh, one snapshot: pairing and routing are checked
+    // against the same read instead of re-loading the store twice for
+    // every paired message.
+    let Some(binding) = store_paired_binding(store, message.chat_id, message.user_id)? else {
         let pending = store_request_pairing(
             store,
             message.chat_id,
@@ -701,9 +768,7 @@ fn handle_ordinary<T: BotTransport>(
             &format!("Pairing required.\n{}", pairing_code_text(&pending.code)),
         )?;
         return Ok(());
-    }
-    let binding = store_binding(store, message.chat_id)?
-        .ok_or_else(|| anyhow!("a4mc_telegram_not_paired"))?;
+    };
     let Some(agent_id) = binding.agent_id.clone() else {
         send_reply(
             transport,
@@ -720,6 +785,17 @@ fn handle_ordinary<T: BotTransport>(
         turn_deadline,
     )
     .map_err(|error| anyhow!(error.to_string()))?;
+    // Record the finished reply on the admitted task before delivery or
+    // the session write: an exit after the agent returned still has the
+    // result to resend rather than losing paid work.
+    let pending_session = if next_session.is_empty()
+        || binding.session_id.as_deref() == Some(next_session.as_str())
+    {
+        None
+    } else {
+        Some(next_session.clone())
+    };
+    store_record_reply(store, message.update_id, &reply, pending_session)?;
     // Persist the new session before telling the user the turn
     // succeeded. If the store is unavailable (busy, read-only, full),
     // the next message must not silently route to the old session.
@@ -750,6 +826,33 @@ fn store_is_paired(store: &Mutex<BindingStore>, chat_id: i64, user_id: i64) -> R
     let mut guard = store.lock().unwrap();
     guard.refresh()?;
     Ok(guard.is_paired(chat_id, user_id))
+}
+
+/// One refresh, one snapshot: pairing state and the routing binding are
+/// read from the same document — no second locked reload per message.
+fn store_paired_binding(
+    store: &Mutex<BindingStore>,
+    chat_id: i64,
+    user_id: i64,
+) -> Result<Option<ChatBinding>> {
+    let mut guard = store.lock().unwrap();
+    guard.refresh()?;
+    Ok(guard
+        .binding(chat_id)
+        .filter(|binding| binding.paired && binding.user_id == user_id)
+        .cloned())
+}
+
+fn store_record_reply(
+    store: &Mutex<BindingStore>,
+    update_id: i64,
+    reply: &str,
+    next_session: Option<String>,
+) -> Result<()> {
+    store
+        .lock()
+        .unwrap()
+        .record_reply(update_id, reply, next_session)
 }
 
 fn store_binding(store: &Mutex<BindingStore>, chat_id: i64) -> Result<Option<ChatBinding>> {
@@ -855,7 +958,7 @@ fn sanitize_error(error: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::inbound::InboundKind;
-    use crate::transport::{MockBotTransport, TelegramApiError, Update};
+    use crate::transport::{MockBotTransport, SendProgress, TelegramApiError, Update};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::time::Instant;
 
@@ -1009,8 +1112,10 @@ mod tests {
             chat_id: i64,
             text: &str,
             reply_to_message_id: Option<i64>,
+            resume: Option<&SendProgress>,
         ) -> Result<Vec<i64>, TelegramApiError> {
-            self.inner.send_message(chat_id, text, reply_to_message_id)
+            self.inner
+                .send_message(chat_id, text, reply_to_message_id, resume)
         }
     }
 
@@ -1057,8 +1162,10 @@ mod tests {
             chat_id: i64,
             text: &str,
             reply_to_message_id: Option<i64>,
+            resume: Option<&SendProgress>,
         ) -> Result<Vec<i64>, TelegramApiError> {
-            self.inner.send_message(chat_id, text, reply_to_message_id)
+            self.inner
+                .send_message(chat_id, text, reply_to_message_id, resume)
         }
     }
 
@@ -1792,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_wait_honors_the_server_hint_and_stays_capped() {
+    fn retry_wait_caps_only_the_local_backoff_and_honors_the_server_floor() {
         assert_eq!(retry_wait(0, None), Duration::from_secs(1));
         for (failures, low, high) in [
             (1, 2, 3),
@@ -1809,14 +1916,12 @@ mod tests {
                 "failure {failures} waited {wait:?}, outside {low}..={high}s"
             );
         }
-        // The platform's hint raises the wait beyond computed backoff.
+        // The platform's floor raises the wait beyond computed backoff.
         assert!(retry_wait(1, Some(30)) >= Duration::from_secs(30));
         assert_eq!(retry_wait(1, Some(5)), Duration::from_secs(5));
-        // An absurd hint is capped — the poller can never be parked.
-        assert_eq!(
-            retry_wait(8, Some(86_400)),
-            Duration::from_secs(MAX_RETRY_WAIT_SECS)
-        );
+        // A floor longer than the local cap is honored at full length —
+        // retrying earlier lands inside the rate-limit window.
+        assert!(retry_wait(8, Some(86_400)) >= Duration::from_secs(86_400));
         assert!(retry_wait(9, None) <= Duration::from_secs(MAX_RETRY_WAIT_SECS));
     }
 

@@ -1,10 +1,12 @@
 //! Normalize Telegram Bot API inbound messages into channel content.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const REPLY_PREVIEW_CHARS: usize = 240;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InboundKind {
     Text,
     Photo,
@@ -43,7 +45,8 @@ impl InboundKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MediaRef {
     pub kind: String,
     pub file_id: String,
@@ -57,7 +60,8 @@ pub struct MediaRef {
     pub emoji: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReplyRef {
     pub message_id: i64,
     pub from_username: Option<String>,
@@ -65,7 +69,8 @@ pub struct ReplyRef {
     pub kind: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InboundMessage {
     pub update_id: i64,
     pub chat_id: i64,
