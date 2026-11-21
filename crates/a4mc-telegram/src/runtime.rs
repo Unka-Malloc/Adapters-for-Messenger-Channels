@@ -339,6 +339,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     let processor_channel = Arc::clone(&channel);
     let processor_store = Arc::clone(&store);
     let processor_identity = identity.clone();
+    let processor_stop = Arc::clone(&config.stop);
     let turn_deadline = config.turn_deadline;
     let processor = move |chat_id: i64, message: InboundMessage| {
         let update_id = message.update_id;
@@ -348,11 +349,17 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
             &processor_identity,
             &message,
             turn_deadline,
+            &processor_stop,
         ) {
             Ok(()) => {
                 let _ = processor_store.lock().unwrap().complete_update(update_id);
                 Ok(())
             }
+            // A reply the host's send policy was still holding when
+            // shutdown cut the wait short is not a handler failure: no
+            // error reply goes out around the policy, and the
+            // unfinished task record stays for the restart drain.
+            Err(error) if is_policy_deferral(&error) => Ok(()),
             Err(error) => {
                 let _ = processor_channel.send(&reply_message(
                     chat_id,
@@ -378,7 +385,11 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     // Resume admitted-but-unfinished work before polling: finished turns
     // only need their recorded reply delivered; unstarted messages are
     // re-queued whole. Records survive only while their stage is
-    // unfinished, so nothing paid or already confirmed runs twice.
+    // unfinished, so nothing paid or already confirmed runs twice. A
+    // resend the host's policy is holding retries after the store lock
+    // drops — parking on its deferral window under the lock would stall
+    // every worker's store access.
+    let mut held: Vec<(i64, a4mc::OutboundMessage)> = Vec::new();
     {
         let mut guard = store.lock().unwrap();
         for task in guard.pending_updates() {
@@ -387,21 +398,30 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                     if let Some(session) = task.next_session.filter(|s| !s.is_empty()) {
                         let _ = guard.set_session(task.message.chat_id, Some(session));
                     }
-                    if channel
-                        .send(&reply_message(
-                            task.message.chat_id,
-                            task.message.message_id,
-                            task.update_id,
-                            "reply",
-                            &reply,
-                        ))
-                        .is_ok()
-                    {
-                        let _ = guard.complete_update(task.update_id);
+                    let outbound = reply_message(
+                        task.message.chat_id,
+                        task.message.message_id,
+                        task.update_id,
+                        "reply",
+                        &reply,
+                    );
+                    match channel.send(&outbound) {
+                        Ok(_) => {
+                            let _ = guard.complete_update(task.update_id);
+                        }
+                        Err(error) if is_outbound_deferral(&error) => {
+                            held.push((task.update_id, outbound));
+                        }
+                        Err(_) => {}
                     }
                 }
                 None => pending.push_back(task.message),
             }
+        }
+    }
+    for (update_id, outbound) in held {
+        if send_policy_wait(&channel, &outbound, &config.stop).is_ok() {
+            let _ = store.lock().unwrap().complete_update(update_id);
         }
     }
     let mut on_event = config.on_event.take();
@@ -676,6 +696,7 @@ fn handle_inbound<T: BotTransport>(
     identity: &BotIdentity,
     message: &InboundMessage,
     turn_deadline: Duration,
+    stop: &AtomicBool,
 ) -> Result<()> {
     if !message.is_private {
         // The channel serves direct chats only; group traffic is ignored.
@@ -683,14 +704,14 @@ fn handle_inbound<T: BotTransport>(
     }
     match parse_control_command(&message.control_text()) {
         ControlOutcome::Command(command) => {
-            handle_command(channel, store, identity, message, command)
+            handle_command(channel, store, identity, message, command, stop)
         }
         ControlOutcome::OrdinaryText(_) => {
             let body = message.agent_text();
             if body.trim().is_empty() {
                 return Ok(());
             }
-            handle_ordinary(channel, store, message, &body, turn_deadline)
+            handle_ordinary(channel, store, message, &body, turn_deadline, stop)
         }
     }
 }
@@ -715,21 +736,75 @@ fn reply_message(
     outbound
 }
 
+/// Retry floor for a policy deferral that carries no hint — modest
+/// enough to close a batch window promptly, wide enough not to spin on
+/// the host's send path.
+const DEFERRED_RETRY_WAIT: Duration = Duration::from_secs(1);
+
+/// Whether a channel rejection is the host's outbound policy holding
+/// the send — a deferral waits out its hint and retries rather than
+/// being reported to the user around the policy.
+fn is_outbound_deferral(error: &a4mc::ChannelError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "a4mc_outbound_batched" | "a4mc_outbound_throttled"
+    )
+}
+
+/// Whether a handler failure is only a policy deferral interrupted by
+/// shutdown: no error reply fires around the policy and the unfinished
+/// task record stays for the restart drain.
+fn is_policy_deferral(error: &anyhow::Error) -> bool {
+    matches!(
+        error.to_string().split(':').next().map(str::trim),
+        Some("a4mc_outbound_batched") | Some("a4mc_outbound_throttled")
+    )
+}
+
+/// Drive one outbound send under the host's policy. A deferral waits
+/// out its hinted window and retries — the policy holds the send, it is
+/// not a failure to report; `stop` ends the wait and returns the
+/// deferral error itself so the caller can keep the work record.
+fn send_policy_wait<T: BotTransport>(
+    channel: &TelegramChannel<T>,
+    outbound: &a4mc::OutboundMessage,
+    stop: &AtomicBool,
+) -> Result<(), a4mc::ChannelError> {
+    loop {
+        match channel.send(outbound) {
+            Ok(_) => return Ok(()),
+            Err(error) if is_outbound_deferral(&error) => {
+                let wait = error
+                    .retry_after_ms
+                    .map(Duration::from_millis)
+                    .unwrap_or(DEFERRED_RETRY_WAIT);
+                if !wait_or_stop(wait, stop) {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn send_reply<T: BotTransport>(
     channel: &TelegramChannel<T>,
     message: &InboundMessage,
     text: &str,
+    stop: &AtomicBool,
 ) -> Result<()> {
-    channel
-        .send(&reply_message(
+    send_policy_wait(
+        channel,
+        &reply_message(
             message.chat_id,
             message.message_id,
             message.update_id,
             "reply",
             text,
-        ))
-        .map(|_| ())
-        .map_err(channel_err)
+        ),
+        stop,
+    )
+    .map_err(channel_err)
 }
 
 fn handle_command<T: BotTransport>(
@@ -738,19 +813,20 @@ fn handle_command<T: BotTransport>(
     identity: &BotIdentity,
     message: &InboundMessage,
     command: ControlCommand,
+    stop: &AtomicBool,
 ) -> Result<()> {
     match command {
         ControlCommand::Help => {
-            send_reply(channel, message, &help_text(&identity.username))?;
+            send_reply(channel, message, &help_text(&identity.username), stop)?;
         }
         ControlCommand::Commands => {
-            send_reply(channel, message, &commands_text())?;
+            send_reply(channel, message, &commands_text(), stop)?;
         }
         ControlCommand::Start | ControlCommand::Pair => {
-            handle_pair_request(channel, store, identity, message)?;
+            handle_pair_request(channel, store, identity, message, stop)?;
         }
         ControlCommand::Whoami => {
-            send_reply(channel, message, &whoami_text(message))?;
+            send_reply(channel, message, &whoami_text(message), stop)?;
         }
         ControlCommand::Unpair => {
             let revoked = store_revoke(store, message.chat_id)?;
@@ -762,6 +838,7 @@ fn handle_command<T: BotTransport>(
                 } else {
                     "No pairing found for this chat."
                 },
+                stop,
             )?;
         }
         ControlCommand::Status => {
@@ -770,19 +847,21 @@ fn handle_command<T: BotTransport>(
                     channel,
                     message,
                     "Not paired. Send /start to request a pairing code.",
+                    stop,
                 )?;
             } else {
                 send_reply(
                     channel,
                     message,
                     &status_text(store, identity, message.chat_id)?,
+                    stop,
                 )?;
             }
         }
         ControlCommand::Agent { agent_id: None } => {
             require_paired(store, message)?;
             let agents = list_agents().map_err(|error| anyhow!(error.to_string()))?;
-            send_reply(channel, message, &format_agent_list(&agents))?;
+            send_reply(channel, message, &format_agent_list(&agents), stop)?;
         }
         ControlCommand::Agent {
             agent_id: Some(agent_id),
@@ -797,13 +876,14 @@ fn handle_command<T: BotTransport>(
                     "Bound agent: {}.\nSession cleared. Use /session or /new, then send a message.",
                     binding.agent_id.unwrap_or(agent_id)
                 ),
+                stop,
             )?;
         }
         ControlCommand::Session { selector: None } => {
             require_paired(store, message)?;
             let agent_id = require_agent(store, message.chat_id)?;
             let sessions = list_sessions(&agent_id).map_err(|error| anyhow!(error.to_string()))?;
-            send_reply(channel, message, &format_session_list(&sessions))?;
+            send_reply(channel, message, &format_session_list(&sessions), stop)?;
         }
         ControlCommand::Session {
             selector: Some(selector),
@@ -821,7 +901,12 @@ fn handle_command<T: BotTransport>(
                 opened
             };
             store_set_session(store, message.chat_id, Some(session_id.clone()))?;
-            send_reply(channel, message, &format!("Bound session: {session_id}"))?;
+            send_reply(
+                channel,
+                message,
+                &format!("Bound session: {session_id}"),
+                stop,
+            )?;
         }
         ControlCommand::New | ControlCommand::Reset => {
             require_paired(store, message)?;
@@ -848,6 +933,7 @@ fn handle_command<T: BotTransport>(
                         format!(": {opened}")
                     }
                 ),
+                stop,
             )?;
         }
         ControlCommand::Stop => {
@@ -855,6 +941,7 @@ fn handle_command<T: BotTransport>(
                 channel,
                 message,
                 "This channel processes one turn at a time. There is no separate in-flight interrupt yet; wait for the current reply, or use /new for a fresh conversation.",
+                stop,
             )?;
         }
         ControlCommand::Unknown { name } => {
@@ -862,6 +949,7 @@ fn handle_command<T: BotTransport>(
                 channel,
                 message,
                 &format!("Unknown command /{name}. Use /commands for the catalog."),
+                stop,
             )?;
         }
     }
@@ -873,6 +961,7 @@ fn handle_pair_request<T: BotTransport>(
     store: &Mutex<BindingStore>,
     identity: &BotIdentity,
     message: &InboundMessage,
+    stop: &AtomicBool,
 ) -> Result<()> {
     if store_is_paired(store, message.chat_id, message.user_id)? {
         send_reply(
@@ -882,6 +971,7 @@ fn handle_pair_request<T: BotTransport>(
                 "Already paired.\n{}",
                 status_text(store, identity, message.chat_id)?
             ),
+            stop,
         )?;
         return Ok(());
     }
@@ -891,7 +981,7 @@ fn handle_pair_request<T: BotTransport>(
         message.user_id,
         message.username.clone(),
     )?;
-    send_reply(channel, message, &pairing_code_text(&pending.code))?;
+    send_reply(channel, message, &pairing_code_text(&pending.code), stop)?;
     Ok(())
 }
 
@@ -901,6 +991,7 @@ fn handle_ordinary<T: BotTransport>(
     message: &InboundMessage,
     text: &str,
     turn_deadline: Duration,
+    stop: &AtomicBool,
 ) -> Result<()> {
     // One refresh, one snapshot: pairing and routing are checked
     // against the same read instead of re-loading the store twice for
@@ -916,6 +1007,7 @@ fn handle_ordinary<T: BotTransport>(
             channel,
             message,
             &format!("Pairing required.\n{}", pairing_code_text(&pending.code)),
+            stop,
         )?;
         return Ok(());
     };
@@ -924,6 +1016,7 @@ fn handle_ordinary<T: BotTransport>(
             channel,
             message,
             "No agent bound. Use /agent to list agents, then /agent <id>.",
+            stop,
         )?;
         return Ok(());
     };
@@ -952,7 +1045,7 @@ fn handle_ordinary<T: BotTransport>(
     if !next_session.is_empty() && binding.session_id.as_deref() != Some(next_session.as_str()) {
         store_set_session(store, message.chat_id, Some(next_session))?;
     }
-    send_reply(channel, message, &reply)?;
+    send_reply(channel, message, &reply, stop)?;
     Ok(())
 }
 
@@ -1218,6 +1311,33 @@ mod tests {
         }
     }
 
+    /// A host policy whose throttle budget holds the first `deferrals`
+    /// send attempts inside a window of `retry_after_ms`, then allows
+    /// the rest — `usize::MAX` deferrals holds every send so shutdown
+    /// has to cut the wait short.
+    struct DeferringHooks {
+        attempts: AtomicUsize,
+        deferrals: usize,
+        retry_after_ms: u64,
+    }
+
+    impl a4mc::OutboundHooks for DeferringHooks {
+        fn throttle(
+            &self,
+            _: &a4mc::SendContext,
+            _: &a4mc::OutboundMessage,
+        ) -> a4mc::ThrottleDecision {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < self.deferrals {
+                a4mc::ThrottleDecision::defer(
+                    "send window open",
+                    Some(Duration::from_millis(self.retry_after_ms)),
+                )
+            } else {
+                a4mc::ThrottleDecision::Allow
+            }
+        }
+    }
+
     fn wait_until<F: Fn() -> bool>(condition: F, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while !condition() {
@@ -1354,6 +1474,7 @@ mod tests {
             &BotIdentity::default(),
             &message,
             TEST_DEADLINE,
+            &AtomicBool::new(false),
         )
         .unwrap();
         let code = store.lock().unwrap().pending_pairings()[0].code.clone();
@@ -1365,6 +1486,7 @@ mod tests {
             &BotIdentity::default(),
             &list,
             TEST_DEADLINE,
+            &AtomicBool::new(false),
         )
         .unwrap();
         let messages = sent.lock().unwrap();
@@ -1400,6 +1522,7 @@ mod tests {
             &identity,
             &text_message(42, 42, Some("alice"), "/whoami", 1),
             TEST_DEADLINE,
+            &AtomicBool::new(false),
         )
         .unwrap();
         handle_inbound(
@@ -1408,6 +1531,7 @@ mod tests {
             &identity,
             &text_message(42, 42, Some("alice"), "/start", 2),
             TEST_DEADLINE,
+            &AtomicBool::new(false),
         )
         .unwrap();
         let code = store.lock().unwrap().pending_pairings()[0].code.clone();
@@ -1418,6 +1542,7 @@ mod tests {
             &identity,
             &text_message(42, 42, Some("alice"), "/unpair", 3),
             TEST_DEADLINE,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert!(!store.lock().unwrap().is_paired(42, 42));
@@ -1464,6 +1589,7 @@ mod tests {
             &BotIdentity::default(),
             &message,
             TEST_DEADLINE,
+            &AtomicBool::new(false),
         )
         .unwrap();
         let messages = sent.lock().unwrap();
@@ -1967,6 +2093,186 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_reply_waits_out_the_policy_window() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 5,
+                message: Some(text_message(42, 42, Some("alice"), "hello", 5)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let hooks = Arc::new(DeferringHooks {
+            attempts: AtomicUsize::new(0),
+            deferrals: 2,
+            retry_after_ms: 20,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks.clone()),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || {
+                let store = BindingStore::open_in(&root).unwrap();
+                store.poll_offset() == 6 && store.pending_updates().is_empty()
+            },
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(
+            hooks.attempts.load(Ordering::SeqCst),
+            3,
+            "the deferred send was not retried after its window"
+        );
+        let messages = sent.lock().unwrap();
+        assert_eq!(messages.len(), 1, "delivered sends: {messages:?}");
+        assert_eq!(messages[0].1, "synthetic");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_policy_deferral_interrupted_by_shutdown_keeps_the_task() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 5,
+                message: Some(text_message(42, 42, Some("alice"), "hello", 5)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let hooks = Arc::new(DeferringHooks {
+            attempts: AtomicUsize::new(0),
+            deferrals: usize::MAX,
+            // A window far longer than the test: only `stop` releases
+            // the parked send, proving the wait is interruptible.
+            retry_after_ms: 60_000,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks.clone()),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let started = Instant::now();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        // Wait until the reply is parked inside the policy's window,
+        // then end the runtime: join must not outlast the wait slices.
+        wait_until(
+            || hooks.attempts.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shutdown did not interrupt the deferral wait"
+        );
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a held reply must not be answered with an error around the policy"
+        );
+        let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the deferred reply's task record was settled: {tasks:?}"
+        );
+        assert_eq!(tasks[0].reply.as_deref(), Some("synthetic"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_deferred_resumed_reply_retries_off_the_store_lock() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        a4mc::lane::clear();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 2,
+                        message: text_message(43, 43, Some("bob"), "hello agent", 2),
+                        reply: Some("agent reply".to_owned()),
+                        next_session: None,
+                    }],
+                    &[],
+                    3,
+                )
+                .unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let hooks = Arc::new(DeferringHooks {
+            attempts: AtomicUsize::new(0),
+            deferrals: 1,
+            retry_after_ms: 20,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks.clone()),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(hooks.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sent.lock().unwrap()[0], (43, "agent reply".to_owned()));
+        assert!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .is_empty(),
+            "the resumed reply stayed recorded after its deferred send"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn failed_poll_does_not_advance_the_durable_cursor() {
         let root = temp_root();
         let mut store = BindingStore::open_in(&root).unwrap();
@@ -2311,6 +2617,7 @@ mod tests {
             &BotIdentity::default(),
             &text_message(42, 42, Some("alice"), BLOCKING_TURN_TEXT, 1),
             Duration::from_millis(50),
+            &AtomicBool::new(false),
         )
         .unwrap();
         let elapsed = started.elapsed();
@@ -2362,6 +2669,7 @@ mod tests {
             &BotIdentity::default(),
             &text_message(42, 42, Some("alice"), "hello", 1),
             TEST_DEADLINE,
+            &AtomicBool::new(false),
         )
         .unwrap_err();
 
