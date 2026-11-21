@@ -161,6 +161,22 @@ impl<T: BotTransport> TelegramChannel<T> {
         self.pipeline = OutboundPipeline::with_hooks(CHANNEL, hooks);
     }
 
+    /// Drop a dedupe key's cached mid-flight checkpoint: the recorded
+    /// reply that checkpoint was earned on has been safely replaced
+    /// before any part was confirmed, so the stale position would only
+    /// refuse the replacement's send as a resume mismatch. A partial
+    /// whose stopping outcome is unknown stays — it is the dedupe
+    /// record that keeps a possibly-posted part from being sent twice.
+    pub(crate) fn discard_partial(&self, key: &str) {
+        let mut cache = self.sent_keys.lock().unwrap();
+        if matches!(
+            cache.entries.get(key),
+            Some(SendState::Partial(progress)) if !progress.outcome_unknown
+        ) {
+            cache.entries.remove(key);
+        }
+    }
+
     /// Send one normalized outbound message.
     ///
     /// The contract validates first; the mounted outbound policy then

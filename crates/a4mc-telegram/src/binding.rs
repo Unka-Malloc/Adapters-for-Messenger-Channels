@@ -398,6 +398,13 @@ pub struct BindingStore {
     /// resend; anything left at exit stays durable on disk for the
     /// next restart's reconciliation.
     bound_replies: Vec<TaskKey>,
+    /// Every task key this instance already queued a recovered reply
+    /// for — own binds and binds discovered on a document another
+    /// store instance committed. A task binds its staged reply exactly
+    /// once, so the set lives for the store's lifetime: a stale
+    /// document re-read after a failed write can never report the same
+    /// transition twice.
+    bound_seen: HashSet<TaskKey>,
     #[cfg(test)]
     fail_next_write: bool,
     /// Mutations allowed to succeed before `fail_next_write` fires —
@@ -426,6 +433,7 @@ impl BindingStore {
             lock,
             document,
             bound_replies: Vec::new(),
+            bound_seen: HashSet::new(),
             #[cfg(test)]
             fail_next_write: false,
             #[cfg(test)]
@@ -442,9 +450,43 @@ impl BindingStore {
         self.lock
             .lock_exclusive()
             .map_err(|_| anyhow!("a4mc_telegram_bindings_lock_failed"))?;
-        let result = read_document(&self.path).map(|document| self.document = document);
+        let result = read_document(&self.path).map(|document| {
+            self.note_externally_bound(&document);
+            self.document = document;
+        });
         let _ = self.lock.unlock();
         result
+    }
+
+    /// Queue one newly bound task for the runtime's resend drain —
+    /// deduplicated so a reply is offered exactly once even when a
+    /// stale document could report its transition again.
+    fn note_bound(&mut self, key: TaskKey) {
+        if self.bound_seen.insert(key) {
+            self.bound_replies.push(key);
+        }
+    }
+
+    /// Discover binds another store instance committed: a task this
+    /// document knows without a finished reply that the freshly read
+    /// document shows holding one. The bind notification lives only in
+    /// the committing instance's memory, so durable transitions are
+    /// rediscovered here on every lock-reload — each queued once.
+    fn note_externally_bound(&mut self, fresh: &BindingDocument) {
+        for task in &fresh.pending_updates {
+            if !task.has_reply() {
+                continue;
+            }
+            let key = task.key();
+            if self
+                .document
+                .pending_updates
+                .iter()
+                .any(|held| held.key() == key && !held.has_reply())
+            {
+                self.note_bound(key);
+            }
+        }
     }
 
     /// Apply one mutation atomically: hold the advisory lock across reload,
@@ -468,6 +510,14 @@ impl BindingStore {
     /// overtaking a staged record; the on-disk records remain
     /// authoritative for what has been finished but not yet committed
     /// (fallback and settle checks consult them directly).
+    ///
+    /// Staged completions reconcile AGAIN on the changed candidate: a
+    /// mutation that frees document space — a task settling, a record
+    /// dropped — is exactly what lets a record stranded for size land,
+    /// and waiting for an unrelated later write would leave finished
+    /// work parked. A record whose guarded effect the change already
+    /// superseded binds its refused variant instead of the outcome the
+    /// newer write displaced.
     fn mutate_bounded<R>(
         &mut self,
         headroom: usize,
@@ -485,10 +535,24 @@ impl BindingStore {
         let result = (|| {
             let dir = replies_dir(&self.path);
             let document = read_document(&self.path)?;
-            let mut staged = document.clone();
+            // A bind another instance committed lands only in that
+            // instance's drain — rediscover the durable transition
+            // against this instance's last seen document.
+            self.note_externally_bound(&document);
+            // The snapshot then tracks the durable read outright: a
+            // mutation refused or failed below must not leave it
+            // stale, because the transitions noted above resolve
+            // against it when the bound-reply drain runs.
+            self.document = document;
+            let mut staged = self.document.clone();
             let bound = apply_staged(&mut staged, &dir);
             let mut candidate = staged.clone();
             let value = change(&mut candidate)?;
+            // Reconcile on the changed candidate: space the change
+            // freed can bind a record the pre-change pass could not.
+            // Binds landing here commit only with the candidate — the
+            // fallback path below replays them on its own next write.
+            let bound_after = apply_staged(&mut candidate, &dir);
             // The file must stay readable under its own bound: a
             // mutation whose result would exceed the read limit is
             // refused before it replaces the document, so the store can
@@ -499,18 +563,22 @@ impl BindingStore {
             if raw.len() + headroom <= MAX_STATE_BYTES {
                 atomic_write_private_text(&self.path, &raw)?;
                 self.document = candidate;
-                self.bound_replies.extend(bound);
+                for key in bound.into_iter().chain(bound_after) {
+                    self.note_bound(key);
+                }
                 return Ok(value);
             }
             // The change does not fit — its work stays uncommitted,
             // but the reconciled document still commits on its own so
             // the staged record is never overtaken by a newer write.
-            if staged != document {
+            if staged != self.document {
                 let raw = serde_json::to_string_pretty(&staged)?;
                 if raw.len() <= MAX_STATE_BYTES {
                     atomic_write_private_text(&self.path, &raw)?;
                     self.document = staged;
-                    self.bound_replies.extend(bound);
+                    for key in bound {
+                        self.note_bound(key);
+                    }
                 }
             }
             Err(anyhow!("a4mc_telegram_state_full"))
@@ -1442,6 +1510,14 @@ impl BindingStore {
     /// approved, or replaced by a newer request — resolves to its
     /// refused variant, so a recovered resend can never publish a dead
     /// code. `Ok(None)` means no finished reply is recorded.
+    ///
+    /// The lapsed-offer substitution applies only while the send is
+    /// still safe to reshape: no contract part confirmed and no
+    /// platform checkpoint holding confirmed parts or an uncertain
+    /// outcome. A send the platform may already have seen keeps the
+    /// text its checkpoint was earned on — substituting under it would
+    /// restart the remaining parts as a different message and strand
+    /// the resume.
     pub fn reply_text(&self, task: &PendingUpdate) -> Result<Option<String>> {
         if let Some(reply) = &task.reply {
             return Ok(Some(reply.clone()));
@@ -1452,8 +1528,12 @@ impl BindingStore {
         if name.ends_with(".json") {
             let staged = read_staged_record(&self.path, name, task.key())?
                 .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))?;
-            let refused =
-                task.reply_refused || pairing_offer_lapsed(&self.document, &staged.effect);
+            let substitutable = task.reply_sent == 0
+                && task.reply_progress.as_ref().is_none_or(|progress| {
+                    progress.confirmed.is_empty() && !progress.outcome_unknown
+                });
+            let refused = task.reply_refused
+                || (substitutable && pairing_offer_lapsed(&self.document, &staged.effect));
             return if refused {
                 staged.refused_text.or(staged.text)
             } else {
@@ -4041,6 +4121,350 @@ mod tests {
             assert!(
                 !store.staged_reply_unbound(7),
                 "a bound record classified as unbound masks checkpoint failures"
+            );
+        });
+    }
+
+    /// A pending task whose record fills most of the bounded document —
+    /// the remaining slack is smaller than a reply pointer.
+    fn admit_filler(store: &mut BindingStore, update_id: i64) {
+        store
+            .admit_updates(
+                &[PendingUpdate {
+                    update_id,
+                    sequence: 0,
+                    message: inbound_message(update_id, 9),
+                    reply: None,
+                    reply_key: None,
+                    reply_sent: 0,
+                    reply_progress: None,
+                    reply_file: None,
+                    reply_retry_at_ms: None,
+                    reply_refused: false,
+                }],
+                &[],
+                &[],
+                update_id + 1,
+            )
+            .unwrap();
+    }
+
+    /// A self-contained staged record for the task, written straight to
+    /// the sidecar directory the way a mutation that died between the
+    /// record rename and the document commit leaves it.
+    fn stage_manifest(dir: &Path, key: TaskKey, text: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let record = StagedCompletion {
+            update_id: key.update_id,
+            sequence: key.sequence,
+            payload: manifest_file_name(key),
+            key: format!("reply:{}", key.update_id),
+            effect: StagedEffect::Reply,
+            text: Some(text.to_owned()),
+            refused_text: None,
+        };
+        std::fs::write(
+            dir.join(manifest_file_name(key)),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Park the document inside `headroom` bytes of the read bound: an
+    /// approved chat's agent field takes arbitrary text, so one
+    /// measured padding write lands the slack exactly — no staged
+    /// pointer smaller than `headroom` can bind until space frees.
+    fn fill_document(store: &mut BindingStore, chat_id: i64, headroom: usize) {
+        let pending = store
+            .request_pairing(chat_id, chat_id, Some("filler".into()))
+            .unwrap();
+        store.approve(&pending.code).unwrap();
+        for _ in 0..4 {
+            let remaining = MAX_STATE_BYTES - serialized_len(&store.document).unwrap();
+            if remaining <= headroom {
+                return;
+            }
+            let agent = store
+                .binding(chat_id)
+                .and_then(|binding| binding.agent_id.as_deref())
+                .map_or(0, str::len);
+            store
+                .set_agent(chat_id, Some("a".repeat(agent + remaining - headroom)))
+                .unwrap();
+        }
+        panic!("document did not fill to the brim");
+    }
+
+    #[test]
+    fn a_settling_mutation_binds_the_reply_its_space_frees() {
+        temp_store(|mut store| {
+            admit_filler(&mut store, 1);
+            admit_filler(&mut store, 2);
+            // Every reply field serializes `default`-style, so a bound
+            // record adds only the null→value delta — a couple dozen
+            // bytes. Four bytes of slack guarantees the manifest stays
+            // durable but unapplied.
+            fill_document(&mut store, 6, 4);
+            let dir = replies_dir(&store.path);
+            stage_manifest(&dir, TaskKey::from(2), "staged reply body");
+            assert!(
+                store.staged_reply_unbound(2),
+                "the record bound before any space was freed"
+            );
+            // Settling the last task frees its record — the same write
+            // must reconcile the stranded reply instead of parking it
+            // for an unrelated later mutation.
+            store.complete_update(1).unwrap();
+            let bound = store.take_bound_replies();
+            assert!(
+                store.pending_update(2).unwrap().has_reply(),
+                "the freed space never reconciled the staged reply"
+            );
+            assert_eq!(
+                bound.iter().map(PendingUpdate::key).collect::<Vec<_>>(),
+                vec![TaskKey::from(2)],
+                "the newly bound reply was not queued for resend"
+            );
+        });
+    }
+
+    #[test]
+    fn a_bind_committed_by_another_store_is_discovered_and_queued_once() {
+        let root = std::env::temp_dir().join(format!(
+            "a4mc-tg-bind-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let mut first = BindingStore::open_in(&root).unwrap();
+        admit_filler(&mut first, 2);
+        let dir = replies_dir(&first.path);
+        stage_manifest(&dir, TaskKey::from(2), "staged reply body");
+        // A second instance on the same file binds the record through
+        // an unrelated mutation — the notification lives only in that
+        // instance's memory.
+        let mut second = BindingStore::open_in(&root).unwrap();
+        second.set_poll_offset(4).unwrap();
+        assert_eq!(
+            second
+                .take_bound_replies()
+                .iter()
+                .map(PendingUpdate::key)
+                .collect::<Vec<_>>(),
+            vec![TaskKey::from(2)],
+            "the binding instance did not report its own bind"
+        );
+        // The first instance's next mutation must discover the durable
+        // transition instead of skipping the already-bound task.
+        first.set_poll_offset(5).unwrap();
+        assert!(
+            first.pending_update(2).unwrap().has_reply(),
+            "the discovered document still lacks the bound reply"
+        );
+        assert_eq!(
+            first
+                .take_bound_replies()
+                .iter()
+                .map(PendingUpdate::key)
+                .collect::<Vec<_>>(),
+            vec![TaskKey::from(2)],
+            "the externally bound reply was never discovered"
+        );
+        assert!(
+            first.take_bound_replies().is_empty(),
+            "the same bind was queued twice"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_refused_admission_still_commits_the_bind_it_reconciled() {
+        temp_store(|mut store| {
+            admit_filler(&mut store, 2);
+            // Room for the reply pointer but not for another task on
+            // top of it.
+            fill_document(&mut store, 6, 400);
+            let dir = replies_dir(&store.path);
+            stage_manifest(&dir, TaskKey::from(2), "staged reply body");
+            let mut big = inbound_message(3, 9);
+            big.text = Some("b".repeat(8 * 1024));
+            let error = store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 3,
+                        sequence: 0,
+                        message: big,
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    4,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_string().as_str(),
+                "a4mc_telegram_state_full",
+                "the oversized batch committed instead of being refused"
+            );
+            // The refused write still landed the staged bind its
+            // reconcile pass earned — the recovered reply is queued so
+            // its delivery can free the space the batch needs.
+            assert!(
+                store.pending_update(2).unwrap().has_reply(),
+                "the refused admission dropped the bind it reconciled"
+            );
+            assert_eq!(
+                store
+                    .take_bound_replies()
+                    .iter()
+                    .map(PendingUpdate::key)
+                    .collect::<Vec<_>>(),
+                vec![TaskKey::from(2)],
+                "the bind a refused admission committed was not drained"
+            );
+        });
+    }
+
+    #[test]
+    fn a_lapsed_offer_keeps_its_text_behind_confirmed_or_uncertain_progress() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            let refused = "That pairing offer did not hold — send /start to request a fresh code.";
+            let reply = store
+                .record_pairing_and_reply(
+                    9,
+                    9,
+                    Some("alice".into()),
+                    7,
+                    "reply:7",
+                    |record| format!("Pairing code: {}", record.code),
+                    refused,
+                )
+                .unwrap();
+            // A newer request lapses the exact offer the reply carries.
+            store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            let progress = |confirmed: Vec<i64>, unknown: bool| {
+                let next_part = confirmed.len();
+                Some(crate::transport::SendProgress {
+                    confirmed,
+                    next_part,
+                    outcome_unknown: unknown,
+                    binding: None,
+                })
+            };
+            // Confirmed transport progress: the platform already holds
+            // part of the original text — the resend continues it, it
+            // does not substitute a different message.
+            store
+                .record_reply_checkpoint(7, progress(vec![11], false), None)
+                .unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(reply.as_str()),
+                "a confirmed send had its recorded text substituted"
+            );
+            // An uncertain stopping outcome likewise keeps the text
+            // the platform may already have posted.
+            store
+                .record_reply_checkpoint(7, progress(vec![], true), None)
+                .unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(reply.as_str()),
+                "an uncertain send had its recorded text substituted"
+            );
+            // A confirmed contract part is the same rule at the
+            // coarser checkpoint.
+            store.record_reply_progress(7, 1, None).unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(reply.as_str()),
+                "a partly-delivered reply had its recorded text substituted"
+            );
+        });
+    }
+
+    #[test]
+    fn a_lapsed_offer_substitutes_only_at_zero_progress() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            let refused = "That pairing offer did not hold — send /start to request a fresh code.";
+            store
+                .record_pairing_and_reply(
+                    9,
+                    9,
+                    Some("alice".into()),
+                    7,
+                    "reply:7",
+                    |record| format!("Pairing code: {}", record.code),
+                    refused,
+                )
+                .unwrap();
+            store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            // A definitive rejection left a checkpoint with nothing
+            // confirmed: substitution stays safe — nothing was posted.
+            store
+                .record_reply_checkpoint(
+                    7,
+                    Some(crate::transport::SendProgress {
+                        confirmed: vec![],
+                        next_part: 0,
+                        outcome_unknown: false,
+                        binding: None,
+                    }),
+                    None,
+                )
+                .unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(refused),
+                "a zero-progress send kept its lapsed offer's dead code"
             );
         });
     }
