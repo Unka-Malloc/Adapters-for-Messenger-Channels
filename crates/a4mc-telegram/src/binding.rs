@@ -28,9 +28,10 @@ const MAX_STATE_BYTES: usize = 256 * 1024;
 /// Bound on one spilled reply payload — beyond it a completed outcome
 /// is refused rather than consuming unbounded state space.
 const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
-/// Bound on one staged-completion manifest file — it carries only a
-/// pointer, a delivery key and a small state effect.
-const MAX_STAGED_BYTES: usize = 8 * 1024;
+/// Bound on one staged-completion record — a self-contained record
+/// carries the payload itself, so the bound must cover a full reply
+/// plus key, effect and encoding overhead.
+const MAX_STAGED_BYTES: usize = 8 * 1024 * 1024;
 /// Headroom admission reserves in the bounded document for the
 /// lifecycle metadata an admitted task still has to record — the reply
 /// pointer, its delivery key, a session change and delivery
@@ -115,7 +116,7 @@ pub struct PendingUpdate {
     /// uncertain outcome is refused rather than blindly reposted.
     #[serde(default)]
     pub reply_progress: Option<crate::transport::SendProgress>,
-    /// File name of the finished reply's spilled payload inside the
+    /// File name of the finished reply's payload record inside the
     /// store's sidecar replies directory. Completed outcomes live
     /// there so a large reply never has to fit the bounded document;
     /// `None` means the reply (if any) is inline in `reply`.
@@ -160,47 +161,85 @@ struct BindingDocument {
     /// host-visible messages. Older readers ignore the field.
     #[serde(default)]
     dropped_updates: Vec<DroppedUpdate>,
+    /// Fetched updates the cursor already confirmed as host-callback
+    /// events but whose callback outcome is not yet durable. Settled
+    /// the moment the hook answers — consumed events are released,
+    /// rejected ones become dropped records; a record still pending
+    /// on restart is settled as dropped, since the lowered event
+    /// cannot be replayed.
+    #[serde(default)]
+    pending_events: Vec<DroppedUpdate>,
     /// Admitted-but-unfinished message updates: the durable inbox every
     /// confirmed update goes through before the cursor advances.
     #[serde(default)]
     pending_updates: Vec<PendingUpdate>,
 }
 
-/// A staged reply completion: the payload file, the delivery key and
-/// the document effect the record carries, written before the parent
-/// document commits so an exit between the sidecar rename and the
-/// document write can be reconciled by update id instead of re-running
-/// the finished work.
+/// A staged reply completion: one atomic record carrying the payload,
+/// the delivery key and the document effect the finished work commits
+/// with. It is written as a single rename *before* the parent document
+/// commits, so a crash at any point leaves either nothing (the result
+/// was never durable) or the whole recoverable record — never a
+/// payload on disk that no manifest recognizes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StagedCompletion {
     update_id: i64,
-    /// The payload file name inside the replies directory.
+    /// The file inside the replies directory holding the payload.
+    /// Self-contained records name themselves; manifests written by
+    /// the separate-files revision name their `reply-<id>.txt`
+    /// sidecar.
     payload: String,
     /// The delivery key the reply's sends carry.
     key: String,
     /// The document change the completion committed with.
     effect: StagedEffect,
+    /// The reply payload of a self-contained record. `None` marks a
+    /// manifest written by the revision that staged payload and
+    /// manifest as two files; its payload lives in the named file.
+    #[serde(default)]
+    text: Option<String>,
 }
 
 /// The document mutation a staged completion re-applies on recovery —
-/// the same effect the record's own commit performed.
+/// the same effect the record's own commit performed, guarded by the
+/// binding it was staged against: a precondition field `None` marks a
+/// record written before it existed, which applies unverifiable,
+/// exactly as it did when staged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum StagedEffect {
     /// Only the reply pointer binds; no other document change.
     Reply,
-    /// A session change on the chat's binding lands with the reply.
+    /// A session change on the chat's binding lands with the reply —
+    /// only while the binding it was recorded under still holds.
     ReplySession {
         chat_id: i64,
         session_id: Option<String>,
+        #[serde(default)]
+        user_id: Option<i64>,
+        #[serde(default)]
+        agent_id: Option<String>,
     },
-    /// The chat's pairing/binding revocation lands with the reply.
-    ReplyRevoke { chat_id: i64 },
+    /// The chat's pairing/binding revocation lands with the reply —
+    /// only against the binding it was recorded for, never a pairing
+    /// a different user established since.
+    ReplyRevoke {
+        chat_id: i64,
+        #[serde(default)]
+        user_id: Option<i64>,
+    },
     /// An agent rebind lands with the reply — a changed agent clears
-    /// the session, exactly as `set_agent` does.
-    ReplyAgent { chat_id: i64, agent_id: String },
-    /// A new pairing record lands with the reply carrying its code.
+    /// the session, exactly as `set_agent` does — only while the chat
+    /// is still bound for the user the command ran for.
+    ReplyAgent {
+        chat_id: i64,
+        agent_id: String,
+        #[serde(default)]
+        user_id: Option<i64>,
+    },
+    /// A new pairing record lands with the reply carrying its code —
+    /// skipped once that user already holds a full pairing.
     ReplyPairing { record: PairingRecord },
 }
 
@@ -269,14 +308,15 @@ impl BindingStore {
     /// lifecycle space this way so completing admitted work never
     /// competes with new admissions for the last bytes.
     ///
-    /// Staged completions are merged onto the candidate after the
-    /// change runs, so a staged pointer and its effect commit in the
-    /// same write as ordinary lifecycle work when they fit. When the
-    /// merged candidate exceeds the bound the change commits alone, so
-    /// ordinary work still lands while a staged reply waits for slack
-    /// — the on-disk manifests remain authoritative for what has been
-    /// finished but not yet committed (fallback and settle checks
-    /// consult them directly).
+    /// Staged completions reconcile BEFORE the change runs: finished
+    /// work that never reached the document lands first, so a newer
+    /// mutation always overtakes it and a staged effect can never
+    /// overwrite a binding committed or staged after it. When the
+    /// candidate exceeds the bound the reconciled document still
+    /// commits on its own — newer work waits for slack rather than
+    /// overtaking a staged record; the on-disk records remain
+    /// authoritative for what has been finished but not yet committed
+    /// (fallback and settle checks consult them directly).
     fn mutate_bounded<R>(
         &mut self,
         headroom: usize,
@@ -291,30 +331,34 @@ impl BindingStore {
             .map_err(|_| anyhow!("a4mc_telegram_bindings_lock_failed"))?;
         let result = (|| {
             let dir = replies_dir(&self.path);
-            let mut document = read_document(&self.path)?;
-            let value = change(&mut document)?;
-            let mut merged = document.clone();
-            apply_staged(&mut merged, &dir);
+            let document = read_document(&self.path)?;
+            let mut staged = document.clone();
+            apply_staged(&mut staged, &dir);
+            let mut candidate = staged.clone();
+            let value = change(&mut candidate)?;
             // The file must stay readable under its own bound: a
             // mutation whose result would exceed the read limit is
             // refused before it replaces the document, so the store can
             // never land in a shape the next open rejects. Callers
             // treat the refusal like a full disk — work it could not
             // hold stays unconfirmed until the backlog drains.
-            let raw = serde_json::to_string_pretty(&merged)?;
+            let raw = serde_json::to_string_pretty(&candidate)?;
             if raw.len() + headroom <= MAX_STATE_BYTES {
                 atomic_write_private_text(&self.path, &raw)?;
-                self.document = merged;
+                self.document = candidate;
                 return Ok(value);
             }
-            let raw = serde_json::to_string_pretty(&document)?;
-            ensure!(
-                raw.len() + headroom <= MAX_STATE_BYTES,
-                "a4mc_telegram_state_full"
-            );
-            atomic_write_private_text(&self.path, &raw)?;
-            self.document = document;
-            Ok(value)
+            // The change does not fit — its work stays uncommitted,
+            // but the reconciled document still commits on its own so
+            // the staged record is never overtaken by a newer write.
+            if staged != document {
+                let raw = serde_json::to_string_pretty(&staged)?;
+                if raw.len() <= MAX_STATE_BYTES {
+                    atomic_write_private_text(&self.path, &raw)?;
+                    self.document = staged;
+                }
+            }
+            Err(anyhow!("a4mc_telegram_state_full"))
         })();
         // Sweep spilled reply files under the same lock that wrote the
         // document: a file is live exactly while a pending task or an
@@ -510,9 +554,10 @@ impl BindingStore {
     }
 
     /// Persist one fetched batch atomically: newly admitted message
-    /// tasks and any unhandled-update records land in the same write
-    /// that confirms the poll cursor, so a crash can never leave a
-    /// confirmed update without its work record. Admission reserves
+    /// tasks, unhandled-update records and event records awaiting
+    /// their host callback all land in the same write that confirms
+    /// the poll cursor, so a crash can never leave a confirmed update
+    /// without its work record. Admission reserves
     /// `LIFECYCLE_RESERVE_BYTES` of slack beyond the write so the
     /// lifecycle metadata an admitted task still has to record — reply
     /// pointer, delivery key, session change, checkpoints — always has
@@ -521,6 +566,7 @@ impl BindingStore {
         &mut self,
         tasks: &[PendingUpdate],
         dropped: &[DroppedUpdate],
+        events: &[DroppedUpdate],
         offset: i64,
     ) -> Result<()> {
         self.mutate_bounded(LIFECYCLE_RESERVE_BYTES, |document| {
@@ -552,8 +598,91 @@ impl BindingStore {
             if excess > 0 {
                 document.dropped_updates.drain(..excess);
             }
+            for event in events {
+                document
+                    .pending_events
+                    .retain(|item| item.update_id != event.update_id);
+                document.pending_events.push(event.clone());
+            }
             document.poll_offset = offset;
             document.poll_offset_advanced_at = Some(now_secs());
+            Ok(())
+        })
+    }
+
+    /// Settle an event the host callback consumed — the durable marker
+    /// committed with the cursor is released without a dropped record.
+    pub fn settle_event(&mut self, update_id: i64) -> Result<()> {
+        self.mutate(|document| {
+            document
+                .pending_events
+                .retain(|item| item.update_id != update_id);
+            Ok(())
+        })
+    }
+
+    /// Settle an event the host callback rejected — or one a restart
+    /// found still pending, since the lowered event cannot be
+    /// replayed: it becomes the durable dropped record either way.
+    /// `raw_kind` labels the record when no pending marker is found.
+    pub fn settle_event_dropped(&mut self, update_id: i64, raw_kind: &str) -> Result<()> {
+        let raw_kind: String = raw_kind.chars().take(MAX_RAW_KIND_CHARS).collect();
+        self.mutate(|document| {
+            let event = document
+                .pending_events
+                .iter()
+                .position(|item| item.update_id == update_id)
+                .map(|index| document.pending_events.remove(index))
+                .unwrap_or(DroppedUpdate {
+                    update_id,
+                    raw_kind,
+                });
+            document
+                .dropped_updates
+                .retain(|item| item.update_id != update_id);
+            document.dropped_updates.push(event);
+            let excess = document
+                .dropped_updates
+                .len()
+                .saturating_sub(MAX_DROPPED_UPDATES);
+            if excess > 0 {
+                document.dropped_updates.drain(..excess);
+            }
+            Ok(())
+        })
+    }
+
+    /// Settle every event still awaiting its callback — the restart
+    /// path: the cursor already confirmed them and the lowered events
+    /// cannot be replayed, so each becomes its durable dropped record.
+    /// Nothing pending means nothing to write.
+    pub fn settle_unconsumed_events(&mut self) -> Result<()> {
+        if self.document.pending_events.is_empty() {
+            return Ok(());
+        }
+        self.mutate(|document| {
+            let ids: Vec<i64> = document
+                .pending_events
+                .iter()
+                .map(|item| item.update_id)
+                .collect();
+            for update_id in ids {
+                let event = document
+                    .pending_events
+                    .iter()
+                    .position(|item| item.update_id == update_id)
+                    .map(|index| document.pending_events.remove(index));
+                if let Some(event) = event {
+                    document.dropped_updates.push(event);
+                }
+            }
+            let excess = document
+                .dropped_updates
+                .len()
+                .saturating_sub(MAX_DROPPED_UPDATES);
+            if excess > 0 {
+                document.dropped_updates.drain(..excess);
+            }
             Ok(())
         })
     }
@@ -609,11 +738,16 @@ impl BindingStore {
             "a4mc_telegram_reply_too_large"
         );
         let dir = replies_dir(&self.path);
-        let effect = StagedEffect::ReplySession {
-            chat_id,
-            session_id,
-        };
         self.mutate(|document| {
+            // Capture the binding the session is recorded under so a
+            // staged replay can never attach it to a newer binding.
+            let binding = document.chats.get(&chat_id.to_string());
+            let effect = StagedEffect::ReplySession {
+                chat_id,
+                session_id,
+                user_id: binding.map(|binding| binding.user_id),
+                agent_id: binding.and_then(|binding| binding.agent_id.clone()),
+            };
             apply_effect(document, &effect);
             stage_reply(document, &dir, update_id, reply, key, effect)
         })
@@ -633,7 +767,13 @@ impl BindingStore {
     ) -> Result<String> {
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
-            let effect = StagedEffect::ReplyRevoke { chat_id };
+            let effect = StagedEffect::ReplyRevoke {
+                chat_id,
+                user_id: document
+                    .chats
+                    .get(&chat_id.to_string())
+                    .map(|binding| binding.user_id),
+            };
             let removed = apply_effect(document, &effect);
             let reply = text(removed);
             ensure!(
@@ -662,8 +802,15 @@ impl BindingStore {
             "a4mc_telegram_reply_too_large"
         );
         let dir = replies_dir(&self.path);
-        let effect = StagedEffect::ReplyAgent { chat_id, agent_id };
         self.mutate(|document| {
+            let effect = StagedEffect::ReplyAgent {
+                chat_id,
+                agent_id,
+                user_id: document
+                    .chats
+                    .get(&chat_id.to_string())
+                    .map(|binding| binding.user_id),
+            };
             apply_effect(document, &effect);
             stage_reply(document, &dir, update_id, reply, key, effect)
         })
@@ -777,19 +924,31 @@ impl BindingStore {
         })
     }
 
-    /// Persist the instant before which the recorded reply must not be
-    /// attempted again — the durable form of a platform `Retry-After`
-    /// or policy deferral a delivery attempt escaped with. A restart
-    /// honors the deadline instead of reposting a throttled send at
-    /// once; a progress write or a new reply record clears it.
-    pub fn record_reply_wait(&mut self, update_id: i64, not_before: u64) -> Result<()> {
+    /// Persist a delivery attempt's checkpoint and owed retry deadline
+    /// as one durable write: `progress` replaces the stored checkpoint
+    /// (`None` leaves it untouched — a failure before the transport
+    /// ran has none to record), `not_before` sets the instant the
+    /// reply must not be attempted before. Persisting both together
+    /// before the wait means an exit inside it can never leave a
+    /// retryable checkpoint missing its deadline.
+    pub fn record_reply_checkpoint(
+        &mut self,
+        update_id: i64,
+        progress: Option<crate::transport::SendProgress>,
+        not_before: Option<u64>,
+    ) -> Result<()> {
         self.mutate(|document| {
             if let Some(task) = document
                 .pending_updates
                 .iter_mut()
                 .find(|task| task.update_id == update_id)
             {
-                task.reply_retry_at = Some(not_before);
+                if let Some(progress) = progress {
+                    task.reply_progress = Some(progress);
+                }
+                if let Some(deadline) = not_before {
+                    task.reply_retry_at = Some(deadline);
+                }
             }
             Ok(())
         })
@@ -866,7 +1025,7 @@ impl BindingStore {
         let Some(name) = &task.reply_file else {
             return Ok(None);
         };
-        read_private_text_bounded(&replies_dir(&self.path).join(name), MAX_REPLY_BYTES)?
+        read_reply_payload(&self.path, name, task.update_id)?
             .map(Some)
             .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))
     }
@@ -930,7 +1089,7 @@ fn lock_path(path: &Path) -> PathBuf {
 }
 
 /// Sidecar directory holding spilled reply payloads and staged
-/// manifests next to the state file: `<full state file
+/// records next to the state file: `<full state file
 /// name>.replies/reply-<update_id>.txt` and
 /// `reply-<update_id>.json`. The directory name derives from the
 /// entire file name, not an extension substitution — `bot.json` and
@@ -944,6 +1103,48 @@ fn replies_dir(path: &Path) -> PathBuf {
         .unwrap_or_else(|| "bindings.json".into());
     name.push(".replies");
     path.with_file_name(name)
+}
+
+/// The sidecar directory the preceding revision spilled payloads
+/// into — `<state stem>.replies`, an extension substitution two
+/// distinct state files can collide on. Payloads a pending record
+/// still points at are resolved there so work finished before the
+/// layout change stays discoverable. Read-only: this store never
+/// creates, deletes or sweeps inside it, because the same directory
+/// may hold a sibling state file's legacy payloads.
+fn legacy_replies_dir(path: &Path) -> PathBuf {
+    path.with_extension("replies")
+}
+
+/// Resolve a record's payload: the store's sidecar directory first,
+/// then the legacy directory the preceding revision used. A `.json`
+/// name is a self-contained staged record whose text is the reply —
+/// verified against the task it is read for; any other name is raw
+/// payload text.
+fn read_reply_payload(path: &Path, name: &str, update_id: i64) -> Result<Option<String>> {
+    for dir in [replies_dir(path), legacy_replies_dir(path)] {
+        let bound = if name.ends_with(".json") {
+            MAX_STAGED_BYTES
+        } else {
+            MAX_REPLY_BYTES
+        };
+        let Some(raw) = read_private_text_bounded(&dir.join(name), bound)? else {
+            continue;
+        };
+        return decode_reply_payload(name, &raw, update_id).map(Some);
+    }
+    Ok(None)
+}
+
+fn decode_reply_payload(name: &str, raw: &str, update_id: i64) -> Result<String> {
+    if !name.ends_with(".json") {
+        return Ok(raw.to_owned());
+    }
+    serde_json::from_str::<StagedCompletion>(raw)
+        .ok()
+        .filter(|staged| staged.update_id == update_id)
+        .and_then(|staged| staged.text)
+        .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))
 }
 
 fn reply_file_name(update_id: i64) -> String {
@@ -964,11 +1165,26 @@ fn staged_file_name_id(name: &str) -> Option<(i64, &str)> {
     Some((id.parse().ok()?, suffix))
 }
 
-/// Whether an uncommitted staged completion exists for the update —
-/// the on-disk manifest stays authoritative until a document write
-/// binds its pointer.
+/// Whether a recoverable staged completion exists for the update —
+/// the on-disk record stays authoritative until a document write
+/// binds its pointer. A self-contained record always qualifies; a
+/// pointer manifest does only while its payload file exists.
 fn staged_exists(dir: &Path, update_id: i64) -> bool {
-    dir.join(manifest_file_name(update_id)).is_file()
+    let Ok(raw) =
+        read_private_text_bounded(&dir.join(manifest_file_name(update_id)), MAX_STAGED_BYTES)
+    else {
+        return false;
+    };
+    raw.and_then(|raw| serde_json::from_str::<StagedCompletion>(&raw).ok())
+        .filter(|staged| staged.update_id == update_id && staged_payload_name_ok(staged, update_id))
+        .is_some_and(|staged| staged.text.is_some() || dir.join(&staged.payload).is_file())
+}
+
+/// Whether a staged record's declared payload name matches the files
+/// this store owns for its update id — the self-contained record's
+/// own name or a pointer manifest's `reply-<id>.txt` sidecar.
+fn staged_payload_name_ok(staged: &StagedCompletion, update_id: i64) -> bool {
+    staged.payload == reply_file_name(update_id) || staged.payload == manifest_file_name(update_id)
 }
 
 fn staged_update_ids(dir: &Path) -> Vec<i64> {
@@ -1004,7 +1220,7 @@ fn staged_manifests(dir: &Path) -> Vec<(i64, Option<StagedCompletion>)> {
             .flatten()
             .and_then(|raw| serde_json::from_str::<StagedCompletion>(&raw).ok())
             .filter(|staged: &StagedCompletion| {
-                staged.update_id == id && staged.payload == reply_file_name(id)
+                staged.update_id == id && staged_payload_name_ok(staged, id)
             });
         out.push((id, staged));
     }
@@ -1020,6 +1236,14 @@ fn staged_manifests(dir: &Path) -> Vec<(i64, Option<StagedCompletion>)> {
 fn apply_staged(document: &mut BindingDocument, dir: &Path) {
     for (id, staged) in staged_manifests(dir) {
         let Some(staged) = staged else { continue };
+        // The record must be readable end to end: a self-contained
+        // record carries its payload; a pointer manifest is only
+        // recoverable while its payload file exists — a pointer whose
+        // payload never landed marks a stage that died mid-write,
+        // not finished work.
+        if staged.text.is_none() && !dir.join(&staged.payload).is_file() {
+            continue;
+        }
         let Some(index) = document
             .pending_updates
             .iter()
@@ -1067,9 +1291,12 @@ fn stranded_staged(document: &BindingDocument, dir: &Path) -> Vec<StrandedReply>
         else {
             continue;
         };
+        let recoverable = staged
+            .as_ref()
+            .is_some_and(|staged| staged.text.is_some() || dir.join(&staged.payload).is_file());
         out.push(StrandedReply {
             update_id: task.update_id,
-            code: if staged.is_some() {
+            code: if recoverable {
                 "a4mc_telegram_state_full".to_owned()
             } else {
                 "a4mc_telegram_staged_invalid".to_owned()
@@ -1079,12 +1306,12 @@ fn stranded_staged(document: &BindingDocument, dir: &Path) -> Vec<StrandedReply>
     out
 }
 
-/// Write one finished reply's payload and manifest into the sidecar
-/// directory and bind the pointer on its admitted task. The payload
-/// rename lands before the manifest rename, so a manifest can never
-/// name a payload that does not exist yet; the manifest rename lands
-/// before the caller's document commit, so the staged completion is
-/// recoverable by update id if the process dies between them.
+/// Write one finished reply's recoverable record into the sidecar
+/// directory and bind its pointer on the admitted task. The record
+/// carries payload, delivery key and state effect in a single atomic
+/// rename before the caller's document commit: a crash before it
+/// leaves nothing durable, a crash after it leaves the whole
+/// recoverable completion — never a payload no record recognizes.
 fn stage_reply(
     document: &mut BindingDocument,
     dir: &Path,
@@ -1101,19 +1328,23 @@ fn stage_reply(
         return Ok(());
     };
     ensure_private_dir(dir)?;
-    let payload = reply_file_name(update_id);
-    atomic_write_private_text(&dir.join(&payload), reply)?;
+    let record_name = manifest_file_name(update_id);
     let manifest = StagedCompletion {
         update_id,
-        payload: payload.clone(),
+        payload: record_name.clone(),
         key: key.to_owned(),
         effect,
+        text: Some(reply.to_owned()),
     };
     let raw = serde_json::to_string(&manifest)
         .map_err(|_| anyhow!("a4mc_telegram_state_write_failed"))?;
-    atomic_write_private_text(&dir.join(manifest_file_name(update_id)), &raw)?;
+    ensure!(
+        raw.len() <= MAX_STAGED_BYTES,
+        "a4mc_telegram_reply_too_large"
+    );
+    atomic_write_private_text(&dir.join(&record_name), &raw)?;
     task.reply = None;
-    task.reply_file = Some(payload);
+    task.reply_file = Some(record_name);
     task.reply_key = Some(key.to_owned());
     task.reply_sent = 0;
     task.reply_progress = None;
@@ -1122,7 +1353,8 @@ fn stage_reply(
 }
 
 /// Apply one staged effect to the document — the same change the
-/// record's own commit performed. Returns whether pairing or binding
+/// record's own commit performed, refused when the binding it was
+/// staged against no longer holds. Returns whether pairing or binding
 /// state was removed (only the revocation effect can remove).
 fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
     match effect {
@@ -1130,26 +1362,44 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
         StagedEffect::ReplySession {
             chat_id,
             session_id,
+            user_id,
+            agent_id,
         } => {
             if let Some(binding) = document.chats.get_mut(&chat_id.to_string())
                 && binding.agent_id.is_some()
+                && user_id.is_none_or(|held| binding.user_id == held)
+                && agent_id
+                    .as_ref()
+                    .is_none_or(|held| binding.agent_id.as_ref() == Some(held))
             {
                 binding.session_id = session_id.clone();
                 binding.updated_at = now_secs();
             }
             false
         }
-        StagedEffect::ReplyRevoke { chat_id } => {
+        StagedEffect::ReplyRevoke { chat_id, user_id } => {
+            let removable = document
+                .chats
+                .get(&chat_id.to_string())
+                .is_none_or(|binding| user_id.is_none_or(|held| binding.user_id == held));
+            if !removable {
+                return false;
+            }
             let removed = document.chats.remove(&chat_id.to_string()).is_some();
             let before = document.pairings.len();
-            document
-                .pairings
-                .retain(|record| record.chat_id != *chat_id);
+            document.pairings.retain(|record| {
+                record.chat_id != *chat_id || user_id.is_some_and(|held| record.user_id != held)
+            });
             removed || document.pairings.len() != before
         }
-        StagedEffect::ReplyAgent { chat_id, agent_id } => {
+        StagedEffect::ReplyAgent {
+            chat_id,
+            agent_id,
+            user_id,
+        } => {
             if let Some(binding) = document.chats.get_mut(&chat_id.to_string())
                 && binding.paired
+                && user_id.is_none_or(|held| binding.user_id == held)
             {
                 if binding.agent_id.as_deref() != Some(agent_id.as_str()) {
                     binding.session_id = None;
@@ -1160,6 +1410,15 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
             false
         }
         StagedEffect::ReplyPairing { record } => {
+            if document
+                .chats
+                .get(&record.chat_id.to_string())
+                .is_some_and(|binding| binding.paired && binding.user_id == record.user_id)
+            {
+                // The user holds a full pairing now — the staged code
+                // offer is superseded, never re-published.
+                return false;
+            }
             document
                 .pairings
                 .retain(|held| held.chat_id != record.chat_id || held.user_id != record.user_id);
@@ -1171,9 +1430,11 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
 
 /// Remove sidecar files no serialized record still references. Runs
 /// inside `mutate`'s lock after the document lands. Only `reply-*`
-/// files this store owns are touched — a payload is live while a task
-/// or an unapplied manifest names it, and a manifest is live while its
-/// task still lacks the committed pointer.
+/// files this store owns inside its own directory are touched — a
+/// payload is live while a task or an unapplied record names it, and
+/// a record is live while its task may still bind it. The legacy
+/// directory is never swept: a sibling state file's payloads may live
+/// there too.
 fn sweep_reply_files(path: &Path, document: &BindingDocument) {
     let dir = replies_dir(path);
     let mut live: HashSet<String> = document
@@ -1182,21 +1443,46 @@ fn sweep_reply_files(path: &Path, document: &BindingDocument) {
         .filter_map(|task| task.reply_file.clone())
         .collect();
     for (id, staged) in staged_manifests(&dir) {
-        let referenced = staged
-            .as_ref()
-            .map(|staged| staged.payload.clone())
-            .unwrap_or_else(|| reply_file_name(id));
-        let waiting = document
+        let task = document
             .pending_updates
             .iter()
-            .find(|task| task.update_id == id)
-            .is_some_and(|task| task.reply_file.as_deref() != Some(referenced.as_str()));
-        if waiting {
-            live.insert(referenced);
-        } else {
-            // Committed (the task already names its payload) or
-            // orphaned (no task remains) — the manifest has served.
-            let _ = std::fs::remove_file(dir.join(manifest_file_name(id)));
+            .find(|task| task.update_id == id);
+        let bound = task.is_some_and(|task| {
+            staged
+                .as_ref()
+                .is_some_and(|staged| task.reply_file.as_deref() == Some(staged.payload.as_str()))
+        });
+        if bound {
+            // The pointer committed — a self-contained record stays
+            // live as the payload itself; a pointer manifest has
+            // served and is reclaimed.
+            if staged.as_ref().is_some_and(|staged| staged.text.is_none()) {
+                let _ = std::fs::remove_file(dir.join(manifest_file_name(id)));
+            }
+            continue;
+        }
+        match staged {
+            Some(staged) => {
+                let recoverable = staged.text.is_some() || dir.join(&staged.payload).is_file();
+                if task.is_none() || !recoverable {
+                    // Orphaned, or a stage that died before its
+                    // payload landed — nothing left to recover.
+                    let _ = std::fs::remove_file(dir.join(manifest_file_name(id)));
+                } else {
+                    // Still waiting to bind: hold the record and the
+                    // payload it names.
+                    live.insert(staged.payload);
+                }
+            }
+            None => {
+                // An unreadable record is held for reporting while its
+                // task is unbound; once the task is gone it is swept.
+                if task.is_none() {
+                    let _ = std::fs::remove_file(dir.join(manifest_file_name(id)));
+                } else {
+                    live.insert(reply_file_name(id));
+                }
+            }
         }
     }
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1238,6 +1524,7 @@ fn read_document(path: &Path) -> Result<BindingDocument> {
             poll_offset: 0,
             poll_offset_advanced_at: None,
             dropped_updates: Vec::new(),
+            pending_events: Vec::new(),
             pending_updates: Vec::new(),
         }),
     }
@@ -1505,6 +1792,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     8,
                 )
                 .unwrap();
@@ -1559,6 +1847,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     4,
                 )
                 .unwrap();
@@ -1580,6 +1869,7 @@ mod tests {
                         reply_file: None,
                         reply_retry_at: None,
                     }],
+                    &[],
                     &[],
                     5,
                 )
@@ -1609,6 +1899,7 @@ mod tests {
                         reply_file: None,
                         reply_retry_at: None,
                     }],
+                    &[],
                     &[],
                     6,
                 )
@@ -1658,6 +1949,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     8,
                 )
                 .unwrap();
@@ -1674,7 +1966,10 @@ mod tests {
                 effect: StagedEffect::ReplySession {
                     chat_id: 9,
                     session_id: Some("staged-session".to_owned()),
+                    user_id: None,
+                    agent_id: None,
                 },
+                text: None,
             };
             std::fs::write(
                 dir.join("reply-7.json"),
@@ -1721,6 +2016,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     10,
                 )
                 .unwrap();
@@ -1761,6 +2057,7 @@ mod tests {
                 payload: "reply-9.txt".to_owned(),
                 key: "reply:9".to_owned(),
                 effect: StagedEffect::Reply,
+                text: None,
             };
             std::fs::write(
                 dir.join("reply-9.json"),
@@ -1809,6 +2106,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     6,
                 )
                 .unwrap();
@@ -1853,6 +2151,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     4,
                 )
                 .unwrap();
@@ -1870,6 +2169,7 @@ mod tests {
                         reply_file: None,
                         reply_retry_at: None,
                     }],
+                    &[],
                     &[],
                     5,
                 )
@@ -1898,6 +2198,7 @@ mod tests {
                         reply_file: None,
                         reply_retry_at: None,
                     }],
+                    &[],
                     &[],
                     4,
                 )
@@ -1933,6 +2234,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     9,
                 )
                 .unwrap();
@@ -1964,6 +2266,335 @@ mod tests {
             assert_eq!(
                 store.reply_text(task).unwrap().as_deref(),
                 Some("Pairing revoked for this chat.")
+            );
+        });
+    }
+
+    #[test]
+    fn a_self_contained_staged_record_binds_on_recovery() {
+        temp_store(|mut store| {
+            let pending = store.request_pairing(9, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(9, Some("codex".into())).unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at: None,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // The record the runtime now stages: payload, delivery key
+            // and effect in one file — a crash leaves the whole record
+            // or nothing, never a payload whose record never landed.
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = StagedCompletion {
+                update_id: 7,
+                payload: "reply-7.json".to_owned(),
+                key: "reply:7".to_owned(),
+                effect: StagedEffect::ReplySession {
+                    chat_id: 9,
+                    session_id: Some("staged-session".to_owned()),
+                    user_id: Some(42),
+                    agent_id: None,
+                },
+                text: Some("self-contained reply".to_owned()),
+            };
+            std::fs::write(
+                dir.join("reply-7.json"),
+                serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+
+            let stranded = store.reconcile_staged().unwrap();
+            assert!(
+                stranded.is_empty(),
+                "a self-contained record stranded: {stranded:?}"
+            );
+            let task = store.pending_updates().pop().unwrap();
+            assert_eq!(task.reply_file.as_deref(), Some("reply-7.json"));
+            assert_eq!(task.reply_key.as_deref(), Some("reply:7"));
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some("self-contained reply")
+            );
+            assert_eq!(
+                store.binding(9).unwrap().session_id.as_deref(),
+                Some("staged-session")
+            );
+        });
+    }
+
+    #[test]
+    fn a_payload_file_without_its_record_is_never_bound() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at: None,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // The crash window: the payload landed but the record that
+            // would make it a reply never did. A bare payload names no
+            // key and no effect — it is never bound and the next
+            // committed write sweeps it.
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("reply-7.txt"), "unrecorded payload").unwrap();
+
+            let stranded = store.reconcile_staged().unwrap();
+            assert!(
+                stranded.is_empty(),
+                "a bare payload produced a binding or a report: {stranded:?}"
+            );
+            let task = store.pending_update(7).unwrap();
+            assert!(!task.has_reply(), "a bare payload bound a reply: {task:?}");
+            store.set_poll_offset(9).unwrap();
+            assert!(
+                !dir.join("reply-7.txt").exists(),
+                "an unrecorded payload survived the sweep"
+            );
+        });
+    }
+
+    #[test]
+    fn a_staged_effect_never_overtakes_a_newer_binding() {
+        temp_store(|mut store| {
+            let pending = store.request_pairing(9, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(9, Some("codex".into())).unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at: None,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // A session staged while "codex" held the binding.
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = StagedCompletion {
+                update_id: 7,
+                payload: "reply-7.json".to_owned(),
+                key: "reply:7".to_owned(),
+                effect: StagedEffect::ReplySession {
+                    chat_id: 9,
+                    session_id: Some("staged-session".to_owned()),
+                    user_id: Some(42),
+                    agent_id: Some("codex".to_owned()),
+                },
+                text: Some("reply body".to_owned()),
+            };
+            std::fs::write(
+                dir.join("reply-7.json"),
+                serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+            // A newer write moved the binding forward before the staged
+            // record reached the document. Reconciliation runs BEFORE
+            // that change lands, so the staged session applies to its
+            // own binding and the newer agent switch still clears it —
+            // the stale session can never attach to the new agent.
+            store.set_agent(9, Some("claude".into())).unwrap();
+            let binding = store.binding(9).unwrap();
+            assert_eq!(binding.agent_id.as_deref(), Some("claude"));
+            assert_eq!(
+                binding.session_id, None,
+                "the staged session attached to the newer binding"
+            );
+            let task = store.pending_update(7).unwrap();
+            assert_eq!(
+                task.reply_key.as_deref(),
+                Some("reply:7"),
+                "the finished reply did not survive its staged effect"
+            );
+        });
+    }
+
+    #[test]
+    fn a_confirmed_event_settles_consumed_or_dropped() {
+        temp_store(|mut store| {
+            // The cursor confirms an event with its pending record in
+            // one write.
+            store
+                .admit_updates(
+                    &[],
+                    &[],
+                    &[DroppedUpdate {
+                        update_id: 5,
+                        raw_kind: "edited_message".to_owned(),
+                    }],
+                    6,
+                )
+                .unwrap();
+            // A restart settles an unconsumed event into its durable
+            // dropped record — the confirmed update is never lost.
+            let mut reopened = BindingStore::open(store.path.clone()).unwrap();
+            reopened.settle_unconsumed_events().unwrap();
+            let dropped = reopened.dropped_updates();
+            assert_eq!(dropped.len(), 1);
+            assert_eq!(dropped[0].update_id, 5);
+            assert_eq!(dropped[0].raw_kind, "edited_message");
+
+            store
+                .admit_updates(
+                    &[],
+                    &[],
+                    &[DroppedUpdate {
+                        update_id: 6,
+                        raw_kind: "reaction".to_owned(),
+                    }],
+                    7,
+                )
+                .unwrap();
+            store.settle_event(6).unwrap();
+            assert!(
+                !store
+                    .dropped_updates()
+                    .iter()
+                    .any(|item| item.update_id == 6),
+                "a consumed event was recorded dropped"
+            );
+
+            store
+                .admit_updates(
+                    &[],
+                    &[],
+                    &[DroppedUpdate {
+                        update_id: 7,
+                        raw_kind: "reaction".to_owned(),
+                    }],
+                    8,
+                )
+                .unwrap();
+            store.settle_event_dropped(7, "reaction").unwrap();
+            assert!(
+                store
+                    .dropped_updates()
+                    .iter()
+                    .any(|item| item.update_id == 7 && item.raw_kind == "reaction"),
+                "a rejected event lost its durable dropped record"
+            );
+        });
+    }
+
+    #[test]
+    fn a_checkpoint_and_its_deadline_commit_as_one_write() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        message: inbound_message(7, 9),
+                        reply: Some("held reply".to_owned()),
+                        reply_key: Some("reply:7".to_owned()),
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at: None,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            let progress = crate::transport::SendProgress {
+                confirmed: vec![91],
+                next_part: 1,
+                outcome_unknown: true,
+                binding: None,
+            };
+            store
+                .record_reply_checkpoint(7, Some(progress), Some(1_700_000_000))
+                .unwrap();
+            let task = BindingStore::open(store.path.clone())
+                .unwrap()
+                .pending_update(7)
+                .unwrap();
+            let progress = task.reply_progress.expect("checkpoint lost");
+            assert!(progress.outcome_unknown);
+            assert_eq!(progress.confirmed, vec![91]);
+            assert_eq!(
+                task.reply_retry_at,
+                Some(1_700_000_000),
+                "the retry deadline did not commit with its checkpoint"
+            );
+        });
+    }
+
+    #[test]
+    fn a_pending_payload_in_the_legacy_replies_dir_is_found() {
+        temp_store(|mut store| {
+            // A record written by the preceding revision: the pointer
+            // names a payload spilled under `<stem>.replies`, not the
+            // current full-filename directory.
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: Some("reply:7".to_owned()),
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: Some("reply-7.txt".to_owned()),
+                        reply_retry_at: None,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            let legacy = store.path.with_extension("replies");
+            std::fs::create_dir_all(&legacy).unwrap();
+            std::fs::write(legacy.join("reply-7.txt"), "legacy payload").unwrap();
+
+            let reopened = BindingStore::open(store.path.clone()).unwrap();
+            let task = reopened.pending_update(7).unwrap();
+            assert_eq!(
+                reopened.reply_text(&task).unwrap().as_deref(),
+                Some("legacy payload"),
+                "a pending payload in the legacy directory was lost"
+            );
+            // A commit must never sweep inside the shared legacy
+            // directory — a sibling state file's payloads may live
+            // there too.
+            let mut store = reopened;
+            store.set_poll_offset(9).unwrap();
+            assert!(
+                legacy.join("reply-7.txt").exists(),
+                "the legacy payload was swept by the new store"
             );
         });
     }

@@ -347,10 +347,16 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         None => channel,
     });
 
+    // Host observer for stranded replies — shared between startup
+    // recovery and the live workers, so a reply that strands during
+    // ordinary processing is surfaced exactly like one found at
+    // restart.
+    let on_stuck = Arc::new(Mutex::new(config.on_stuck.take()));
     let processor_channel = Arc::clone(&channel);
     let processor_store = Arc::clone(&store);
     let processor_identity = identity.clone();
     let processor_stop = Arc::clone(&config.stop);
+    let processor_stuck = Arc::clone(&on_stuck);
     let turn_deadline = config.turn_deadline;
     let processor = move |chat_id: i64, message: InboundMessage| {
         let update_id = message.update_id;
@@ -386,7 +392,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                     .lock()
                     .unwrap()
                     .record_fallback_reply(update_id, &text, &key)?;
-                let delivered = if recorded {
+                let delivery = if recorded {
                     deliver_recorded_reply(
                         &processor_channel,
                         &processor_store,
@@ -400,7 +406,6 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                         true,
                         &processor_stop,
                     )
-                    .is_ok()
                 } else {
                     // The slot already holds a finished agent reply
                     // the report must not shadow — and must not earn
@@ -410,19 +415,35 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                         &reply_sends(chat_id, message.message_id, &key, &text),
                         &processor_stop,
                     )
-                    .is_ok()
+                    .map_err(channel_err)
                 };
                 // A fallback that was both recorded and delivered ends
                 // the task outright; anything else — an undelivered
                 // report, or a finished agent reply still owed — keeps
                 // its record for the restart drain.
-                if recorded && delivered {
+                if recorded && delivery.is_ok() {
                     processor_store.lock().unwrap().complete_update(update_id)?;
                 } else {
                     processor_store
                         .lock()
                         .unwrap()
                         .settle_failed_update(update_id)?;
+                    // A live stranded outcome — a retained record still
+                    // holding a finished reply — surfaces to the host
+                    // with the stable code, exactly like startup
+                    // recovery, while its checkpoint stays durable.
+                    let stranded = processor_store
+                        .lock()
+                        .unwrap()
+                        .pending_update(update_id)
+                        .is_some_and(|task| task.has_reply());
+                    if stranded {
+                        let code = match &delivery {
+                            Err(delivery_error) if recorded => failure_code(delivery_error),
+                            _ => failure_code(&error),
+                        };
+                        notify_stuck(&processor_stuck, update_id, &code);
+                    }
                 }
                 Ok(())
             }
@@ -431,7 +452,6 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     let workers = scheduler.spawn_workers(config.worker_count, processor)?;
 
     let mut pending: VecDeque<InboundMessage> = VecDeque::new();
-    let mut on_stuck = config.on_stuck.take();
     // Bind staged completions first: a reply whose payload, key and
     // effect were staged but whose document pointer never committed is
     // recovered by update id here instead of re-running its work —
@@ -456,8 +476,12 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     };
     let staged: HashSet<i64> = stranded.iter().map(|item| item.update_id).collect();
     for item in &stranded {
-        notify_stuck(&mut on_stuck, item.update_id, &item.code);
+        notify_stuck(&on_stuck, item.update_id, &item.code);
     }
+    // Events the cursor confirmed but whose callbacks never ran — the
+    // lowered event cannot be replayed, so each becomes its durable
+    // dropped record instead of vanishing on restart.
+    store.lock().unwrap().settle_unconsumed_events()?;
     // Resume admitted-but-unfinished work before polling: finished turns
     // only need their recorded reply delivered; unstarted messages are
     // re-queued whole. Records survive only while their stage is
@@ -487,7 +511,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 continue;
             }
             Err(error) => {
-                notify_stuck(&mut on_stuck, task.update_id, &failure_code(&error));
+                notify_stuck(&on_stuck, task.update_id, &failure_code(&error));
                 continue;
             }
         };
@@ -529,7 +553,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
             // — and the checkpoint it earned — stays for the next
             // restart's resend.
             Err(error) if is_interrupted_send_wait(&error) => held.push((task, reply)),
-            Err(error) => notify_stuck(&mut on_stuck, task.update_id, &failure_code(&error)),
+            Err(error) => notify_stuck(&on_stuck, task.update_id, &failure_code(&error)),
         }
     }
     for (task, reply) in held {
@@ -568,7 +592,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 let _ = store.lock().unwrap().complete_update(task.update_id);
             }
             Err(error) if is_interrupted_send_wait(&error) => {}
-            Err(error) => notify_stuck(&mut on_stuck, task.update_id, &failure_code(&error)),
+            Err(error) => notify_stuck(&on_stuck, task.update_id, &failure_code(&error)),
         }
     }
     let mut on_event = config.on_event.take();
@@ -772,6 +796,26 @@ fn poll_updates<T: BotTransport>(
                 let committed = admit_batch_prefix(store, &updates, &records, next_offset)?;
                 if committed == 0 {
                     // Nothing of this batch fits the store right now.
+                    // While workers or the dispatch backlog still hold
+                    // records, their completion frees the capacity the
+                    // store lacks — temporary pressure waits for the
+                    // backlog to drain instead of spending the
+                    // permanent-failure budget, which is reserved for
+                    // an update that cannot fit once nothing is left
+                    // to drain.
+                    if scheduler.admitted() > 0 || !pending.is_empty() {
+                        let waited = if scheduler.admitted() >= scheduler.max_admitted
+                            || !pending.is_empty()
+                        {
+                            scheduler.wait_for_capacity()
+                        } else {
+                            wait_or_stop(retry_wait(1, None), &config.stop)
+                        };
+                        if !waited {
+                            break;
+                        }
+                        continue;
+                    }
                     // Not a transport failure — admission failures are
                     // counted independently so a fetch succeeding does
                     // not reset the budget an update that can never fit
@@ -809,11 +853,15 @@ fn poll_updates<T: BotTransport>(
                 // records the store just durably confirmed reach the
                 // hook, so routine capacity backpressure cannot replay
                 // a callback for an update still in the uncommitted
-                // suffix. A rejected event is recorded in the durable
-                // dropped list — it was confirmed already — and the
-                // loop fails so the host sees the rejection; events
-                // after the first rejection are recorded the same way
-                // without reaching the hook again.
+                // suffix. Every confirmed event was admitted as a
+                // pending record; the callback's outcome now settles
+                // it — success consumes the record, rejection turns it
+                // into the durable dropped record — and a settle
+                // write's failure surfaces rather than discarding the
+                // event's only durable trace. Events after the first
+                // rejection settle dropped without reaching the hook
+                // again; an event with no hook installed settles
+                // dropped the same way.
                 let mut event_error = None;
                 for record in &records[..committed] {
                     let BatchRecord::Event {
@@ -824,20 +872,28 @@ fn poll_updates<T: BotTransport>(
                     else {
                         continue;
                     };
-                    if event_error.is_none()
-                        && let Some(hook) = on_event.as_mut()
-                    {
-                        match hook(event) {
-                            Ok(()) => continue,
-                            Err(error) => {
-                                event_error = Some(error);
-                            }
+                    let rejected = if event_error.is_some() {
+                        true
+                    } else {
+                        match on_event.as_mut() {
+                            Some(hook) => match hook(event) {
+                                Ok(()) => false,
+                                Err(error) => {
+                                    event_error = Some(error);
+                                    true
+                                }
+                            },
+                            None => true,
                         }
+                    };
+                    if rejected {
+                        store
+                            .lock()
+                            .unwrap()
+                            .settle_event_dropped(*update_id, raw_kind)?;
+                    } else {
+                        store.lock().unwrap().settle_event(*update_id)?;
                     }
-                    let _ = store
-                        .lock()
-                        .unwrap()
-                        .record_dropped_update(*update_id, raw_kind);
                 }
                 if let Some(error) = event_error {
                     return Err(anyhow!("a4mc_telegram_unhandled_event: {error}"));
@@ -860,9 +916,9 @@ enum BatchRecord {
     Dropped(DroppedUpdate),
     /// A dispatched message task admitted with the cursor.
     Task(Box<crate::binding::PendingUpdate>),
-    /// An unhandled update awaiting its host callback — invoked only
-    /// once the record's cursor advance has durably committed, and
-    /// recorded dropped if the hook then rejects it.
+    /// An unhandled update awaiting its host callback — admitted as a
+    /// pending-event record with the cursor, then settled consumed or
+    /// dropped by the callback's outcome.
     Event {
         update_id: i64,
         raw_kind: &'static str,
@@ -882,23 +938,33 @@ fn is_store_capacity(error: &anyhow::Error) -> bool {
 
 /// One durable admit write for a batch prefix: the records of
 /// `updates[..records.len()]` commit with the cursor confirmed at
-/// `offset`.
+/// `offset` — tasks, dropped-update records, and a pending record for
+/// each event whose host callback has not run yet, so a crash between
+/// cursor commit and callback leaves the event settled as dropped on
+/// restart rather than lost.
 fn admit_batch(store: &Mutex<BindingStore>, records: &[BatchRecord], offset: i64) -> Result<()> {
     let mut tasks = Vec::new();
     let mut dropped = Vec::new();
+    let mut events = Vec::new();
     for record in records {
         match record {
             BatchRecord::Task(task) => tasks.push(task.as_ref().clone()),
             BatchRecord::Dropped(item) => dropped.push(item.clone()),
-            // An event commits no record of its own: it is callback-
-            // driven and recorded dropped only if the hook rejects it.
-            BatchRecord::Event { .. } | BatchRecord::Skip => {}
+            BatchRecord::Event {
+                update_id,
+                raw_kind,
+                ..
+            } => events.push(DroppedUpdate {
+                update_id: *update_id,
+                raw_kind: (*raw_kind).to_owned(),
+            }),
+            BatchRecord::Skip => {}
         }
     }
     store
         .lock()
         .unwrap()
-        .admit_updates(&tasks, &dropped, offset)
+        .admit_updates(&tasks, &dropped, &events, offset)
 }
 
 /// Confirm as much of the fetched batch as the bounded store can hold,
@@ -1237,63 +1303,62 @@ fn deliver_recorded_reply<T: BotTransport>(
                     break;
                 }
                 Err(tracked) => {
-                    // Persist the checkpoint the attempt left behind —
-                    // including the uncertain-outcome flag — so the
-                    // restart drain resumes the same logical send. A
-                    // failure before the transport ran leaves the
-                    // stored checkpoint untouched.
-                    if let Some(progress) = tracked.progress {
-                        store.lock().unwrap().record_reply_progress(
-                            update_id,
-                            index,
-                            Some((*progress).clone()),
-                        )?;
-                        resume = Some(*progress);
-                    }
                     let error = tracked.error;
-                    if is_outbound_deferral(&error) {
-                        let window = error
-                            .retry_after_ms
-                            .map(Duration::from_millis)
-                            .unwrap_or(DEFERRED_RETRY_WAIT);
-                        if !wait || !wait_or_stop(window, stop) {
-                            record_reply_wait(store, update_id, window);
-                            return Err(channel_err(error));
-                        }
-                        continue;
+                    let progress = tracked.progress.map(|progress| *progress);
+                    if let Some(progress) = &progress {
+                        resume = Some(progress.clone());
                     }
                     // A failure nothing could have posted — or a
                     // definitive rejection carrying its retry hint —
                     // retries from the persisted checkpoint here
                     // instead of stranding the recorded reply until a
                     // restart.
-                    if is_transient_send_failure(&error, resume.as_ref()) {
+                    let window = if is_outbound_deferral(&error) {
+                        Some(
+                            error
+                                .retry_after_ms
+                                .map(Duration::from_millis)
+                                .unwrap_or(DEFERRED_RETRY_WAIT),
+                        )
+                    } else if is_transient_send_failure(&error, resume.as_ref()) {
                         transient_failures += 1;
-                        let window = error
-                            .retry_after_ms
-                            .map(Duration::from_millis)
-                            .unwrap_or_else(|| retry_wait(transient_failures, None));
-                        if !wait || !wait_or_stop(window, stop) {
-                            record_reply_wait(store, update_id, window);
-                            return Err(channel_err(error));
-                        }
-                        continue;
+                        Some(
+                            error
+                                .retry_after_ms
+                                .map(Duration::from_millis)
+                                .unwrap_or_else(|| retry_wait(transient_failures, None)),
+                        )
+                    } else {
+                        None
+                    };
+                    // Persist the checkpoint the attempt left behind —
+                    // including the uncertain-outcome flag — together
+                    // with the absolute deadline an owed wait ends, in
+                    // one durable write BEFORE sleeping: an exit inside
+                    // the wait can never leave a retryable checkpoint
+                    // missing its deadline, and a persistence failure
+                    // surfaces instead of landing an unsafe resend.
+                    if progress.is_some() || window.is_some() {
+                        store.lock().unwrap().record_reply_checkpoint(
+                            update_id,
+                            progress,
+                            window.map(|window| now_secs().saturating_add(window.as_secs().max(1))),
+                        )?;
                     }
-                    return Err(channel_err(error));
+                    match window {
+                        Some(window) => {
+                            if !wait || !wait_or_stop(window, stop) {
+                                return Err(channel_err(error));
+                            }
+                            continue;
+                        }
+                        None => return Err(channel_err(error)),
+                    }
                 }
             }
         }
     }
     Ok(())
-}
-
-/// Persist the instant before which a recorded reply must not be
-/// attempted again — the durable form of the deferral or retry hint a
-/// delivery attempt escaped with, so a restart honors the wait instead
-/// of reposting a throttled send at once.
-fn record_reply_wait(store: &Mutex<BindingStore>, update_id: i64, window: Duration) {
-    let deadline = now_secs().saturating_add(window.as_secs().max(1));
-    let _ = store.lock().unwrap().record_reply_wait(update_id, deadline);
 }
 
 /// Record a reply the runtime just produced on the admitted task and
@@ -1330,8 +1395,8 @@ fn record_and_deliver<T: BotTransport>(
 
 /// Report one retained reply to the host observer — update id and
 /// stable refusal code only, never reply content.
-fn notify_stuck(on_stuck: &mut Option<OnStuck>, update_id: i64, code: &str) {
-    if let Some(hook) = on_stuck.as_mut() {
+fn notify_stuck(on_stuck: &Mutex<Option<OnStuck>>, update_id: i64, code: &str) {
+    if let Some(hook) = on_stuck.lock().unwrap().as_mut() {
         hook(&StrandedReply {
             update_id,
             code: code.to_owned(),
@@ -2716,6 +2781,7 @@ mod tests {
                         },
                     ],
                     &[],
+                    &[],
                     3,
                 )
                 .unwrap();
@@ -2980,6 +3046,7 @@ mod tests {
                         reply_file: None,
                         reply_retry_at: None,
                     }],
+                    &[],
                     &[],
                     3,
                 )
@@ -4094,6 +4161,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     3,
                 )
                 .unwrap();
@@ -4165,6 +4233,7 @@ mod tests {
                         reply_file: None,
                         reply_retry_at: None,
                     }],
+                    &[],
                     &[],
                     2,
                 )
@@ -4296,6 +4365,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     3,
                 )
                 .unwrap();
@@ -4373,6 +4443,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     3,
                 )
                 .unwrap();
@@ -4447,6 +4518,7 @@ mod tests {
                         reply_file: None,
                         reply_retry_at: None,
                     }],
+                    &[],
                     &[],
                     3,
                 )
@@ -4877,6 +4949,7 @@ mod tests {
                         reply_retry_at: Some(now_secs() + 3_600),
                     }],
                     &[],
+                    &[],
                     4,
                 )
                 .unwrap();
@@ -4930,6 +5003,7 @@ mod tests {
                         reply_file: Some("reply-2.txt".to_owned()),
                         reply_retry_at: None,
                     }],
+                    &[],
                     &[],
                     3,
                 )
@@ -5007,6 +5081,7 @@ mod tests {
                         reply_file: None,
                         reply_retry_at: None,
                     }],
+                    &[],
                     &[],
                     3,
                 )
@@ -5138,6 +5213,7 @@ mod tests {
                         reply_retry_at: None,
                     }],
                     &[],
+                    &[],
                     10,
                 )
                 .unwrap();
@@ -5186,6 +5262,127 @@ mod tests {
             reopened.pending_updates().is_empty(),
             "the delivered command reply's task never settled"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn temporary_store_pressure_waits_for_the_backlog_to_drain() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        a4mc::lane::clear();
+        let root = temp_root();
+        // The first update's record fills most of the bounded document:
+        // while its worker holds it, the second cannot fit. With
+        // `max_poll_failures` at one, counting that temporary pressure
+        // as a permanent refusal would end polling on the spot — the
+        // backlog must drain and the second update must still be
+        // served.
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = RedeliveringTransport {
+            inner: MockBotTransport {
+                sent: Arc::clone(&sent),
+                ..MockBotTransport::default()
+            },
+            batch: vec![
+                Update {
+                    update_id: 1,
+                    message: Some(text_message(42, 42, Some("alice"), &"x".repeat(180_000), 1)),
+                },
+                Update {
+                    update_id: 2,
+                    message: Some(text_message(42, 42, Some("alice"), &"y".repeat(120_000), 2)),
+                },
+            ],
+        };
+        // Send deferrals keep the first worker busy long enough that
+        // the second fetch's admission attempt lands inside the
+        // pressure window.
+        let hooks = Arc::new(KeyRecordingHooks::holding(8, 60));
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            max_poll_failures: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(20));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            3,
+            "temporary pressure stranded the second update"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_live_stranded_reply_is_reported_to_the_host() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        a4mc::lane::clear();
+        let root = temp_root();
+        // A reply recorded during ordinary processing whose delivery
+        // fails strands its task exactly like a record found at
+        // startup: the host is told the update id and the stable
+        // refusal code, and the durable reply with its checkpoint
+        // stays for the restart drain.
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let stranded = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let observed = Arc::clone(&stranded);
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            fail_send_with: Arc::new(Mutex::new(Some(TelegramApiError::new(
+                "a4mc_telegram_api_failed",
+                "sendMessage: Bot API request failed",
+            )))),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 5,
+                message: Some(text_message(42, 42, Some("alice"), "hello there", 5)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            on_stuck: Some(Box::new(move |item: &StrandedReply| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((item.update_id, item.code.clone()));
+            })),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || !stranded.lock().unwrap().is_empty(),
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(
+            *stranded.lock().unwrap(),
+            vec![(5, "a4mc_telegram_api_failed".to_owned())],
+            "the live stranded reply never reached on_stuck"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a failed send was still posted"
+        );
+        let task = BindingStore::open_in(&root)
+            .unwrap()
+            .pending_update(5)
+            .expect("the stranded reply's record was dropped");
+        assert!(task.has_reply(), "the durable reply was discarded");
+        assert_eq!(task.reply_key.as_deref(), Some("reply:5"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

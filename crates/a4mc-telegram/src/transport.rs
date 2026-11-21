@@ -501,38 +501,44 @@ fn https_post(
     }
 }
 
-/// Read one close-delimited response: status line, the headers that
-/// matter (`Retry-After`, `Transfer-Encoding`) and the decoded body,
-/// bounded the whole way.
+/// Read one close-delimited response in two phases: the head —
+/// status line plus the headers that matter (`Retry-After`,
+/// `Transfer-Encoding`) — is parsed as soon as its terminator
+/// arrives, then the body is read and decoded under the same bound.
+/// A throttle answer's classification lives entirely in the head, so
+/// a 429 whose body stalls, truncates or frames incompletely still
+/// returns as a throttle with its `Retry-After` instead of degrading
+/// into an ambiguous read failure.
 fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError> {
     let failed =
         || TelegramApiError::new("a4mc_telegram_read_failed", "Bot API response read failed");
-    let cap = MAX_HEAD_BYTES + MAX_RESPONSE_BYTES + 1;
+    let oversized = || {
+        TelegramApiError::new(
+            "a4mc_telegram_response_too_large",
+            "Bot API response exceeded bound",
+        )
+    };
+    // Framing slack on the raw body bound so a chunked answer whose
+    // decoded body just fits the response bound is not refused on
+    // chunk headers alone.
+    let raw_cap = MAX_RESPONSE_BYTES + 64 * 1024;
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8192];
-    loop {
+    let head_end = loop {
+        if let Some(position) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
         match stream.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => return Err(failed()),
             Ok(read) => {
                 raw.extend_from_slice(&chunk[..read]);
-                if raw.len() > cap {
-                    return Err(TelegramApiError::new(
-                        "a4mc_telegram_response_too_large",
-                        "Bot API response exceeded bound",
-                    ));
+                if raw.len() > MAX_HEAD_BYTES {
+                    return Err(failed());
                 }
             }
             Err(_) => return Err(failed()),
         }
-    }
-    let head_end = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 4)
-        .ok_or_else(failed)?;
-    if head_end > MAX_HEAD_BYTES {
-        return Err(failed());
-    }
+    };
     let head = String::from_utf8_lossy(&raw[..head_end]);
     let status = head
         .split_whitespace()
@@ -552,16 +558,44 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
             }
         }
     }
+    // A 429's classification needs no body: any body-read or decode
+    // failure — a stall, a truncated frame, an oversized payload —
+    // degrades the body to absent rather than the status to
+    // ambiguous.
+    let throttled_body_lost = || {
+        (status == 429).then(|| HttpResponse {
+            status,
+            retry_after,
+            body: Vec::new(),
+        })
+    };
+    let mut body_raw = raw.split_off(head_end);
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                body_raw.extend_from_slice(&chunk[..read]);
+                if body_raw.len() > raw_cap {
+                    return throttled_body_lost().map_or_else(|| Err(oversized()), Ok);
+                }
+            }
+            Err(_) => {
+                return throttled_body_lost().map_or_else(|| Err(failed()), Ok);
+            }
+        }
+    }
     let body = if chunked {
-        decode_chunked(&raw[head_end..]).ok_or_else(failed)?
+        match decode_chunked(&body_raw) {
+            Some(body) => body,
+            None => {
+                return throttled_body_lost().map_or_else(|| Err(failed()), Ok);
+            }
+        }
     } else {
-        raw[head_end..].to_vec()
+        body_raw
     };
     if body.len() > MAX_RESPONSE_BYTES {
-        return Err(TelegramApiError::new(
-            "a4mc_telegram_response_too_large",
-            "Bot API response exceeded bound",
-        ));
+        return throttled_body_lost().map_or_else(|| Err(oversized()), Ok);
     }
     Ok(HttpResponse {
         status,
@@ -592,6 +626,9 @@ fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
         body.extend_from_slice(&rest[..size]);
+        if body.len() > MAX_RESPONSE_BYTES {
+            return None;
+        }
         rest = &rest[size..];
         if !rest.starts_with(b"\r\n") {
             return None;
@@ -1480,5 +1517,30 @@ mod tests {
         let progress = error.send_progress.expect("no checkpoint reported");
         assert!(!progress.outcome_unknown);
         assert_eq!(progress.next_part, 0);
+    }
+
+    #[test]
+    fn throttled_status_with_an_incomplete_body_keeps_the_head_classification() {
+        // Valid 429 headers arrive, then the chunk framing dies mid
+        // body: the body is optional to the classification, never the
+        // other way around.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request_body(&mut stream).expect("complete request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 X\r\nContent-Type: application/json\r\nRetry-After: 6\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhel",
+                )
+                .unwrap();
+            // Close with the chunk half-sent: framing never completes.
+        });
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let error = transport.get_updates(0, 1).unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_throttled");
+        assert_eq!(error.retry_after, Some(6));
     }
 }
