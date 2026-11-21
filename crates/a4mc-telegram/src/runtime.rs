@@ -17,7 +17,7 @@ use super::bridge::{
 };
 use super::channel::TelegramChannel;
 use super::transport::{BotIdentity, BotTransport, InboundMessage, SendProgress, bot_commands};
-use crate::binding::{BindingStore, ChatBinding, DroppedUpdate, StrandedReply};
+use crate::binding::{BindingStore, ChatBinding, DroppedUpdate, StrandedReply, TaskKey};
 use crate::control::{
     ControlCommand, ControlOutcome, commands_text, help_text, parse_control_command,
 };
@@ -106,13 +106,19 @@ impl Default for RuntimeConfig {
 }
 
 /// One unit of scheduler work: a fetched message to process, or a
-/// durably-recorded reply owed a resend after restart. Both travel the
-/// per-chat FIFO so a resend keeps its chat's order — it delivers
-/// ahead of newer work for its own chat and never delays another's —
-/// while its deadline and policy waits run on a worker, off the
-/// startup path.
+/// durably-recorded reply owed a resend after restart. Both travel
+/// the one bounded admission path in the order their records admit —
+/// a resend keeps its chat's FIFO position relative to everything
+/// older, it can never run ahead of an older message for the same
+/// chat, and its deadline and policy waits occupy only its own chat
+/// lane and one admission slot.
 enum Scheduled {
-    Message(Box<InboundMessage>),
+    /// A polled or recovered message — `key` is the sequence-scoped
+    /// claim its durable record committed under.
+    Message {
+        key: TaskKey,
+        message: Box<InboundMessage>,
+    },
     /// A recorded reply restart recovery re-queues: the worker waits
     /// its persisted deadline, resumes at the checkpoint and settles
     /// the record on delivery.
@@ -232,7 +238,7 @@ impl Scheduler {
     fn enqueue(&self, job: Scheduled) {
         let mut state = self.state.lock().unwrap();
         let chat_id = match &job {
-            Scheduled::Message(message) => message.chat_id,
+            Scheduled::Message { message, .. } => message.chat_id,
             Scheduled::Resend { task, .. } => task.message.chat_id,
         };
         state.per_chat.entry(chat_id).or_default().push_back(job);
@@ -390,12 +396,16 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 .unwrap_or(Duration::ZERO),
         ),
         offset: 0,
+        sequence_expired: false,
     };
     cursor.offset = if cursor.sequence_age.elapsed() >= config.poll_sequence_idle {
-        // The settled-id tail belongs to the dead sequence: a
-        // restarted one may lawfully reuse its ids, so it is retired
-        // before the new sequence's first poll.
-        store.retire_settled()?;
+        // The confirmed id sequence is dead: claims minted under it —
+        // settled ids and pending-event markers — retire in one write,
+        // while outstanding tasks and staged records keep their
+        // dead-sequence keys so a restarted numbering's reused ids can
+        // never collide with them.
+        store.expire_sequence()?;
+        cursor.sequence_expired = true;
         0
     } else {
         store.poll_offset()
@@ -440,7 +450,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 let task = processor_store
                     .lock()
                     .unwrap()
-                    .pending_update(task.update_id)
+                    .pending_update(task.key())
                     .unwrap_or(*task);
                 // One clock reading decides both whether a wait is owed
                 // and how long it lasts — a second read between them can
@@ -453,34 +463,31 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 {
                     return Ok(());
                 }
-                let key = task
+                let delivery_key = task
                     .reply_key
                     .clone()
-                    .unwrap_or_else(|| reply_key(task.update_id, "reply"));
+                    .unwrap_or_else(|| reply_key(task.key(), "reply"));
                 match deliver_recorded_reply(
                     &processor_channel,
                     &processor_store,
                     task.message.chat_id,
                     task.message.message_id,
-                    task.update_id,
-                    &key,
+                    task.key(),
+                    &delivery_key,
                     &reply,
                     task.reply_sent,
                     task.reply_progress.clone(),
                     true,
                     &processor_stop,
                 ) {
-                    Ok(()) => processor_store
-                        .lock()
-                        .unwrap()
-                        .complete_update(task.update_id),
+                    Ok(()) => processor_store.lock().unwrap().complete_update(task.key()),
                     Err(error) if is_interrupted_send_wait(&error) => Ok(()),
                     // A delivery failure keeps its record — and the
                     // checkpoint it earned — for the next restart's
                     // resend; the host is told. A persistence failure
                     // is routed to the supervising loop.
                     Err(error) => {
-                        notify_stuck(&processor_stuck, task.update_id, &failure_code(&error));
+                        notify_stuck(&processor_stuck, task.key(), &failure_code(&error));
                         if is_store_write_failure(&error) {
                             Err(error)
                         } else {
@@ -489,27 +496,54 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                     }
                 }
             }
-            Scheduled::Message(message) => {
-                let update_id = message.update_id;
+            Scheduled::Message { key, message } => {
                 match handle_inbound(
                     &processor_channel,
                     &processor_store,
                     &processor_identity,
+                    key,
                     &message,
                     turn_deadline,
                     &processor_stop,
                 ) {
-                    Ok(()) => processor_store.lock().unwrap().complete_update(update_id),
+                    Ok(()) => processor_store.lock().unwrap().complete_update(key),
                     // A reply the host's send policy was still holding when
                     // shutdown cut the wait short is not a handler failure: no
                     // error reply goes out around the policy, and the
                     // unfinished task record stays for the restart drain.
                     Err(error) if is_interrupted_send_wait(&error) => Ok(()),
+                    // A persistence failure is not a turn failure: the
+                    // fallback path must never write over it — a
+                    // settlement write that lands after a reply-record
+                    // failure would settle work whose result was never
+                    // recorded, and the supervisor would never see the
+                    // original error. The task stays claimed for
+                    // recovery either way; only a failure that left
+                    // nothing durable reaches the caller, while a
+                    // completion retained staged — one whose document
+                    // could not take it — keeps the established
+                    // nonfatal report-and-continue contract.
+                    Err(error) if is_persistence_failure(&error) => {
+                        let retained = {
+                            let store = processor_store.lock().unwrap();
+                            store
+                                .pending_update(key)
+                                .is_some_and(|task| task.has_reply())
+                                || store.staged_reply_pending(key)
+                        };
+                        if retained {
+                            notify_stuck(&processor_stuck, key, &failure_code(&error));
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    }
                     Err(error) => handle_failed_inbound(
                         &processor_channel,
                         &processor_store,
                         &processor_stuck,
                         chat_id,
+                        key,
                         &message,
                         &error,
                         &processor_stop,
@@ -519,10 +553,10 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         }
     };
 
-    let mut pending: VecDeque<InboundMessage> = VecDeque::new();
+    let mut pending: VecDeque<Scheduled> = VecDeque::new();
     // Bind staged completions first: a reply whose payload, key and
     // effect were staged but whose document pointer never committed is
-    // recovered by update id here instead of re-running its work —
+    // recovered by its claim key here instead of re-running its work —
     // delivery key and session change come back with it. Whatever
     // could not bind is surfaced to the host while its record stays:
     // it is never silently parked and never re-dispatched.
@@ -534,17 +568,25 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         Err(_) => store
             .lock()
             .unwrap()
-            .staged_update_ids()
+            .staged_update_keys()
             .into_iter()
-            .map(|update_id| StrandedReply {
-                update_id,
+            .map(|key| StrandedReply {
+                update_id: key.update_id,
+                sequence: key.sequence,
                 code: "a4mc_telegram_state_full".to_owned(),
             })
             .collect(),
     };
-    let staged: HashSet<i64> = stranded.iter().map(|item| item.update_id).collect();
+    let staged: HashSet<TaskKey> = stranded
+        .iter()
+        .map(|item| TaskKey::new(item.sequence, item.update_id))
+        .collect();
     for item in &stranded {
-        notify_stuck(&on_stuck, item.update_id, &item.code);
+        notify_stuck(
+            &on_stuck,
+            TaskKey::new(item.sequence, item.update_id),
+            &item.code,
+        );
     }
     // Events the cursor confirmed past but whose callbacks never ran —
     // the lowered event cannot be replayed, so each becomes its
@@ -552,20 +594,19 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     // at or above the cursor is still refetchable and stays for the
     // redelivered callback.
     store.lock().unwrap().settle_unconsumed_events()?;
-    // Resume admitted-but-unfinished work before polling: finished turns
-    // only need their recorded reply delivered; unstarted messages are
-    // re-queued whole. Records survive only while their stage is
-    // unfinished, so nothing paid or already confirmed runs twice. The
-    // binding's session is already committed — a turn's session change
-    // lands in the same store write as its reply record — so recovery
-    // only re-delivers; it never re-applies a superseded routing
-    // change. A recorded reply owed a resend is queued as scheduler
-    // work itself — its deadline and policy waits run on a worker, so
-    // a reply the host keeps deferring holds only its own chat's FIFO
-    // and one admission slot, never all of ingress.
+    // Resume admitted-but-unfinished work before polling — on the same
+    // bounded admission path polled messages take: recovered replies
+    // and unstarted messages enter the backlog in record order, so
+    // recovery cannot exceed the admission bound, cannot leapfrog an
+    // older record for the same chat, and a held reply occupies only
+    // its own chat lane once a worker takes it. Records survive only
+    // while their stage is unfinished, so nothing paid or already
+    // confirmed runs twice; the binding's routing is already committed
+    // — recovery only re-delivers, it never re-applies a superseded
+    // change.
     let unfinished = store.lock().unwrap().pending_updates();
     for task in unfinished {
-        if staged.contains(&task.update_id) {
+        if staged.contains(&task.key()) {
             continue;
         }
         // A finished reply may be spilled to its sidecar file; resolve
@@ -574,21 +615,19 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         // allowed — and the host is told it is stuck rather than the
         // record being parked silently; one with none re-queues its
         // message whole.
-        let reply = match store.lock().unwrap().reply_text(&task) {
-            Ok(Some(reply)) => reply,
-            Ok(None) => {
-                pending.push_back(task.message.clone());
-                continue;
-            }
+        match store.lock().unwrap().reply_text(&task) {
+            Ok(Some(reply)) => pending.push_back(Scheduled::Resend {
+                task: Box::new(task),
+                reply,
+            }),
+            Ok(None) => pending.push_back(Scheduled::Message {
+                key: task.key(),
+                message: Box::new(task.message.clone()),
+            }),
             Err(error) => {
-                notify_stuck(&on_stuck, task.update_id, &failure_code(&error));
-                continue;
+                notify_stuck(&on_stuck, task.key(), &failure_code(&error));
             }
-        };
-        scheduler.enqueue(Scheduled::Resend {
-            task: Box::new(task),
-            reply,
-        });
+        }
     }
     // Workers spawn only after every recovery write has run: a
     // recovery failure that returns early can never strand spawned
@@ -632,26 +671,27 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
 /// and every failed write surfaces with the stranded reply still
 /// reported to the host first, instead of the error being dropped on
 /// the way out.
+#[allow(clippy::too_many_arguments)]
 fn handle_failed_inbound<T: BotTransport>(
     channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
     on_stuck: &Mutex<Option<OnStuck>>,
     chat_id: i64,
+    key: TaskKey,
     message: &InboundMessage,
     error: &anyhow::Error,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let update_id = message.update_id;
-    let key = reply_key(update_id, "error");
+    let delivery_key = reply_key(key, "error");
     let text = sanitize_error(error);
     let recorded = store
         .lock()
         .unwrap()
-        .record_fallback_reply(update_id, &text, &key);
+        .record_fallback_reply(key, &text, &delivery_key);
     let recorded = match recorded {
         Ok(recorded) => recorded,
         Err(write) => {
-            report_stranded(store, on_stuck, update_id, &failure_code(&write));
+            report_stranded(store, on_stuck, key, &failure_code(&write));
             return Err(write);
         }
     };
@@ -661,8 +701,8 @@ fn handle_failed_inbound<T: BotTransport>(
             store,
             chat_id,
             message.message_id,
-            update_id,
-            &key,
+            key,
+            &delivery_key,
             &text,
             0,
             None,
@@ -675,33 +715,45 @@ fn handle_failed_inbound<T: BotTransport>(
         // either.
         deliver_sends(
             channel,
-            &reply_sends(chat_id, message.message_id, &key, &text),
+            &reply_sends(chat_id, message.message_id, &delivery_key, &text),
             stop,
         )
         .map_err(channel_err)
+    };
+    // A persistence failure inside delivery — a progress or checkpoint
+    // write that could not land — is not a refused send to settle
+    // over: the record stays for recovery and the error reaches the
+    // supervising loop, rather than being masked by a later
+    // settlement write that happened to succeed.
+    let delivery = match delivery {
+        Err(delivery_error) if is_store_write_failure(&delivery_error) => {
+            report_stranded(store, on_stuck, key, &failure_code(&delivery_error));
+            return Err(delivery_error);
+        }
+        other => other,
     };
     // A fallback that was both recorded and delivered ends the task
     // outright; anything else — an undelivered report, or a finished
     // agent reply still owed — keeps its record for the restart
     // drain.
     if recorded && delivery.is_ok() {
-        let settled = store.lock().unwrap().complete_update(update_id);
+        let settled = store.lock().unwrap().complete_update(key);
         if let Err(write) = settled {
-            report_stranded(store, on_stuck, update_id, &failure_code(&write));
+            report_stranded(store, on_stuck, key, &failure_code(&write));
             return Err(write);
         }
         return Ok(());
     }
-    let settled = store.lock().unwrap().settle_failed_update(update_id);
+    let settled = store.lock().unwrap().settle_failed_update(key);
     if let Err(write) = settled {
-        report_stranded(store, on_stuck, update_id, &failure_code(&write));
+        report_stranded(store, on_stuck, key, &failure_code(&write));
         return Err(write);
     }
     let code = match &delivery {
         Err(delivery_error) if recorded => failure_code(delivery_error),
         _ => failure_code(error),
     };
-    report_stranded(store, on_stuck, update_id, &code);
+    report_stranded(store, on_stuck, key, &code);
     Ok(())
 }
 
@@ -712,18 +764,18 @@ fn handle_failed_inbound<T: BotTransport>(
 fn report_stranded(
     store: &Mutex<BindingStore>,
     on_stuck: &Mutex<Option<OnStuck>>,
-    update_id: i64,
+    key: TaskKey,
     code: &str,
 ) {
     let stranded = {
         let store = store.lock().unwrap();
         store
-            .pending_update(update_id)
+            .pending_update(key)
             .is_some_and(|task| task.has_reply())
-            || store.staged_reply_pending(update_id)
+            || store.staged_reply_pending(key)
     };
     if stranded {
-        notify_stuck(on_stuck, update_id, code);
+        notify_stuck(on_stuck, key, code);
     }
 }
 
@@ -778,10 +830,14 @@ impl SequenceAge {
 /// The polling cursor plus the freshness of the id sequence it
 /// confirms: silent past [`RuntimeConfig::poll_sequence_idle`], the
 /// stale high-water mark is dropped so a restarted sequence's lower
-/// first ids are seen.
+/// first ids are seen. The drop happens at most once per run: after
+/// the resync, the cursor this process advanced is the live mark —
+/// expiring again would roll a confirmed offset back to zero and
+/// re-expose dead-sequence ids for re-admission.
 struct PollCursor {
     offset: i64,
     sequence_age: SequenceAge,
+    sequence_expired: bool,
 }
 
 fn poll_updates<T: BotTransport>(
@@ -790,7 +846,7 @@ fn poll_updates<T: BotTransport>(
     store: &Mutex<BindingStore>,
     config: &RuntimeConfig,
     cursor: &mut PollCursor,
-    pending: &mut VecDeque<InboundMessage>,
+    pending: &mut VecDeque<Scheduled>,
     on_event: &mut Option<OnEvent>,
 ) -> Result<()> {
     let mut consecutive_failures = 0u32;
@@ -809,14 +865,23 @@ fn poll_updates<T: BotTransport>(
             // redeliver updates the platform still holds unconfirmed,
             // while passing the stale offset would acknowledge the new
             // sequence's lower first ids unseen.
-            if cursor.sequence_age.elapsed() >= config.poll_sequence_idle {
-                // The settled-id tail belongs to the dead sequence and
-                // is retired with it — a restarted one may lawfully
-                // reuse those ids, and keeping the tail would suppress
-                // fresh work as already-settled.
-                store.lock().unwrap().retire_settled()?;
+            if !cursor.sequence_expired
+                && cursor.offset != 0
+                && cursor.sequence_age.elapsed() >= config.poll_sequence_idle
+            {
+                // The confirmed id sequence is dead and retires in one
+                // write: the settled tail and pending-event markers
+                // belong to it, and a restarted numbering may lawfully
+                // reuse those ids — while dead-sequence tasks and staged
+                // records keep their keys so the reused ids can never
+                // collide with retained work. Fires once per run: an
+                // offset this process already resynced is the live mark,
+                // not a stale one, and re-expiring would renumber the
+                // live sequence and re-admit its retained ids.
+                store.lock().unwrap().expire_sequence()?;
                 cursor.offset = 0;
                 cursor.sequence_age.reset();
+                cursor.sequence_expired = true;
             }
             let updates = match transport.get_updates(cursor.offset, config.poll_timeout_secs) {
                 Ok(updates) => {
@@ -843,12 +908,17 @@ fn poll_updates<T: BotTransport>(
                     continue;
                 }
             };
-            // Update ids the store already durably claimed — admitted
-            // and still pending, or settled — must never re-enter the
-            // scheduler: a cursor rolled back for a rejected event
-            // refetches them, and re-running confirmed work would pay
-            // for the same turn twice.
-            let claimed = store.lock().unwrap().claimed_update_ids();
+            // Update ids the store already durably claimed in the live
+            // sequence — admitted and still pending, or settled — must
+            // never re-enter the scheduler: a cursor rolled back for a
+            // rejected event refetches them, and re-running confirmed
+            // work would pay for the same turn twice. Dead-sequence
+            // records claim nothing here: a restarted numbering's
+            // reused ids admit fresh work under the live sequence.
+            let (claimed, sequence) = {
+                let store = store.lock().unwrap();
+                (store.claimed_update_ids(), store.poll_sequence())
+            };
             let mut records = Vec::with_capacity(updates.len());
             let mut next_offset = cursor.offset;
             for update in &updates {
@@ -874,13 +944,14 @@ fn poll_updates<T: BotTransport>(
                     Some(raw_kind) => {
                         if on_event.is_some() {
                             records.push(BatchRecord::Event {
-                                update_id: update.update_id,
+                                key: TaskKey::new(sequence, update.update_id),
                                 raw_kind,
                                 event: Box::new(crate::lower::lower_event(update)),
                             });
                         } else {
                             records.push(BatchRecord::Dropped(DroppedUpdate {
                                 update_id: update.update_id,
+                                sequence,
                                 raw_kind: raw_kind.to_owned(),
                             }));
                         }
@@ -897,10 +968,14 @@ fn poll_updates<T: BotTransport>(
                             }
                             // Admit the task BEFORE the cursor confirms
                             // it: a crash after confirmation must find
-                            // the work record, not a silent skip.
+                            // the work record, not a silent skip. The
+                            // record claims its id under the live
+                            // sequence — a dead sequence's retained
+                            // record can never mask it.
                             records.push(BatchRecord::Task(Box::new(
                                 crate::binding::PendingUpdate {
                                     update_id: update.update_id,
+                                    sequence,
                                     message,
                                     reply: None,
                                     reply_key: None,
@@ -908,6 +983,7 @@ fn poll_updates<T: BotTransport>(
                                     reply_progress: None,
                                     reply_file: None,
                                     reply_retry_at_ms: None,
+                                    reply_refused: false,
                                 },
                             )));
                         } else {
@@ -993,7 +1069,10 @@ fn poll_updates<T: BotTransport>(
                     records[..committed]
                         .iter()
                         .filter_map(|record| match record {
-                            BatchRecord::Task(task) => Some(task.message.clone()),
+                            BatchRecord::Task(task) => Some(Scheduled::Message {
+                                key: task.key(),
+                                message: Box::new(task.message.clone()),
+                            }),
                             _ => None,
                         }),
                 );
@@ -1013,10 +1092,7 @@ fn poll_updates<T: BotTransport>(
                 // refetch names is reclaimed by record — settled and
                 // still-pending ids are skipped, never re-run.
                 for (index, record) in records[..committed].iter().enumerate() {
-                    let BatchRecord::Event {
-                        update_id, event, ..
-                    } = record
-                    else {
+                    let BatchRecord::Event { key, event, .. } = record else {
                         continue;
                     };
                     let Some(hook) = on_event.as_mut() else {
@@ -1028,14 +1104,14 @@ fn poll_updates<T: BotTransport>(
                                 .iter()
                                 .skip(index + 1)
                                 .find_map(|record| match record {
-                                    BatchRecord::Event { update_id, .. } => Some(*update_id),
+                                    BatchRecord::Event { key, .. } => Some(key.update_id),
                                     _ => None,
                                 })
                                 .unwrap_or(batch_offset);
                             store
                                 .lock()
                                 .unwrap()
-                                .settle_event_at_cursor(*update_id, boundary)?;
+                                .settle_event_at_cursor(*key, boundary)?;
                         }
                         Err(error) => {
                             return Err(anyhow!("a4mc_telegram_unhandled_event: {error}"));
@@ -1066,7 +1142,7 @@ enum BatchRecord {
     /// pending-event record with the cursor, then settled consumed or
     /// dropped by the callback's outcome.
     Event {
-        update_id: i64,
+        key: TaskKey,
         raw_kind: &'static str,
         event: Box<a4mc::ChannelEvent>,
     },
@@ -1099,12 +1175,9 @@ fn admit_batch(store: &Mutex<BindingStore>, records: &[BatchRecord], offset: i64
         match record {
             BatchRecord::Task(task) => tasks.push(task.as_ref().clone()),
             BatchRecord::Dropped(item) => dropped.push(item.clone()),
-            BatchRecord::Event {
-                update_id,
-                raw_kind,
-                ..
-            } => events.push(DroppedUpdate {
-                update_id: *update_id,
+            BatchRecord::Event { key, raw_kind, .. } => events.push(DroppedUpdate {
+                update_id: key.update_id,
+                sequence: key.sequence,
                 raw_kind: (*raw_kind).to_owned(),
             }),
             BatchRecord::Skip => {}
@@ -1208,19 +1281,19 @@ fn wait_or_stop(duration: Duration, stop: &AtomicBool) -> bool {
     !stop.load(Ordering::SeqCst)
 }
 
-fn admit_available(scheduler: &Scheduler, pending: &mut VecDeque<InboundMessage>) {
+fn admit_available(scheduler: &Scheduler, pending: &mut VecDeque<Scheduled>) {
     loop {
         if scheduler.admitted() >= scheduler.max_admitted {
             break;
         }
-        let Some(message) = pending.pop_front() else {
+        let Some(job) = pending.pop_front() else {
             break;
         };
-        scheduler.enqueue(Scheduled::Message(Box::new(message)));
+        scheduler.enqueue(job);
     }
 }
 
-fn drain_pending(scheduler: &Scheduler, pending: &mut VecDeque<InboundMessage>) {
+fn drain_pending(scheduler: &Scheduler, pending: &mut VecDeque<Scheduled>) {
     while !pending.is_empty() {
         scheduler.wait_for_drain();
         admit_available(scheduler, pending);
@@ -1231,6 +1304,7 @@ fn handle_inbound<T: BotTransport>(
     channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
     identity: &BotIdentity,
+    key: TaskKey,
     message: &InboundMessage,
     turn_deadline: Duration,
     stop: &AtomicBool,
@@ -1241,14 +1315,14 @@ fn handle_inbound<T: BotTransport>(
     }
     match parse_control_command(&message.control_text()) {
         ControlOutcome::Command(command) => {
-            handle_command(channel, store, identity, message, command, stop)
+            handle_command(channel, store, identity, key, message, command, stop)
         }
         ControlOutcome::OrdinaryText(_) => {
             let body = message.agent_text();
             if body.trim().is_empty() {
                 return Ok(());
             }
-            handle_ordinary(channel, store, message, &body, turn_deadline, stop)
+            handle_ordinary(channel, store, key, message, &body, turn_deadline, stop)
         }
     }
 }
@@ -1257,9 +1331,16 @@ fn handle_inbound<T: BotTransport>(
 /// distinguishes the reply produced by handling the update (`reply`)
 /// from the fallback error report for the same update (`error`), so a
 /// recorded agent reply can never be shadowed by an observed error
-/// receipt under the same dedupe key.
-fn reply_key(update_id: i64, purpose: &str) -> String {
-    format!("{purpose}:{update_id}")
+/// receipt under the same dedupe key. The claim's sequence names the
+/// key: a restarted id sequence can never mint a key that collides
+/// with a dead sequence's retained delivery. Sequence `0` keeps the
+/// revision-one key shape so records staged before the field existed
+/// still resume under the key they wrote.
+fn reply_key(key: TaskKey, purpose: &str) -> String {
+    match key.sequence {
+        0 => format!("{purpose}:{}", key.update_id),
+        sequence => format!("{purpose}:{sequence}:{}", key.update_id),
+    }
 }
 
 /// One runtime reply as contract-valid sends. Text inside the
@@ -1360,6 +1441,18 @@ fn is_store_write_failure(error: &anyhow::Error) -> bool {
     )
 }
 
+/// Whether a live-path failure is a persistence failure the
+/// supervising loop must see: the store refused or could not durably
+/// record — the task stays claimed for recovery instead of being
+/// settled over by the fallback path. A reply refused for its size is
+/// the turn's own outcome — the record was never writable — so it
+/// keeps the ordinary failure path rather than reporting a dead store.
+fn is_persistence_failure(error: &anyhow::Error) -> bool {
+    is_store_write_failure(error)
+        && error.to_string().split(':').next().map(str::trim)
+            != Some("a4mc_telegram_reply_too_large")
+}
+
 /// Whether a failed send is safe to retry from its checkpoint: the
 /// platform either never saw the request — a pre-connect failure — or
 /// definitively rejected it and said when to come back (429). An
@@ -1443,15 +1536,15 @@ fn deliver_recorded_reply<T: BotTransport>(
     store: &Mutex<BindingStore>,
     chat_id: i64,
     reply_to_message_id: i64,
-    update_id: i64,
-    key: &str,
+    key: TaskKey,
+    delivery_key: &str,
     reply: &str,
     sent: usize,
     progress: Option<SendProgress>,
     wait: bool,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let parts = reply_sends(chat_id, reply_to_message_id, key, reply);
+    let parts = reply_sends(chat_id, reply_to_message_id, delivery_key, reply);
     if sent >= parts.len() {
         return Ok(());
     }
@@ -1463,7 +1556,7 @@ fn deliver_recorded_reply<T: BotTransport>(
                 store
                     .lock()
                     .unwrap()
-                    .record_reply_progress(update_id, index, Some(checkpoint.clone()))
+                    .record_reply_progress(key, index, Some(checkpoint.clone()))
                     .map_err(|_| {
                         crate::transport::TelegramApiError::new(
                             "a4mc_telegram_checkpoint_failed",
@@ -1477,7 +1570,7 @@ fn deliver_recorded_reply<T: BotTransport>(
                     store
                         .lock()
                         .unwrap()
-                        .record_reply_progress(update_id, index + 1, None)?;
+                        .record_reply_progress(key, index + 1, None)?;
                     break;
                 }
                 Err(tracked) => {
@@ -1518,7 +1611,7 @@ fn deliver_recorded_reply<T: BotTransport>(
                     // surfaces instead of landing an unsafe resend.
                     if progress.is_some() || window.is_some() {
                         store.lock().unwrap().record_reply_checkpoint(
-                            update_id,
+                            key,
                             progress,
                             window.map(|window| {
                                 now_millis().saturating_add(
@@ -1551,22 +1644,23 @@ fn deliver_recorded_reply<T: BotTransport>(
 fn record_and_deliver<T: BotTransport>(
     channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
+    key: TaskKey,
     message: &InboundMessage,
     text: &str,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let key = reply_key(message.update_id, "reply");
+    let delivery_key = reply_key(key, "reply");
     store
         .lock()
         .unwrap()
-        .record_reply(message.update_id, text, &key)?;
+        .record_reply(key, text, &delivery_key)?;
     deliver_recorded_reply(
         channel,
         store,
         message.chat_id,
         message.message_id,
-        message.update_id,
-        &key,
+        key,
+        &delivery_key,
         text,
         0,
         None,
@@ -1575,12 +1669,14 @@ fn record_and_deliver<T: BotTransport>(
     )
 }
 
-/// Report one retained reply to the host observer — update id and
-/// stable refusal code only, never reply content.
-fn notify_stuck(on_stuck: &Mutex<Option<OnStuck>>, update_id: i64, code: &str) {
+/// Report one retained reply to the host observer — the claim's
+/// update id and sequence plus the stable refusal code, never reply
+/// content.
+fn notify_stuck(on_stuck: &Mutex<Option<OnStuck>>, key: TaskKey, code: &str) {
     if let Some(hook) = on_stuck.lock().unwrap().as_mut() {
         hook(&StrandedReply {
-            update_id,
+            update_id: key.update_id,
+            sequence: key.sequence,
             code: code.to_owned(),
         });
     }
@@ -1590,6 +1686,7 @@ fn handle_command<T: BotTransport>(
     channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
     identity: &BotIdentity,
+    key: TaskKey,
     message: &InboundMessage,
     command: ControlCommand,
     stop: &AtomicBool,
@@ -1599,19 +1696,20 @@ fn handle_command<T: BotTransport>(
             record_and_deliver(
                 channel,
                 store,
+                key,
                 message,
                 &help_text(&identity.username),
                 stop,
             )?;
         }
         ControlCommand::Commands => {
-            record_and_deliver(channel, store, message, &commands_text(), stop)?;
+            record_and_deliver(channel, store, key, message, &commands_text(), stop)?;
         }
         ControlCommand::Start | ControlCommand::Pair => {
-            handle_pair_request(channel, store, identity, message, stop)?;
+            handle_pair_request(channel, store, identity, key, message, stop)?;
         }
         ControlCommand::Whoami => {
-            record_and_deliver(channel, store, message, &whoami_text(message), stop)?;
+            record_and_deliver(channel, store, key, message, &whoami_text(message), stop)?;
         }
         ControlCommand::Unpair => {
             // The revocation and the confirmation commit in one write —
@@ -1621,8 +1719,8 @@ fn handle_command<T: BotTransport>(
             // re-running the command and answering a second time.
             let text = store.lock().unwrap().record_reply_and_revocation(
                 message.chat_id,
-                message.update_id,
-                &reply_key(message.update_id, "reply"),
+                key,
+                &reply_key(key, "reply"),
                 |revoked| {
                     if revoked {
                         "Pairing revoked for this chat. Send /start to pair again.".to_owned()
@@ -1636,8 +1734,8 @@ fn handle_command<T: BotTransport>(
                 store,
                 message.chat_id,
                 message.message_id,
-                message.update_id,
-                &reply_key(message.update_id, "reply"),
+                key,
+                &reply_key(key, "reply"),
                 &text,
                 0,
                 None,
@@ -1650,6 +1748,7 @@ fn handle_command<T: BotTransport>(
                 record_and_deliver(
                     channel,
                     store,
+                    key,
                     message,
                     "Not paired. Send /start to request a pairing code.",
                     stop,
@@ -1658,6 +1757,7 @@ fn handle_command<T: BotTransport>(
                 record_and_deliver(
                     channel,
                     store,
+                    key,
                     message,
                     &status_text(store, identity, message.chat_id)?,
                     stop,
@@ -1667,12 +1767,25 @@ fn handle_command<T: BotTransport>(
         ControlCommand::Agent { agent_id: None } => {
             require_paired(store, message)?;
             let agents = list_agents().map_err(|error| anyhow!(error.to_string()))?;
-            record_and_deliver(channel, store, message, &format_agent_list(&agents), stop)?;
+            record_and_deliver(
+                channel,
+                store,
+                key,
+                message,
+                &format_agent_list(&agents),
+                stop,
+            )?;
         }
         ControlCommand::Agent {
             agent_id: Some(agent_id),
         } => {
             require_paired(store, message)?;
+            // The authorized binding — revision included — is captured
+            // BEFORE the host call: a rebind the user lands while
+            // `ensure_known_agent` runs must not become this command's
+            // expected revision, or the guarded write would overwrite
+            // the intervening change it was meant to refuse.
+            let expected = store_binding(store, message.chat_id)?;
             ensure_known_agent(&agent_id).map_err(|error| anyhow!(error.to_string()))?;
             // The rebind and its confirmation commit in one write, so
             // recovery only ever resumes delivery — it never re-runs
@@ -1680,12 +1793,11 @@ fn handle_command<T: BotTransport>(
             // confirmation reports what the guarded mutation actually
             // did: a pairing or binding that moved while the command
             // ran gets an honest reply, not a success claim.
-            let expected = store_binding(store, message.chat_id)?;
             let confirmation = store.lock().unwrap().record_reply_and_agent(
                 message.chat_id,
-                message.update_id,
+                key,
                 agent_id.clone(),
-                &reply_key(message.update_id, "reply"),
+                &reply_key(key, "reply"),
                 message.user_id,
                 expected.as_ref(),
                 |applied| {
@@ -1704,8 +1816,8 @@ fn handle_command<T: BotTransport>(
                 store,
                 message.chat_id,
                 message.message_id,
-                message.update_id,
-                &reply_key(message.update_id, "reply"),
+                key,
+                &reply_key(key, "reply"),
                 &confirmation,
                 0,
                 None,
@@ -1721,6 +1833,7 @@ fn handle_command<T: BotTransport>(
             record_and_deliver(
                 channel,
                 store,
+                key,
                 message,
                 &format_session_list(&sessions),
                 stop,
@@ -1752,7 +1865,7 @@ fn handle_command<T: BotTransport>(
             let confirmation = store_record_reply_and_session(
                 store,
                 message.chat_id,
-                message.update_id,
+                key,
                 Some(session_id.clone()),
                 &binding,
                 |applied| {
@@ -1769,8 +1882,8 @@ fn handle_command<T: BotTransport>(
                 store,
                 message.chat_id,
                 message.message_id,
-                message.update_id,
-                &reply_key(message.update_id, "reply"),
+                key,
+                &reply_key(key, "reply"),
                 &confirmation,
                 0,
                 None,
@@ -1808,7 +1921,7 @@ fn handle_command<T: BotTransport>(
             let confirmation = store_record_reply_and_session(
                 store,
                 message.chat_id,
-                message.update_id,
+                key,
                 session_id,
                 &binding,
                 |applied| {
@@ -1825,8 +1938,8 @@ fn handle_command<T: BotTransport>(
                 store,
                 message.chat_id,
                 message.message_id,
-                message.update_id,
-                &reply_key(message.update_id, "reply"),
+                key,
+                &reply_key(key, "reply"),
                 &confirmation,
                 0,
                 None,
@@ -1838,6 +1951,7 @@ fn handle_command<T: BotTransport>(
             record_and_deliver(
                 channel,
                 store,
+                key,
                 message,
                 "This channel processes one turn at a time. There is no separate in-flight interrupt yet; wait for the current reply, or use /new for a fresh conversation.",
                 stop,
@@ -1847,6 +1961,7 @@ fn handle_command<T: BotTransport>(
             record_and_deliver(
                 channel,
                 store,
+                key,
                 message,
                 &format!("Unknown command /{name}. Use /commands for the catalog."),
                 stop,
@@ -1860,6 +1975,7 @@ fn handle_pair_request<T: BotTransport>(
     channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
     identity: &BotIdentity,
+    key: TaskKey,
     message: &InboundMessage,
     stop: &AtomicBool,
 ) -> Result<()> {
@@ -1867,6 +1983,7 @@ fn handle_pair_request<T: BotTransport>(
         record_and_deliver(
             channel,
             store,
+            key,
             message,
             &format!(
                 "Already paired.\n{}",
@@ -1879,13 +1996,13 @@ fn handle_pair_request<T: BotTransport>(
     // The pairing record and the reply carrying its code commit in one
     // write: a restart never re-mints a second code for a confirmation
     // the platform already accepted.
-    let key = reply_key(message.update_id, "reply");
+    let delivery_key = reply_key(key, "reply");
     let text = store.lock().unwrap().record_pairing_and_reply(
         message.chat_id,
         message.user_id,
         message.username.clone(),
-        message.update_id,
-        &key,
+        key,
+        &delivery_key,
         |record| pairing_code_text(&record.code),
     )?;
     deliver_recorded_reply(
@@ -1893,8 +2010,8 @@ fn handle_pair_request<T: BotTransport>(
         store,
         message.chat_id,
         message.message_id,
-        message.update_id,
-        &key,
+        key,
+        &delivery_key,
         &text,
         0,
         None,
@@ -1907,6 +2024,7 @@ fn handle_pair_request<T: BotTransport>(
 fn handle_ordinary<T: BotTransport>(
     channel: &TelegramChannel<T>,
     store: &Mutex<BindingStore>,
+    key: TaskKey,
     message: &InboundMessage,
     text: &str,
     turn_deadline: Duration,
@@ -1919,13 +2037,13 @@ fn handle_ordinary<T: BotTransport>(
         // The pairing record and the reply carrying its code commit in
         // one write — recovery resumes this delivery instead of
         // minting a second code.
-        let key = reply_key(message.update_id, "reply");
+        let delivery_key = reply_key(key, "reply");
         let text = store.lock().unwrap().record_pairing_and_reply(
             message.chat_id,
             message.user_id,
             message.username.clone(),
-            message.update_id,
-            &key,
+            key,
+            &delivery_key,
             |record| format!("Pairing required.\n{}", pairing_code_text(&record.code)),
         )?;
         deliver_recorded_reply(
@@ -1933,8 +2051,8 @@ fn handle_ordinary<T: BotTransport>(
             store,
             message.chat_id,
             message.message_id,
-            message.update_id,
-            &key,
+            key,
+            &delivery_key,
             &text,
             0,
             None,
@@ -1947,6 +2065,7 @@ fn handle_ordinary<T: BotTransport>(
         record_and_deliver(
             channel,
             store,
+            key,
             message,
             "No agent bound. Use /agent to list agents, then /agent <id>.",
             stop,
@@ -1970,18 +2089,17 @@ fn handle_ordinary<T: BotTransport>(
     // the turn keeps its newer routing, and the reply record
     // regardless.
     if next_session.is_empty() || binding.session_id.as_deref() == Some(next_session.as_str()) {
-        store_record_reply(store, message.update_id, &reply)?;
+        store_record_reply(store, key, &reply)?;
     } else {
         // The reply is the turn's paid output — delivered verbatim
         // whether or not the guarded session change still applies.
-        let reply_text = reply.clone();
         store_record_reply_and_session(
             store,
             message.chat_id,
-            message.update_id,
+            key,
             Some(next_session),
             &binding,
-            move |_| reply_text,
+            |_| reply.clone(),
         )?;
     }
     deliver_recorded_reply(
@@ -1989,8 +2107,8 @@ fn handle_ordinary<T: BotTransport>(
         store,
         message.chat_id,
         message.message_id,
-        message.update_id,
-        &reply_key(message.update_id, "reply"),
+        key,
+        &reply_key(key, "reply"),
         &reply,
         0,
         None,
@@ -2040,30 +2158,31 @@ fn store_paired_binding(
         .cloned())
 }
 
-fn store_record_reply(store: &Mutex<BindingStore>, update_id: i64, reply: &str) -> Result<()> {
+fn store_record_reply(store: &Mutex<BindingStore>, key: TaskKey, reply: &str) -> Result<()> {
     store
         .lock()
         .unwrap()
-        .record_reply(update_id, reply, &reply_key(update_id, "reply"))
+        .record_reply(key, reply, &reply_key(key, "reply"))
 }
 
 /// Commit a chat's session change and the finished reply record in one
 /// store mutation — see [`BindingStore::record_reply_and_session`].
 /// `expected` is the binding the caller ran under; the session lands
-/// only while it still matches. `text` receives whether it did and
-/// produces the recorded reply; the recorded text is returned.
+/// only while it still matches. `text` renders both outcomes so a
+/// recovered record binds the answer matching what the effect
+/// committed; the recorded text is returned.
 fn store_record_reply_and_session(
     store: &Mutex<BindingStore>,
     chat_id: i64,
-    update_id: i64,
+    key: TaskKey,
     session_id: Option<String>,
     expected: &ChatBinding,
-    text: impl FnOnce(bool) -> String,
+    text: impl Fn(bool) -> String,
 ) -> Result<String> {
     store.lock().unwrap().record_reply_and_session(
         chat_id,
-        update_id,
-        &reply_key(update_id, "reply"),
+        key,
+        &reply_key(key, "reply"),
         session_id,
         expected,
         text,
@@ -2222,12 +2341,20 @@ mod tests {
     /// precondition the completion write carries.
     static MID_TURN_ACTION: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
+    /// A one-shot action the synthetic lane runs inside `scan_targets`
+    /// — a host rebind landing while `/agent` checks admission
+    /// exercises the command's pre-captured binding revision.
+    static MID_SCAN_ACTION: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
     /// The composing host owns conversation access; tests install deterministic
     /// lane answers so the channel admission path stays exercised.
     fn install_synthetic_lane() {
         use a4mc::lane::{self, LanePort};
         use serde_json::json;
         fn scan_targets() -> Result<serde_json::Value, a4mc::ChannelError> {
+            if let Some(action) = MID_SCAN_ACTION.lock().unwrap().take() {
+                action();
+            }
             Ok(json!({"candidates": [{
                 "target": "codex",
                 "label": "Codex",
@@ -2244,6 +2371,7 @@ mod tests {
         }
         lane::clear();
         *MID_TURN_ACTION.lock().unwrap() = None;
+        *MID_SCAN_ACTION.lock().unwrap() = None;
         *LANE_TURN_SESSION.lock().unwrap() = None;
         let _ = lane::install(LanePort {
             scan_targets,
@@ -2521,6 +2649,7 @@ mod tests {
             &channel,
             &store,
             &BotIdentity::default(),
+            TaskKey::from(1),
             &message,
             TEST_DEADLINE,
             &AtomicBool::new(false),
@@ -2533,6 +2662,7 @@ mod tests {
             &channel,
             &store,
             &BotIdentity::default(),
+            TaskKey::from(2),
             &list,
             TEST_DEADLINE,
             &AtomicBool::new(false),
@@ -2569,6 +2699,7 @@ mod tests {
             &channel,
             &store,
             &identity,
+            TaskKey::from(1),
             &text_message(42, 42, Some("alice"), "/whoami", 1),
             TEST_DEADLINE,
             &AtomicBool::new(false),
@@ -2578,6 +2709,7 @@ mod tests {
             &channel,
             &store,
             &identity,
+            TaskKey::from(2),
             &text_message(42, 42, Some("alice"), "/start", 2),
             TEST_DEADLINE,
             &AtomicBool::new(false),
@@ -2589,6 +2721,7 @@ mod tests {
             &channel,
             &store,
             &identity,
+            TaskKey::from(3),
             &text_message(42, 42, Some("alice"), "/unpair", 3),
             TEST_DEADLINE,
             &AtomicBool::new(false),
@@ -2636,6 +2769,7 @@ mod tests {
             &channel,
             &store,
             &BotIdentity::default(),
+            TaskKey::from(1),
             &message,
             TEST_DEADLINE,
             &AtomicBool::new(false),
@@ -2739,7 +2873,7 @@ mod tests {
             let chat_11_held = Arc::clone(&chat_11_held);
             let chat_11_blocked = Arc::clone(&chat_11_blocked);
             move |chat_id: i64, job: Scheduled| -> Result<()> {
-                let Scheduled::Message(message) = job else {
+                let Scheduled::Message { message, .. } = job else {
                     return Ok(());
                 };
                 records.lock().unwrap().push((
@@ -2764,31 +2898,22 @@ mod tests {
         let workers = scheduler
             .spawn_workers(4, processor, Arc::new(Mutex::new(None)))
             .unwrap();
-        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
-            11,
-            1,
-            Some("a"),
-            "m1",
-            1,
-        ))));
-        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
-            11,
-            1,
-            Some("a"),
-            "m2",
-            2,
-        ))));
+        scheduler.enqueue(Scheduled::Message {
+            key: TaskKey::from(1),
+            message: Box::new(text_message(11, 1, Some("a"), "m1", 1)),
+        });
+        scheduler.enqueue(Scheduled::Message {
+            key: TaskKey::from(2),
+            message: Box::new(text_message(11, 1, Some("a"), "m2", 2)),
+        });
         wait_until(
             || chat_11_blocked.load(Ordering::SeqCst),
             Duration::from_secs(5),
         );
-        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
-            22,
-            2,
-            Some("b"),
-            "m3",
-            10,
-        ))));
+        scheduler.enqueue(Scheduled::Message {
+            key: TaskKey::from(10),
+            message: Box::new(text_message(22, 2, Some("b"), "m3", 10)),
+        });
         wait_until(
             || {
                 records
@@ -2846,7 +2971,7 @@ mod tests {
             let done = Arc::clone(&done);
             let gate = Arc::clone(&gate);
             move |_chat_id: i64, job: Scheduled| -> Result<()> {
-                let Scheduled::Message(message) = job else {
+                let Scheduled::Message { message, .. } = job else {
                     return Ok(());
                 };
                 done.lock().unwrap().push(message.message_id);
@@ -2861,12 +2986,14 @@ mod tests {
         let workers = scheduler
             .spawn_workers(1, processor, Arc::new(Mutex::new(None)))
             .unwrap();
-        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
-            1, 1, None, "a", 1,
-        ))));
-        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
-            2, 2, None, "b", 2,
-        ))));
+        scheduler.enqueue(Scheduled::Message {
+            key: TaskKey::from(1),
+            message: Box::new(text_message(1, 1, None, "a", 1)),
+        });
+        scheduler.enqueue(Scheduled::Message {
+            key: TaskKey::from(2),
+            message: Box::new(text_message(2, 2, None, "b", 2)),
+        });
         assert_eq!(scheduler.admitted(), 2);
 
         let returned = Arc::new(AtomicBool::new(false));
@@ -2892,9 +3019,10 @@ mod tests {
         waiter.join().unwrap();
         assert!(returned.load(Ordering::SeqCst));
 
-        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
-            3, 3, None, "c", 3,
-        ))));
+        scheduler.enqueue(Scheduled::Message {
+            key: TaskKey::from(3),
+            message: Box::new(text_message(3, 3, None, "c", 3)),
+        });
         wait_until(|| done.lock().unwrap().len() == 3, Duration::from_secs(5));
         let mut processed = done.lock().unwrap().clone();
         processed.sort_unstable();
@@ -3047,6 +3175,7 @@ mod tests {
                     &[
                         crate::binding::PendingUpdate {
                             update_id: 1,
+                            sequence: 0,
                             message: queued,
                             reply: None,
                             reply_key: None,
@@ -3055,9 +3184,11 @@ mod tests {
 
                             reply_file: None,
                             reply_retry_at_ms: None,
+                            reply_refused: false,
                         },
                         crate::binding::PendingUpdate {
                             update_id: 2,
+                            sequence: 0,
                             message: recorded,
                             reply: Some("agent reply".to_owned()),
                             reply_key: None,
@@ -3066,6 +3197,7 @@ mod tests {
 
                             reply_file: None,
                             reply_retry_at_ms: None,
+                            reply_refused: false,
                         },
                     ],
                     &[],
@@ -3326,6 +3458,7 @@ mod tests {
                 .admit_updates(
                     &[crate::binding::PendingUpdate {
                         update_id: 2,
+                        sequence: 0,
                         message: text_message(43, 43, Some("bob"), "hello agent", 2),
                         reply: Some("agent reply".to_owned()),
                         reply_key: None,
@@ -3333,6 +3466,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -3865,9 +3999,10 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let scheduler = Arc::new(Scheduler::new(1, Arc::clone(&stop)));
         // Fill admission without workers so capacity never frees.
-        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
-            1, 1, None, "a", 1,
-        ))));
+        scheduler.enqueue(Scheduled::Message {
+            key: TaskKey::from(1),
+            message: Box::new(text_message(1, 1, None, "a", 1)),
+        });
         let waiter = {
             let scheduler = Arc::clone(&scheduler);
             thread::spawn(move || scheduler.wait_for_capacity())
@@ -3978,6 +4113,7 @@ mod tests {
             &channel,
             &store,
             &BotIdentity::default(),
+            TaskKey::from(1),
             &text_message(42, 42, Some("alice"), BLOCKING_TURN_TEXT, 1),
             Duration::from_millis(50),
             &AtomicBool::new(false),
@@ -4030,6 +4166,7 @@ mod tests {
             &channel,
             &store,
             &BotIdentity::default(),
+            TaskKey::from(1),
             &text_message(42, 42, Some("alice"), "hello", 1),
             TEST_DEADLINE,
             &AtomicBool::new(false),
@@ -4298,7 +4435,7 @@ mod tests {
         let processor = {
             let done = Arc::clone(&done);
             move |_chat_id: i64, job: Scheduled| -> Result<()> {
-                let Scheduled::Message(message) = job else {
+                let Scheduled::Message { message, .. } = job else {
                     return Ok(());
                 };
                 done.lock().unwrap().push(message.message_id);
@@ -4308,16 +4445,23 @@ mod tests {
         let workers = scheduler
             .spawn_workers(1, processor, Arc::new(Mutex::new(None)))
             .unwrap();
-        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
-            1, 1, None, "a", 1,
-        ))));
+        scheduler.enqueue(Scheduled::Message {
+            key: TaskKey::from(1),
+            message: Box::new(text_message(1, 1, None, "a", 1)),
+        });
         scheduler.shutdown();
         // With `stop` already raised, workers could be gone before this
         // drain admits the fetched remainder: the second message would
         // sit behind a full admission bound with nobody left to free it.
         let mut pending = VecDeque::from([
-            text_message(2, 2, None, "b", 2),
-            text_message(3, 3, None, "c", 3),
+            Scheduled::Message {
+                key: TaskKey::from(2),
+                message: Box::new(text_message(2, 2, None, "b", 2)),
+            },
+            Scheduled::Message {
+                key: TaskKey::from(3),
+                message: Box::new(text_message(3, 3, None, "c", 3)),
+            },
         ]);
         drain_pending(&scheduler, &mut pending);
         scheduler.mark_drained();
@@ -4463,6 +4607,7 @@ mod tests {
                 .admit_updates(
                     &[crate::binding::PendingUpdate {
                         update_id: 2,
+                        sequence: 0,
                         message: text_message(7, 7, Some("zed"), "/agent", 2),
                         reply: None,
                         reply_key: None,
@@ -4470,6 +4615,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -4541,6 +4687,7 @@ mod tests {
                 .admit_updates(
                     &[crate::binding::PendingUpdate {
                         update_id: 1,
+                        sequence: 0,
                         message: text_message(42, 42, Some("alice"), "hello agent", 1),
                         reply: Some("agent reply".into()),
                         reply_key: None,
@@ -4548,6 +4695,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -4672,6 +4820,7 @@ mod tests {
                 .admit_updates(
                     &[crate::binding::PendingUpdate {
                         update_id: 2,
+                        sequence: 0,
                         message: text_message(43, 43, Some("bob"), "hello agent", 2),
                         reply: Some(big.clone()),
                         reply_key: None,
@@ -4679,6 +4828,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -4745,6 +4895,7 @@ mod tests {
                 .admit_updates(
                     &[crate::binding::PendingUpdate {
                         update_id: 2,
+                        sequence: 0,
                         message: text_message(43, 43, Some("bob"), "hello agent", 2),
                         reply: Some(big.clone()),
                         reply_key: None,
@@ -4757,6 +4908,7 @@ mod tests {
                         }),
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -4821,6 +4973,7 @@ mod tests {
                 .admit_updates(
                     &[crate::binding::PendingUpdate {
                         update_id: 2,
+                        sequence: 0,
                         message: text_message(43, 43, Some("bob"), "hello agent", 2),
                         reply: Some(big.clone()),
                         reply_key: None,
@@ -4833,6 +4986,7 @@ mod tests {
                         }),
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -5086,7 +5240,7 @@ mod tests {
                     .sum::<usize>()
                     == big.len()
             },
-            Duration::from_secs(20),
+            Duration::from_secs(60),
         );
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap();
@@ -5253,6 +5407,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 3,
+                        sequence: 0,
                         message: text_message(42, 42, Some("alice"), "hello", 3),
                         reply: Some("recorded reply".to_owned()),
                         reply_key: Some("reply:3".to_owned()),
@@ -5263,6 +5418,7 @@ mod tests {
                         // in the future: recovery must keep waiting,
                         // not post immediately.
                         reply_retry_at_ms: Some(now_millis() + 3_600_000),
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -5308,6 +5464,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 2,
+                        sequence: 0,
                         message: text_message(42, 42, Some("alice"), "hello", 2),
                         // The record names a payload file that is not
                         // there: recovery cannot prove the reply — it
@@ -5318,6 +5475,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: Some("reply-2.txt".to_owned()),
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -5381,6 +5539,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 2,
+                        sequence: 0,
                         message: text_message(42, 42, Some("alice"), "hello", 2),
                         reply: Some("x".repeat(5_000)),
                         reply_key: Some("reply:2".to_owned()),
@@ -5396,6 +5555,7 @@ mod tests {
                         }),
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -5520,6 +5680,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 9,
+                        sequence: 0,
                         message: text_message(42, 42, Some("alice"), "/unpair", 9),
                         reply: None,
                         reply_key: None,
@@ -5527,6 +5688,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -5540,8 +5702,11 @@ mod tests {
             // report "No pairing found" on the already-revoked chat).
             store
                 .record_reply_and_revocation(42, 9, "reply:9", |removed| {
-                    assert!(removed);
-                    "Pairing revoked for this chat. Send /start to pair again.".to_owned()
+                    if removed {
+                        "Pairing revoked for this chat. Send /start to pair again.".to_owned()
+                    } else {
+                        "No pairing found for this chat.".to_owned()
+                    }
                 })
                 .unwrap();
         }
@@ -5835,6 +6000,7 @@ mod tests {
                 &[],
                 &[DroppedUpdate {
                     update_id: 6,
+                    sequence: 0,
                     raw_kind: "reaction".to_owned(),
                 }],
                 7,
@@ -5873,6 +6039,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 3,
+                        sequence: 0,
                         message: text_message(42, 42, Some("alice"), "hello", 3),
                         reply: Some("recorded reply".to_owned()),
                         reply_key: Some("reply:3".to_owned()),
@@ -5884,6 +6051,7 @@ mod tests {
                         // waits it out instead of reposting early
                         // inside the platform's rate-limit window.
                         reply_retry_at_ms: Some(now_millis() + 400),
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -5944,6 +6112,7 @@ mod tests {
         let mut cursor = PollCursor {
             offset: 0,
             sequence_age: SequenceAge::resumed(Duration::ZERO),
+            sequence_expired: false,
         };
         let mut pending = VecDeque::new();
         let mut on_event = None;
@@ -5982,6 +6151,7 @@ mod tests {
                 .admit_updates(
                     &[crate::binding::PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: text_message(42, 42, Some("alice"), "/whoami", 7),
                         reply: None,
                         reply_key: None,
@@ -5989,6 +6159,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -6067,6 +6238,7 @@ mod tests {
                 .admit_updates(
                     &[crate::binding::PendingUpdate {
                         update_id: 2,
+                        sequence: 0,
                         message: text_message(42, 42, Some("alice"), "hello agent", 2),
                         reply: Some("stuck reply".to_owned()),
                         reply_key: Some("reply:2".to_owned()),
@@ -6074,6 +6246,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -6129,6 +6302,263 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_reply_queues_behind_an_older_unfinished_message() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+            // Same chat, record order: an unfinished message ahead of a
+            // finished reply owed a resend. Recovery feeds both through
+            // the one bounded admission path in per-chat order, so the
+            // newer reply can never run before the older turn.
+            store
+                .admit_updates(
+                    &[
+                        crate::binding::PendingUpdate {
+                            update_id: 3,
+                            sequence: 0,
+                            message: text_message(42, 42, Some("alice"), "hello agent", 3),
+                            reply: None,
+                            reply_key: None,
+                            reply_sent: 0,
+                            reply_progress: None,
+                            reply_file: None,
+                            reply_retry_at_ms: None,
+                            reply_refused: false,
+                        },
+                        crate::binding::PendingUpdate {
+                            update_id: 4,
+                            sequence: 0,
+                            message: text_message(42, 42, Some("alice"), "again", 4),
+                            reply: Some("stuck reply".to_owned()),
+                            reply_key: Some("reply:4".to_owned()),
+                            reply_sent: 0,
+                            reply_progress: None,
+                            reply_file: None,
+                            reply_retry_at_ms: None,
+                            reply_refused: false,
+                        },
+                    ],
+                    &[],
+                    &[],
+                    5,
+                )
+                .unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || {
+                sent.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(chat, _)| *chat == 42)
+                    .count()
+                    == 2
+            },
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let posts = sent.lock().unwrap();
+        let chat_replies: Vec<&str> = posts
+            .iter()
+            .filter(|(chat, _)| *chat == 42)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(
+            chat_replies,
+            ["synthetic", "stuck reply"],
+            "the resend overtook the older unfinished turn in its own chat"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_reply_record_propagates_and_the_task_survives_for_recovery() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+        store.approve(&pending.code).unwrap();
+        store.set_agent(42, Some("codex".into())).unwrap();
+        store
+            .admit_updates(
+                &[crate::binding::PendingUpdate {
+                    update_id: 9,
+                    sequence: 0,
+                    message: text_message(42, 42, Some("alice"), "hello agent", 9),
+                    reply: None,
+                    reply_key: None,
+                    reply_sent: 0,
+                    reply_progress: None,
+                    reply_file: None,
+                    reply_retry_at_ms: None,
+                    reply_refused: false,
+                }],
+                &[],
+                &[],
+                10,
+            )
+            .unwrap();
+        // The first write inside the run is the worker's reply record.
+        // It must surface to the supervising loop — a fallback or
+        // settlement write that lands afterwards can never be allowed
+        // to mask the original failure or settle the unrecorded turn.
+        store.fail_next_write_for_test();
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        // Stop is already raised: the drained backlog still runs, so
+        // the worker hits the poisoned write without any polling.
+        let stop = Arc::new(AtomicBool::new(true));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let error = run_channel_loop(transport, store, config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a4mc_telegram_state_write_failed"),
+            "the record failure never reached the supervisor: {error}"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "an unrecorded reply was delivered"
+        );
+        // Nothing was settled: the task keeps its claim — no reply —
+        // so the next run re-dispatches the turn instead of resending
+        // a reply that was never recorded.
+        {
+            let reopened = BindingStore::open_in(&root).unwrap();
+            let task = reopened
+                .pending_update(9)
+                .expect("the failed turn's record was dropped or settled");
+            assert!(!task.has_reply());
+        }
+        // Recovery re-runs the turn and delivers its reply: the failed
+        // record write costs one restart, not the paid result.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| !sent.lock().unwrap().is_empty(), Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(
+            sent.lock().unwrap()[0].1,
+            "synthetic",
+            "the retained task never re-ran its turn"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_agent_rebind_during_the_admission_call_is_not_overwritten() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        // The host's own rebind lands while `/agent` checks admission:
+        // a second handle on the same root moves the binding's revision
+        // mid-command, and the guarded write must refuse it — the
+        // revision the command captured was taken BEFORE the host
+        // call, so the intervening change is not adopted as the
+        // command's own precondition.
+        let racing_root = root.clone();
+        *MID_SCAN_ACTION.lock().unwrap() = Some(Box::new(move || {
+            BindingStore::open_in(&racing_root)
+                .unwrap()
+                .set_agent(42, Some("claude".into()))
+                .unwrap();
+        }));
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 9,
+                message: Some(text_message(42, 42, Some("alice"), "/agent codex", 9)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| !sent.lock().unwrap().is_empty(), Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(
+            sent.lock().unwrap()[0].1,
+            "The chat's pairing moved while the command ran — the agent was not changed.",
+            "the command confirmed a rebind it did not commit"
+        );
+        let reopened = BindingStore::open_in(&root).unwrap();
+        assert_eq!(
+            reopened.binding(42).unwrap().agent_id.as_deref(),
+            Some("claude"),
+            "the racing rebind was overwritten by the command"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_delivery_key_namespaces_the_claims_sequence() {
+        // A restarted id sequence mints keys in its own namespace, so a
+        // retained dead-sequence delivery can never collide with the
+        // fresh sequence's reply for the same update id. Sequence zero
+        // keeps the revision-one shape older records resume under.
+        assert_eq!(reply_key(TaskKey::from(7), "reply"), "reply:7");
+        assert_eq!(reply_key(TaskKey::new(1, 7), "reply"), "reply:1:7");
+        assert_eq!(reply_key(TaskKey::new(1, 7), "error"), "error:1:7");
+    }
+
+    #[test]
     fn a_partial_worker_spawn_failure_shuts_down_and_joins_the_started_workers() {
         let stop = Arc::new(AtomicBool::new(false));
         let scheduler = Arc::new(Scheduler::new(4, Arc::clone(&stop)));
@@ -6158,9 +6588,10 @@ mod tests {
         // Work enqueued after the failure can never be picked up: the
         // workers that survived the partial spawn are gone — had their
         // handles been dropped parked, this job would still run.
-        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
-            1, 1, None, "a", 1,
-        ))));
+        scheduler.enqueue(Scheduled::Message {
+            key: TaskKey::from(1),
+            message: Box::new(text_message(1, 1, None, "a", 1)),
+        });
         thread::sleep(Duration::from_millis(300));
         assert_eq!(
             ran.load(Ordering::SeqCst),

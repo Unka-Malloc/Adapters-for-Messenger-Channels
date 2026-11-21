@@ -50,6 +50,43 @@ const MAX_RAW_KIND_CHARS: usize = 64;
 const PAIRING_TTL: Duration = Duration::from_secs(60 * 60);
 pub const BINDING_SCHEMA: &str = "a4mc.telegram-bindings.v1";
 
+/// The durable identity of a fetched update's record: the polling
+/// sequence it was fetched under plus its platform update id. Update
+/// ids are only unique within one id sequence — the platform may
+/// restart numbering after a long silence — so a claim, a staged
+/// record or a task lookup must name both to never confuse a fresh
+/// update for an earlier sequence's unfinished work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskKey {
+    pub sequence: u64,
+    pub update_id: i64,
+}
+
+impl TaskKey {
+    pub fn new(sequence: u64, update_id: i64) -> Self {
+        Self {
+            sequence,
+            update_id,
+        }
+    }
+}
+
+/// Bare ids name sequence-0 records — the namespace documents written
+/// before sequences existed, and any store that has never expired a
+/// sequence, live in.
+impl From<i64> for TaskKey {
+    fn from(update_id: i64) -> Self {
+        Self::new(0, update_id)
+    }
+}
+
+impl From<(u64, i64)> for TaskKey {
+    fn from((sequence, update_id): (u64, i64)) -> Self {
+        Self::new(sequence, update_id)
+    }
+}
+
 /// One platform update this runtime received but could not hand to the
 /// host as a message (a dice/game/service payload, or any update with no
 /// message body). Persisting the id makes the gap durable even when the
@@ -60,6 +97,10 @@ pub const BINDING_SCHEMA: &str = "a4mc.telegram-bindings.v1";
 pub struct DroppedUpdate {
     pub update_id: i64,
     pub raw_kind: String,
+    /// The polling sequence the update was fetched under. `0` predates
+    /// the field.
+    #[serde(default)]
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +143,11 @@ pub struct ChatBinding {
 #[serde(rename_all = "camelCase")]
 pub struct PendingUpdate {
     pub update_id: i64,
+    /// The polling sequence this task was admitted under — part of its
+    /// claim identity, so a restarted sequence's reused update id can
+    /// never shadow this record. `0` predates the field.
+    #[serde(default)]
+    pub sequence: u64,
     pub message: InboundMessage,
     /// The finished turn's reply, recorded before delivery so an exit
     /// after the agent returned still has the result to resend. `None`
@@ -142,13 +188,32 @@ pub struct PendingUpdate {
     /// truncated away.
     #[serde(default)]
     pub reply_retry_at_ms: Option<u64>,
+    /// Whether the bound reply is the staged record's refused-effect
+    /// variant: a command whose routing change did not commit records
+    /// both outcomes, and recovery selects by what the guarded effect
+    /// actually did — never the success text the original stage hoped
+    /// to commit.
+    #[serde(default)]
+    pub reply_refused: bool,
 }
 
 impl PendingUpdate {
+    /// The task's full claim identity — sequence plus update id.
+    pub fn key(&self) -> TaskKey {
+        TaskKey::new(self.sequence, self.update_id)
+    }
+
     /// Whether a finished reply is durably recorded — inline in the
     /// document or spilled to its sidecar file.
     pub fn has_reply(&self) -> bool {
         self.reply.is_some() || self.reply_file.is_some()
+    }
+}
+
+impl DroppedUpdate {
+    /// The record's full claim identity — sequence plus update id.
+    fn key(&self) -> TaskKey {
+        TaskKey::new(self.sequence, self.update_id)
     }
 }
 
@@ -203,6 +268,12 @@ struct BindingDocument {
     /// revisions stay unique across restarts.
     #[serde(default)]
     revision_counter: u64,
+    /// The current update-id sequence: bumped each time the confirmed
+    /// id sequence expires, so claims, staged records and fresh delivery
+    /// keys from a restarted sequence can never collide with retained
+    /// work from a dead one. `0` predates the field.
+    #[serde(default)]
+    poll_sequence: u64,
 }
 
 /// A staged reply completion: one atomic record carrying the payload,
@@ -215,6 +286,11 @@ struct BindingDocument {
 #[serde(rename_all = "camelCase")]
 struct StagedCompletion {
     update_id: i64,
+    /// The polling sequence the record was staged under — part of the
+    /// claim identity, verified against both the file name and the
+    /// task it binds to. `0` predates the field.
+    #[serde(default)]
+    sequence: u64,
     /// The file inside the replies directory holding the payload.
     /// Self-contained records name themselves; manifests written by
     /// the separate-files revision name their `reply-<id>.txt`
@@ -224,11 +300,19 @@ struct StagedCompletion {
     key: String,
     /// The document change the completion committed with.
     effect: StagedEffect,
-    /// The reply payload of a self-contained record. `None` marks a
-    /// manifest written by the revision that staged payload and
-    /// manifest as two files; its payload lives in the named file.
+    /// The reply payload of a self-contained record — bound when the
+    /// record's effect applies. `None` marks a manifest written by the
+    /// revision that staged payload and manifest as two files; its
+    /// payload lives in the named file.
     #[serde(default)]
     text: Option<String>,
+    /// The alternative outcome bound when the record's effect is
+    /// refused at recovery — a staged command reply names both what it
+    /// hoped to commit and what an intervening binding change turns it
+    /// into, so recovery never binds a success the refused effect did
+    /// not earn. `None` means one text serves both outcomes.
+    #[serde(default)]
+    refused_text: Option<String>,
 }
 
 /// The document mutation a staged completion re-applies on recovery —
@@ -297,6 +381,8 @@ enum StagedEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrandedReply {
     pub update_id: i64,
+    /// The polling sequence the record was staged under.
+    pub sequence: u64,
     pub code: String,
 }
 
@@ -637,15 +723,22 @@ impl BindingStore {
             return Err(anyhow!("a4mc_telegram_state_full"));
         }
         self.mutate_bounded(LIFECYCLE_RESERVE_BYTES, |document| {
+            // Records claim their update id in the sequence that was
+            // live when the batch was fetched — the store stamps it so
+            // a dead sequence's retained record can never block a
+            // restarted sequence's fresh admit of the same id.
+            let sequence = document.poll_sequence;
             for task in tasks {
                 // Re-admission keeps the existing record: a finished
                 // reply must survive a stale transport redelivery.
                 if !document
                     .pending_updates
                     .iter()
-                    .any(|held| held.update_id == task.update_id)
+                    .any(|held| held.key() == TaskKey::new(sequence, task.update_id))
                 {
-                    document.pending_updates.push(task.clone());
+                    let mut task = task.clone();
+                    task.sequence = sequence;
+                    document.pending_updates.push(task);
                 }
             }
             ensure!(
@@ -653,10 +746,12 @@ impl BindingStore {
                 "a4mc_telegram_pending_updates_full"
             );
             for dropped in dropped {
+                let mut dropped = dropped.clone();
+                dropped.sequence = sequence;
                 document
                     .dropped_updates
-                    .retain(|item| item.update_id != dropped.update_id);
-                document.dropped_updates.push(dropped.clone());
+                    .retain(|item| item.key() != dropped.key());
+                document.dropped_updates.push(dropped);
             }
             let excess = document
                 .dropped_updates
@@ -666,10 +761,12 @@ impl BindingStore {
                 document.dropped_updates.drain(..excess);
             }
             for event in events {
+                let mut event = event.clone();
+                event.sequence = sequence;
                 document
                     .pending_events
-                    .retain(|item| item.update_id != event.update_id);
-                document.pending_events.push(event.clone());
+                    .retain(|item| item.key() != event.key());
+                document.pending_events.push(event);
             }
             document.poll_offset = offset;
             document.poll_offset_advanced_at = Some(now_secs());
@@ -679,11 +776,10 @@ impl BindingStore {
 
     /// Settle an event the host callback consumed — the durable marker
     /// committed with the cursor is released without a dropped record.
-    pub fn settle_event(&mut self, update_id: i64) -> Result<()> {
+    pub fn settle_event(&mut self, key: impl Into<TaskKey>) -> Result<()> {
+        let key = key.into();
         self.mutate(|document| {
-            document
-                .pending_events
-                .retain(|item| item.update_id != update_id);
+            document.pending_events.retain(|item| item.key() != key);
             Ok(())
         })
     }
@@ -693,11 +789,10 @@ impl BindingStore {
     /// released and the cursor advances to `offset` — the first update
     /// whose outcome is not yet durable — atomically, so a crash can
     /// never leave a confirmed cursor on an unsettled marker.
-    pub fn settle_event_at_cursor(&mut self, update_id: i64, offset: i64) -> Result<()> {
+    pub fn settle_event_at_cursor(&mut self, key: impl Into<TaskKey>, offset: i64) -> Result<()> {
+        let key = key.into();
         self.mutate(|document| {
-            document
-                .pending_events
-                .retain(|item| item.update_id != update_id);
+            document.pending_events.retain(|item| item.key() != key);
             document.poll_offset = offset;
             document.poll_offset_advanced_at = Some(now_secs());
             Ok(())
@@ -748,24 +843,39 @@ impl BindingStore {
         })
     }
 
-    /// Clear the settled-id tail: the remembered ids belong to the
-    /// polling sequence that just expired, and a restarted sequence may
-    /// lawfully reuse them — keeping the tail would suppress fresh work
-    /// as already-settled. An empty tail means nothing to write.
-    pub fn retire_settled(&mut self) -> Result<()> {
-        if self.document.settled_updates.is_empty() {
-            return Ok(());
-        }
+    /// The polling sequence currently live — the namespace new claims,
+    /// staged records and delivery keys are minted under.
+    pub fn poll_sequence(&self) -> u64 {
+        self.document.poll_sequence
+    }
+
+    /// Retire the confirmed id sequence in one durable write: the
+    /// sequence counter advances, the settled-id tail and the pending
+    /// event markers — claims only meaningful inside the dead sequence —
+    /// are released, and the cursor restarts so a restarted numbering's
+    /// lower first ids are fetched instead of acknowledged unseen.
+    /// Outstanding tasks and staged records keep their dead-sequence
+    /// keys: their replies still deliver under the keys they recorded,
+    /// but they no longer claim the id a fresh sequence may reuse.
+    pub fn expire_sequence(&mut self) -> Result<()> {
         self.mutate(|document| {
+            document.poll_sequence += 1;
             document.settled_updates.clear();
+            document
+                .pending_events
+                .retain(|item| item.sequence == document.poll_sequence);
+            document.poll_offset = 0;
+            document.poll_offset_advanced_at = Some(now_secs());
             Ok(())
         })
     }
 
-    /// The admitted-but-unfinished work, oldest update first.
+    /// The admitted-but-unfinished work, oldest first — sequence before
+    /// update id, so a dead sequence's retained work precedes whatever
+    /// a restarted numbering admitted later.
     pub fn pending_updates(&self) -> Vec<PendingUpdate> {
         let mut tasks = self.document.pending_updates.clone();
-        tasks.sort_by_key(|task| task.update_id);
+        tasks.sort_by_key(|task| (task.sequence, task.update_id));
         tasks
     }
 
@@ -782,14 +892,29 @@ impl BindingStore {
     /// effect are written before the document commit, so an exit
     /// between the sidecar rename and the document write is reconciled
     /// on recovery instead of re-running finished work.
-    pub fn record_reply(&mut self, update_id: i64, reply: &str, key: &str) -> Result<()> {
+    pub fn record_reply(
+        &mut self,
+        key: impl Into<TaskKey>,
+        reply: &str,
+        delivery_key: &str,
+    ) -> Result<()> {
         ensure!(
             reply.len() <= MAX_REPLY_BYTES,
             "a4mc_telegram_reply_too_large"
         );
+        let key = key.into();
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
-            stage_reply(document, &dir, update_id, reply, key, StagedEffect::Reply)
+            stage_reply(
+                document,
+                &dir,
+                key,
+                reply,
+                None,
+                true,
+                delivery_key,
+                StagedEffect::Reply,
+            )
         })
     }
 
@@ -803,20 +928,22 @@ impl BindingStore {
     /// still matches it — user, agent, session and revision — so a
     /// rebind that raced an in-flight turn can never have the stale
     /// session written over it, even one that moved the binding and
-    /// moved it back. `text` receives whether the guarded session
-    /// change applied, so the confirmation reports what the mutation
-    /// actually did. The reply record itself never depends on the
-    /// effect: a refused routing change still keeps its finished
-    /// reply. Returns the reply text.
+    /// moved it back. `text` is rendered for both outcomes — applied
+    /// and refused — so a record recovered after the binding moved
+    /// binds the answer matching what its effect actually commits, not
+    /// the success it was staged hoping for. The reply record itself
+    /// never depends on the effect: a refused routing change still
+    /// keeps its finished reply. Returns the reply text.
     pub fn record_reply_and_session(
         &mut self,
         chat_id: i64,
-        update_id: i64,
-        key: &str,
+        key: impl Into<TaskKey>,
+        delivery_key: &str,
         session_id: Option<String>,
         expected: &ChatBinding,
-        text: impl FnOnce(bool) -> String,
+        text: impl Fn(bool) -> String,
     ) -> Result<String> {
+        let key = key.into();
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
             let effect = StagedEffect::ReplySession {
@@ -828,12 +955,27 @@ impl BindingStore {
                 binding_revision: Some(expected.revision),
             };
             let applied = apply_effect(document, &effect);
-            let reply = text(applied);
+            let (applied_text, refused_text) = (text(true), text(false));
+            let reply = if applied {
+                applied_text.clone()
+            } else {
+                refused_text.clone()
+            };
             ensure!(
                 reply.len() <= MAX_REPLY_BYTES,
                 "a4mc_telegram_reply_too_large"
             );
-            stage_reply(document, &dir, update_id, &reply, key, effect)?;
+            let refused_text = (refused_text != applied_text).then_some(refused_text);
+            stage_reply(
+                document,
+                &dir,
+                key,
+                &applied_text,
+                refused_text.as_deref(),
+                applied,
+                delivery_key,
+                effect,
+            )?;
             Ok(reply)
         })
     }
@@ -841,15 +983,17 @@ impl BindingStore {
     /// Commit a chat's revocation — its binding and every pending
     /// pairing record — and the reply confirming it in one write, so a
     /// restart never replays a mutating command whose confirmation was
-    /// already accepted by the platform. `text` receives whether any
-    /// state was actually removed. Returns the reply text.
+    /// already accepted by the platform. `text` is rendered for both
+    /// outcomes so a recovered record binds the answer matching what
+    /// its effect commits. Returns the reply text.
     pub fn record_reply_and_revocation(
         &mut self,
         chat_id: i64,
-        update_id: i64,
-        key: &str,
-        text: impl FnOnce(bool) -> String,
+        key: impl Into<TaskKey>,
+        delivery_key: &str,
+        text: impl Fn(bool) -> String,
     ) -> Result<String> {
+        let key = key.into();
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
             let effect = StagedEffect::ReplyRevoke {
@@ -860,12 +1004,27 @@ impl BindingStore {
                     .map(|binding| binding.user_id),
             };
             let removed = apply_effect(document, &effect);
-            let reply = text(removed);
+            let (applied_text, refused_text) = (text(true), text(false));
+            let reply = if removed {
+                applied_text.clone()
+            } else {
+                refused_text.clone()
+            };
             ensure!(
                 reply.len() <= MAX_REPLY_BYTES,
                 "a4mc_telegram_reply_too_large"
             );
-            stage_reply(document, &dir, update_id, &reply, key, effect)?;
+            let refused_text = (refused_text != applied_text).then_some(refused_text);
+            stage_reply(
+                document,
+                &dir,
+                key,
+                &applied_text,
+                refused_text.as_deref(),
+                removed,
+                delivery_key,
+                effect,
+            )?;
             Ok(reply)
         })
     }
@@ -875,21 +1034,22 @@ impl BindingStore {
     /// `set_agent` does. The rebind is applied only while the chat is
     /// still paired for the user the command ran for and, when
     /// `expected` carries the binding the command observed, while that
-    /// binding's revision still holds. `text` receives whether the
-    /// guarded rebind applied, so the confirmation reports what the
-    /// mutation actually did; the reply record never depends on it.
-    /// Returns the reply text.
+    /// binding's revision still holds. `text` is rendered for both
+    /// outcomes, so a recovered record binds the answer matching what
+    /// the guarded rebind actually commits; the reply record never
+    /// depends on it. Returns the reply text.
     #[allow(clippy::too_many_arguments)]
     pub fn record_reply_and_agent(
         &mut self,
         chat_id: i64,
-        update_id: i64,
+        key: impl Into<TaskKey>,
         agent_id: String,
-        key: &str,
+        delivery_key: &str,
         user_id: i64,
         expected: Option<&ChatBinding>,
-        text: impl FnOnce(bool) -> String,
+        text: impl Fn(bool) -> String,
     ) -> Result<String> {
+        let key = key.into();
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
             let effect = StagedEffect::ReplyAgent {
@@ -899,12 +1059,27 @@ impl BindingStore {
                 binding_revision: expected.map(|binding| binding.revision),
             };
             let applied = apply_effect(document, &effect);
-            let reply = text(applied);
+            let (applied_text, refused_text) = (text(true), text(false));
+            let reply = if applied {
+                applied_text.clone()
+            } else {
+                refused_text.clone()
+            };
             ensure!(
                 reply.len() <= MAX_REPLY_BYTES,
                 "a4mc_telegram_reply_too_large"
             );
-            stage_reply(document, &dir, update_id, &reply, key, effect)?;
+            let refused_text = (refused_text != applied_text).then_some(refused_text);
+            stage_reply(
+                document,
+                &dir,
+                key,
+                &applied_text,
+                refused_text.as_deref(),
+                applied,
+                delivery_key,
+                effect,
+            )?;
             Ok(reply)
         })
     }
@@ -919,10 +1094,11 @@ impl BindingStore {
         chat_id: i64,
         user_id: i64,
         username: Option<String>,
-        update_id: i64,
-        key: &str,
+        key: impl Into<TaskKey>,
+        delivery_key: &str,
         text: impl FnOnce(&PairingRecord) -> String,
     ) -> Result<String> {
+        let key = key.into();
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
             let now = now_secs();
@@ -951,7 +1127,16 @@ impl BindingStore {
                 record: record.clone(),
             };
             apply_effect(document, &effect);
-            stage_reply(document, &dir, update_id, &reply, key, effect)?;
+            stage_reply(
+                document,
+                &dir,
+                key,
+                &reply,
+                None,
+                true,
+                delivery_key,
+                effect,
+            )?;
             Ok(reply)
         })
     }
@@ -967,25 +1152,27 @@ impl BindingStore {
     /// the task is gone) and nothing was written.
     pub fn record_fallback_reply(
         &mut self,
-        update_id: i64,
+        key: impl Into<TaskKey>,
         reply: &str,
-        key: &str,
+        delivery_key: &str,
     ) -> Result<bool> {
+        let key = key.into();
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
             if let Some(task) = document
                 .pending_updates
                 .iter_mut()
-                .find(|task| task.update_id == update_id)
+                .find(|task| task.key() == key)
                 && !task.has_reply()
-                && !staged_exists(&dir, update_id)
+                && !staged_exists(&dir, key)
             {
                 task.reply = Some(reply.to_owned());
                 task.reply_file = None;
-                task.reply_key = Some(key.to_owned());
+                task.reply_key = Some(delivery_key.to_owned());
                 task.reply_sent = 0;
                 task.reply_progress = None;
                 task.reply_retry_at_ms = None;
+                task.reply_refused = false;
                 return Ok(true);
             }
             Ok(false)
@@ -999,15 +1186,16 @@ impl BindingStore {
     /// only ever moves forward — a stale write can never drag it back.
     pub fn record_reply_progress(
         &mut self,
-        update_id: i64,
+        key: impl Into<TaskKey>,
         sent: usize,
         progress: Option<crate::transport::SendProgress>,
     ) -> Result<()> {
+        let key = key.into();
         self.mutate(|document| {
             if let Some(task) = document
                 .pending_updates
                 .iter_mut()
-                .find(|task| task.update_id == update_id)
+                .find(|task| task.key() == key)
             {
                 task.reply_sent = task.reply_sent.max(sent);
                 task.reply_progress = progress;
@@ -1026,15 +1214,16 @@ impl BindingStore {
     /// leave a retryable checkpoint missing its deadline.
     pub fn record_reply_checkpoint(
         &mut self,
-        update_id: i64,
+        key: impl Into<TaskKey>,
         progress: Option<crate::transport::SendProgress>,
         not_before: Option<u64>,
     ) -> Result<()> {
+        let key = key.into();
         self.mutate(|document| {
             if let Some(task) = document
                 .pending_updates
                 .iter_mut()
-                .find(|task| task.update_id == update_id)
+                .find(|task| task.key() == key)
             {
                 if let Some(progress) = progress {
                     task.reply_progress = Some(progress);
@@ -1047,40 +1236,46 @@ impl BindingStore {
         })
     }
 
-    /// One admitted-but-unfinished task by update id, if it exists —
-    /// the durable record a retried delivery reloads before it
-    /// resumes, so a later attempt continues the latest checkpoint
-    /// rather than a stale snapshot.
-    pub fn pending_update(&self, update_id: i64) -> Option<PendingUpdate> {
+    /// One admitted-but-unfinished task by its sequence-scoped key,
+    /// if it exists — the durable record a retried delivery reloads
+    /// before it resumes, so a later attempt continues the latest
+    /// checkpoint rather than a stale snapshot.
+    pub fn pending_update(&self, key: impl Into<TaskKey>) -> Option<PendingUpdate> {
+        let key = key.into();
         self.document
             .pending_updates
             .iter()
-            .find(|task| task.update_id == update_id)
+            .find(|task| task.key() == key)
             .cloned()
     }
 
-    /// The update ids with a staged completion on disk — the replies
-    /// whose payload and manifest exist but whose document pointer may
-    /// not have committed yet. Filename-derived; no content is read.
-    pub fn staged_update_ids(&self) -> Vec<i64> {
-        staged_update_ids(&replies_dir(&self.path))
+    /// The staged keys on disk — the replies whose payload and manifest
+    /// exist but whose document pointer may not have committed yet.
+    /// Filename-derived; no content is read.
+    pub fn staged_update_keys(&self) -> Vec<TaskKey> {
+        staged_update_keys(&replies_dir(&self.path))
     }
 
-    /// Whether a recoverable staged completion for the update is still
+    /// Whether a recoverable staged completion for the task is still
     /// waiting to bind — the durable reply exists, so the task counts
     /// as holding a finished reply even while its document pointer has
     /// not committed.
-    pub fn staged_reply_pending(&self, update_id: i64) -> bool {
-        staged_exists(&replies_dir(&self.path), update_id)
+    pub fn staged_reply_pending(&self, key: impl Into<TaskKey>) -> bool {
+        staged_exists(&replies_dir(&self.path), key.into())
     }
 
-    /// The update ids this store already durably claimed — admitted
-    /// tasks still pending, and tasks already settled. A refetched
-    /// update naming one is confirmed work, never re-queued.
+    /// The update ids this store already durably claimed — settled ids
+    /// plus the live-sequence ids of pending tasks. Settled records and
+    /// claims mean nothing outside the sequence they were confirmed
+    /// under, so a restarted sequence's reused ids must not name a dead
+    /// sequence's retained work; the runtime filters live-sequence
+    /// claims itself once the fetched batch names its own sequence.
     pub fn claimed_update_ids(&self) -> std::collections::HashSet<i64> {
+        let sequence = self.document.poll_sequence;
         self.document
             .pending_updates
             .iter()
+            .filter(|task| task.sequence == sequence)
             .map(|task| task.update_id)
             .chain(self.document.settled_updates.iter().copied())
             .collect()
@@ -1106,13 +1301,16 @@ impl BindingStore {
 
     /// Drop an admitted task once it is fully processed. Its id stays
     /// on the bounded settled tail: a cursor rollback that refetches
-    /// the update skips it instead of re-running confirmed work.
-    pub fn complete_update(&mut self, update_id: i64) -> Result<()> {
+    /// the update skips it instead of re-running confirmed work. Only
+    /// a live-sequence claim settles — the tail's ids name the live
+    /// numbering alone.
+    pub fn complete_update(&mut self, key: impl Into<TaskKey>) -> Result<()> {
+        let key = key.into();
         self.mutate(|document| {
-            document
-                .pending_updates
-                .retain(|task| task.update_id != update_id);
-            note_settled(document, update_id);
+            document.pending_updates.retain(|task| task.key() != key);
+            if key.sequence == document.poll_sequence {
+                note_settled(document, key.update_id);
+            }
             Ok(())
         })
     }
@@ -1123,15 +1321,16 @@ impl BindingStore {
     /// is resumed on restart instead of re-running the turn. A
     /// retained record stays claimed; a removed one's id joins the
     /// settled tail so a refetch skips it either way.
-    pub fn settle_failed_update(&mut self, update_id: i64) -> Result<()> {
+    pub fn settle_failed_update(&mut self, key: impl Into<TaskKey>) -> Result<()> {
+        let key = key.into();
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
             let before = document.pending_updates.len();
-            document.pending_updates.retain(|task| {
-                task.update_id != update_id || task.has_reply() || staged_exists(&dir, update_id)
-            });
-            if document.pending_updates.len() != before {
-                note_settled(document, update_id);
+            document
+                .pending_updates
+                .retain(|task| task.key() != key || task.has_reply() || staged_exists(&dir, key));
+            if document.pending_updates.len() != before && key.sequence == document.poll_sequence {
+                note_settled(document, key.update_id);
             }
             Ok(())
         })
@@ -1139,7 +1338,10 @@ impl BindingStore {
 
     /// Resolve a task's finished reply text: small records carry it
     /// inline; a spilled record's payload lives in its sidecar file.
-    /// `Ok(None)` means no finished reply is recorded.
+    /// A task marked `reply_refused` resolves the manifest's refused
+    /// variant — for a pointer manifest that text lives in the `.json`
+    /// record, not the payload sidecar. `Ok(None)` means no finished
+    /// reply is recorded.
     pub fn reply_text(&self, task: &PendingUpdate) -> Result<Option<String>> {
         if let Some(reply) = &task.reply {
             return Ok(Some(reply.clone()));
@@ -1147,7 +1349,13 @@ impl BindingStore {
         let Some(name) = &task.reply_file else {
             return Ok(None);
         };
-        read_reply_payload(&self.path, name, task.update_id)?
+        if task.reply_refused {
+            let manifest = manifest_file_name(task.key());
+            return read_reply_payload(&self.path, &manifest, task.key(), true)?
+                .map(Some)
+                .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"));
+        }
+        read_reply_payload(&self.path, name, task.key(), false)?
             .map(Some)
             .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))
     }
@@ -1159,11 +1367,12 @@ impl BindingStore {
     pub fn record_dropped_update(&mut self, update_id: i64, raw_kind: &str) -> Result<()> {
         let raw_kind: String = raw_kind.chars().take(MAX_RAW_KIND_CHARS).collect();
         self.mutate(|document| {
-            document
-                .dropped_updates
-                .retain(|item| item.update_id != update_id);
+            let sequence = document.poll_sequence;
+            let key = TaskKey::new(sequence, update_id);
+            document.dropped_updates.retain(|item| item.key() != key);
             document.dropped_updates.push(DroppedUpdate {
                 update_id,
+                sequence,
                 raw_kind,
             });
             let excess = document
@@ -1258,7 +1467,12 @@ fn legacy_replies_dir(path: &Path) -> PathBuf {
 /// name is a self-contained staged record whose text is the reply —
 /// verified against the task it is read for; any other name is raw
 /// payload text.
-fn read_reply_payload(path: &Path, name: &str, update_id: i64) -> Result<Option<String>> {
+fn read_reply_payload(
+    path: &Path,
+    name: &str,
+    key: TaskKey,
+    refused: bool,
+) -> Result<Option<String>> {
     for dir in [replies_dir(path), legacy_replies_dir(path)] {
         let bound = if name.ends_with(".json") {
             MAX_STAGED_BYTES
@@ -1268,80 +1482,103 @@ fn read_reply_payload(path: &Path, name: &str, update_id: i64) -> Result<Option<
         let Some(raw) = read_private_text_bounded(&dir.join(name), bound)? else {
             continue;
         };
-        return decode_reply_payload(name, &raw, update_id).map(Some);
+        return decode_reply_payload(name, &raw, key, refused).map(Some);
     }
     Ok(None)
 }
 
-fn decode_reply_payload(name: &str, raw: &str, update_id: i64) -> Result<String> {
+fn decode_reply_payload(name: &str, raw: &str, key: TaskKey, refused: bool) -> Result<String> {
     if !name.ends_with(".json") {
         return Ok(raw.to_owned());
     }
-    serde_json::from_str::<StagedCompletion>(raw)
+    let staged = serde_json::from_str::<StagedCompletion>(raw)
         .ok()
-        .filter(|staged| staged.update_id == update_id)
-        .and_then(|staged| staged.text)
-        .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))
+        .filter(|staged| staged.update_id == key.update_id && staged.sequence == key.sequence)
+        .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))?;
+    if refused {
+        staged.refused_text.or(staged.text)
+    } else {
+        staged.text
+    }
+    .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))
 }
 
-fn reply_file_name(update_id: i64) -> String {
-    format!("reply-{update_id}.txt")
+fn reply_file_name(key: TaskKey) -> String {
+    match key.sequence {
+        0 => format!("reply-{}.txt", key.update_id),
+        sequence => format!("reply-s{sequence}-{}.txt", key.update_id),
+    }
 }
 
-/// The staged-completion manifest for one update id — payload, key
-/// and effect recorded before the document commits.
-fn manifest_file_name(update_id: i64) -> String {
-    format!("reply-{update_id}.json")
+/// The staged-completion manifest for one task key — payload, key
+/// and effect recorded before the document commits. Sequence `0`
+/// keeps the revision-one file name so records staged before the
+/// field existed stay discoverable under the key they decode to.
+fn manifest_file_name(key: TaskKey) -> String {
+    match key.sequence {
+        0 => format!("reply-{}.json", key.update_id),
+        sequence => format!("reply-s{sequence}-{}.json", key.update_id),
+    }
 }
 
-/// Parse `reply-<update_id>.<suffix>` names — the only file names this
-/// store owns inside its replies directory.
-fn staged_file_name_id(name: &str) -> Option<(i64, &str)> {
+/// Parse `reply-<update_id>.<suffix>` and `reply-s<seq>-<update_id>.<suffix>`
+/// names — the only file names this store owns inside its replies
+/// directory. The unsequenced form decodes to sequence `0`.
+fn staged_file_name_id(name: &str) -> Option<(TaskKey, &str)> {
     let body = name.strip_prefix("reply-")?;
-    let (id, suffix) = body.split_once('.')?;
-    Some((id.parse().ok()?, suffix))
+    let (id, suffix) = body.rsplit_once('.')?;
+    let key = if let Some(rest) = id.strip_prefix('s') {
+        let (sequence, id) = rest.split_once('-')?;
+        TaskKey::new(sequence.parse().ok()?, id.parse().ok()?)
+    } else {
+        TaskKey::from(id.parse::<i64>().ok()?)
+    };
+    Some((key, suffix))
 }
 
-/// Whether a recoverable staged completion exists for the update —
+/// Whether a recoverable staged completion exists for the task —
 /// the on-disk record stays authoritative until a document write
 /// binds its pointer. A self-contained record always qualifies; a
 /// pointer manifest does only while its payload file exists.
-fn staged_exists(dir: &Path, update_id: i64) -> bool {
-    let Ok(raw) =
-        read_private_text_bounded(&dir.join(manifest_file_name(update_id)), MAX_STAGED_BYTES)
+fn staged_exists(dir: &Path, key: TaskKey) -> bool {
+    let Ok(raw) = read_private_text_bounded(&dir.join(manifest_file_name(key)), MAX_STAGED_BYTES)
     else {
         return false;
     };
     raw.and_then(|raw| serde_json::from_str::<StagedCompletion>(&raw).ok())
-        .filter(|staged| staged.update_id == update_id && staged_payload_name_ok(staged, update_id))
+        .filter(|staged| {
+            staged.update_id == key.update_id
+                && staged.sequence == key.sequence
+                && staged_payload_name_ok(staged, key)
+        })
         .is_some_and(|staged| staged.text.is_some() || dir.join(&staged.payload).is_file())
 }
 
 /// Whether a staged record's declared payload name matches the files
-/// this store owns for its update id — the self-contained record's
-/// own name or a pointer manifest's `reply-<id>.txt` sidecar.
-fn staged_payload_name_ok(staged: &StagedCompletion, update_id: i64) -> bool {
-    staged.payload == reply_file_name(update_id) || staged.payload == manifest_file_name(update_id)
+/// this store owns for its task key — the self-contained record's
+/// own name or a pointer manifest's `.txt` sidecar.
+fn staged_payload_name_ok(staged: &StagedCompletion, key: TaskKey) -> bool {
+    staged.payload == reply_file_name(key) || staged.payload == manifest_file_name(key)
 }
 
-fn staged_update_ids(dir: &Path) -> Vec<i64> {
-    let mut ids = Vec::new();
+fn staged_update_keys(dir: &Path) -> Vec<TaskKey> {
+    let mut keys = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return ids;
+        return keys;
     };
     for entry in entries.flatten() {
-        if let Some((id, "json")) = entry.file_name().to_str().and_then(staged_file_name_id) {
-            ids.push(id);
+        if let Some((key, "json")) = entry.file_name().to_str().and_then(staged_file_name_id) {
+            keys.push(key);
         }
     }
-    ids
+    keys
 }
 
 /// Read every staged manifest in the directory. Entries whose file
-/// name, declared update id or declared payload name disagree are
-/// reported as invalid; a manifest for a finished update the document
+/// name, declared identity or declared payload name disagree are
+/// reported as invalid; a manifest for a finished task the document
 /// already answers is ignored by `apply_staged`.
-fn staged_manifests(dir: &Path) -> Vec<(i64, Option<StagedCompletion>)> {
+fn staged_manifests(dir: &Path) -> Vec<(TaskKey, Option<StagedCompletion>)> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
@@ -1349,7 +1586,7 @@ fn staged_manifests(dir: &Path) -> Vec<(i64, Option<StagedCompletion>)> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some((id, "json")) = staged_file_name_id(name) else {
+        let Some((key, "json")) = staged_file_name_id(name) else {
             continue;
         };
         let staged = read_private_text_bounded(&entry.path(), MAX_STAGED_BYTES)
@@ -1357,9 +1594,11 @@ fn staged_manifests(dir: &Path) -> Vec<(i64, Option<StagedCompletion>)> {
             .flatten()
             .and_then(|raw| serde_json::from_str::<StagedCompletion>(&raw).ok())
             .filter(|staged: &StagedCompletion| {
-                staged.update_id == id && staged_payload_name_ok(staged, id)
+                staged.update_id == key.update_id
+                    && staged.sequence == key.sequence
+                    && staged_payload_name_ok(staged, key)
             });
-        out.push((id, staged));
+        out.push((key, staged));
     }
     out
 }
@@ -1384,7 +1623,7 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some((id, "json")) = entry.file_name().to_str().and_then(staged_file_name_id) else {
+        let Some((key, "json")) = entry.file_name().to_str().and_then(staged_file_name_id) else {
             continue;
         };
         // A task already holding its bound reply can never re-apply
@@ -1394,7 +1633,7 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
         let Some(index) = document
             .pending_updates
             .iter()
-            .position(|task| task.update_id == id)
+            .position(|task| task.key() == key)
         else {
             continue;
         };
@@ -1406,7 +1645,9 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
             .flatten()
             .and_then(|raw| serde_json::from_str::<StagedCompletion>(&raw).ok())
             .filter(|staged: &StagedCompletion| {
-                staged.update_id == id && staged_payload_name_ok(staged, id)
+                staged.update_id == key.update_id
+                    && staged.sequence == key.sequence
+                    && staged_payload_name_ok(staged, key)
             });
         let Some(staged) = staged else { continue };
         // The record must be readable end to end: a self-contained
@@ -1425,7 +1666,7 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
         // by `stranded_staged` — instead of letting every mutation
         // that replays it fail on a document it can never commit.
         let before = document.clone();
-        apply_effect(document, &staged.effect);
+        let applied = apply_effect(document, &staged.effect);
         let task = &mut document.pending_updates[index];
         task.reply = None;
         task.reply_file = Some(staged.payload.clone());
@@ -1433,6 +1674,10 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
         task.reply_sent = 0;
         task.reply_progress = None;
         task.reply_retry_at_ms = None;
+        // The bound text names what the effect actually committed: a
+        // refused effect binds the record's refused variant, never the
+        // success text the stage hoped for.
+        task.reply_refused = !applied && staged.refused_text.is_some();
         if serialized_len(document).is_none_or(|len| len > MAX_STATE_BYTES) {
             *document = before;
         }
@@ -1444,11 +1689,11 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
 /// task is gone is ignored: the sweep reclaims it.
 fn stranded_staged(document: &BindingDocument, dir: &Path) -> Vec<StrandedReply> {
     let mut out = Vec::new();
-    for (id, staged) in staged_manifests(dir) {
+    for (key, staged) in staged_manifests(dir) {
         let applied = document
             .pending_updates
             .iter()
-            .find(|task| task.update_id == id)
+            .find(|task| task.key() == key)
             .is_some_and(|task| {
                 task.has_reply()
                     && staged.as_ref().is_some_and(|staged| {
@@ -1461,7 +1706,7 @@ fn stranded_staged(document: &BindingDocument, dir: &Path) -> Vec<StrandedReply>
         let Some(task) = document
             .pending_updates
             .iter()
-            .find(|task| task.update_id == id)
+            .find(|task| task.key() == key)
         else {
             continue;
         };
@@ -1470,6 +1715,7 @@ fn stranded_staged(document: &BindingDocument, dir: &Path) -> Vec<StrandedReply>
             .is_some_and(|staged| staged.text.is_some() || dir.join(&staged.payload).is_file());
         out.push(StrandedReply {
             update_id: task.update_id,
+            sequence: task.sequence,
             code: if recoverable {
                 "a4mc_telegram_state_full".to_owned()
             } else {
@@ -1486,29 +1732,37 @@ fn stranded_staged(document: &BindingDocument, dir: &Path) -> Vec<StrandedReply>
 /// rename before the caller's document commit: a crash before it
 /// leaves nothing durable, a crash after it leaves the whole
 /// recoverable completion — never a payload no record recognizes.
+/// `refused_text` is the outcome bound instead when recovery finds
+/// the record's effect refused; `applied` is what this commit's own
+/// effect did, so the pointer binds the matching variant.
+#[allow(clippy::too_many_arguments)]
 fn stage_reply(
     document: &mut BindingDocument,
     dir: &Path,
-    update_id: i64,
+    key: TaskKey,
     reply: &str,
-    key: &str,
+    refused_text: Option<&str>,
+    applied: bool,
+    delivery_key: &str,
     effect: StagedEffect,
 ) -> Result<()> {
     let Some(task) = document
         .pending_updates
         .iter_mut()
-        .find(|task| task.update_id == update_id)
+        .find(|task| task.key() == key)
     else {
         return Ok(());
     };
     ensure_private_dir(dir)?;
-    let record_name = manifest_file_name(update_id);
+    let record_name = manifest_file_name(key);
     let manifest = StagedCompletion {
-        update_id,
+        update_id: key.update_id,
+        sequence: key.sequence,
         payload: record_name.clone(),
-        key: key.to_owned(),
+        key: delivery_key.to_owned(),
         effect,
         text: Some(reply.to_owned()),
+        refused_text: refused_text.map(str::to_owned),
     };
     let raw = serde_json::to_string(&manifest)
         .map_err(|_| anyhow!("a4mc_telegram_state_write_failed"))?;
@@ -1519,10 +1773,11 @@ fn stage_reply(
     atomic_write_private_text(&dir.join(&record_name), &raw)?;
     task.reply = None;
     task.reply_file = Some(record_name);
-    task.reply_key = Some(key.to_owned());
+    task.reply_key = Some(delivery_key.to_owned());
     task.reply_sent = 0;
     task.reply_progress = None;
     task.reply_retry_at_ms = None;
+    task.reply_refused = !applied && refused_text.is_some();
     Ok(())
 }
 
@@ -1653,11 +1908,11 @@ fn sweep_reply_files(path: &Path, document: &BindingDocument) {
         .iter()
         .filter_map(|task| task.reply_file.clone())
         .collect();
-    for (id, staged) in staged_manifests(&dir) {
+    for (key, staged) in staged_manifests(&dir) {
         let task = document
             .pending_updates
             .iter()
-            .find(|task| task.update_id == id);
+            .find(|task| task.key() == key);
         let bound = task.is_some_and(|task| {
             staged
                 .as_ref()
@@ -1668,7 +1923,7 @@ fn sweep_reply_files(path: &Path, document: &BindingDocument) {
             // live as the payload itself; a pointer manifest has
             // served and is reclaimed.
             if staged.as_ref().is_some_and(|staged| staged.text.is_none()) {
-                let _ = std::fs::remove_file(dir.join(manifest_file_name(id)));
+                let _ = std::fs::remove_file(dir.join(manifest_file_name(key)));
             }
             continue;
         }
@@ -1678,7 +1933,7 @@ fn sweep_reply_files(path: &Path, document: &BindingDocument) {
                 if task.is_none() || !recoverable {
                     // Orphaned, or a stage that died before its
                     // payload landed — nothing left to recover.
-                    let _ = std::fs::remove_file(dir.join(manifest_file_name(id)));
+                    let _ = std::fs::remove_file(dir.join(manifest_file_name(key)));
                 } else {
                     // Still waiting to bind: hold the record and the
                     // payload it names.
@@ -1689,9 +1944,9 @@ fn sweep_reply_files(path: &Path, document: &BindingDocument) {
                 // An unreadable record is held for reporting while its
                 // task is unbound; once the task is gone it is swept.
                 if task.is_none() {
-                    let _ = std::fs::remove_file(dir.join(manifest_file_name(id)));
+                    let _ = std::fs::remove_file(dir.join(manifest_file_name(key)));
                 } else {
-                    live.insert(reply_file_name(id));
+                    live.insert(reply_file_name(key));
                 }
             }
         }
@@ -1739,6 +1994,7 @@ fn read_document(path: &Path) -> Result<BindingDocument> {
             pending_updates: Vec::new(),
             settled_updates: Vec::new(),
             revision_counter: 0,
+            poll_sequence: 0,
         }),
     }
 }
@@ -1996,6 +2252,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: None,
@@ -2003,6 +2260,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2023,8 +2281,11 @@ mod tests {
                     Some("s2".into()),
                     &expected,
                     |applied| {
-                        assert!(applied);
-                        "Started a new conversation: s2".to_owned()
+                        if applied {
+                            "Started a new conversation: s2".to_owned()
+                        } else {
+                            "The session could not move.".to_owned()
+                        }
                     },
                 )
                 .unwrap_err();
@@ -2038,8 +2299,11 @@ mod tests {
                     Some("s2".into()),
                     &expected,
                     |applied| {
-                        assert!(applied);
-                        "Started a new conversation: s2".to_owned()
+                        if applied {
+                            "Started a new conversation: s2".to_owned()
+                        } else {
+                            "The session could not move.".to_owned()
+                        }
                     },
                 )
                 .unwrap();
@@ -2061,6 +2325,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 3,
+                        sequence: 0,
                         message: inbound_message(3, 9),
                         reply: None,
                         reply_key: None,
@@ -2068,6 +2333,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2084,6 +2350,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 4,
+                        sequence: 0,
                         message: oversized,
                         reply: None,
                         reply_key: None,
@@ -2091,6 +2358,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2114,6 +2382,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 5,
+                        sequence: 0,
                         message: inbound_message(5, 9),
                         reply: None,
                         reply_key: None,
@@ -2121,6 +2390,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2163,6 +2433,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: None,
@@ -2170,6 +2441,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2184,6 +2456,7 @@ mod tests {
             std::fs::write(dir.join("reply-7.txt"), "staged reply body").unwrap();
             let manifest = StagedCompletion {
                 update_id: 7,
+                sequence: 0,
                 payload: "reply-7.txt".to_owned(),
                 key: "reply:7".to_owned(),
                 effect: StagedEffect::ReplySession {
@@ -2195,6 +2468,7 @@ mod tests {
                     binding_revision: None,
                 },
                 text: None,
+                refused_text: None,
             };
             std::fs::write(
                 dir.join("reply-7.json"),
@@ -2232,6 +2506,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 9,
+                        sequence: 0,
                         message: inbound_message(9, 9),
                         reply: None,
                         reply_key: None,
@@ -2239,6 +2514,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2279,10 +2555,12 @@ mod tests {
             std::fs::write(dir.join("reply-9.txt"), "orphan body").unwrap();
             let manifest = StagedCompletion {
                 update_id: 9,
+                sequence: 0,
                 payload: "reply-9.txt".to_owned(),
                 key: "reply:9".to_owned(),
                 effect: StagedEffect::Reply,
                 text: None,
+                refused_text: None,
             };
             std::fs::write(
                 dir.join("reply-9.json"),
@@ -2322,6 +2600,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 5,
+                        sequence: 0,
                         message: inbound_message(5, 9),
                         reply: None,
                         reply_key: None,
@@ -2329,6 +2608,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2367,6 +2647,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 3,
+                        sequence: 0,
                         message,
                         reply: None,
                         reply_key: None,
@@ -2374,6 +2655,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2386,6 +2668,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 4,
+                        sequence: 0,
                         message: crowded,
                         reply: None,
                         reply_key: None,
@@ -2393,6 +2676,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2415,6 +2699,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 3,
+                        sequence: 0,
                         message: inbound_message(3, 9),
                         reply: None,
                         reply_key: None,
@@ -2422,6 +2707,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2450,6 +2736,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 8,
+                        sequence: 0,
                         message: inbound_message(8, 9),
                         reply: None,
                         reply_key: None,
@@ -2457,6 +2744,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2469,8 +2757,11 @@ mod tests {
             store.fail_next_write_for_test();
             store
                 .record_reply_and_revocation(9, 8, "reply:8", |removed| {
-                    assert!(removed);
-                    "Pairing revoked for this chat.".to_owned()
+                    if removed {
+                        "Pairing revoked for this chat.".to_owned()
+                    } else {
+                        "This chat was not paired.".to_owned()
+                    }
                 })
                 .unwrap_err();
             assert!(
@@ -2480,8 +2771,11 @@ mod tests {
             assert!(!store.pending_updates()[0].has_reply());
             let reply = store
                 .record_reply_and_revocation(9, 8, "reply:8", |removed| {
-                    assert!(removed);
-                    "Pairing revoked for this chat.".to_owned()
+                    if removed {
+                        "Pairing revoked for this chat.".to_owned()
+                    } else {
+                        "This chat was not paired.".to_owned()
+                    }
                 })
                 .unwrap();
             assert_eq!(reply, "Pairing revoked for this chat.");
@@ -2505,6 +2799,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: None,
@@ -2512,6 +2807,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2525,6 +2821,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let record = StagedCompletion {
                 update_id: 7,
+                sequence: 0,
                 payload: "reply-7.json".to_owned(),
                 key: "reply:7".to_owned(),
                 effect: StagedEffect::ReplySession {
@@ -2536,6 +2833,7 @@ mod tests {
                     binding_revision: None,
                 },
                 text: Some("self-contained reply".to_owned()),
+                refused_text: None,
             };
             std::fs::write(
                 dir.join("reply-7.json"),
@@ -2569,6 +2867,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: None,
@@ -2576,6 +2875,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2615,6 +2915,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: None,
@@ -2622,6 +2923,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2633,6 +2935,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let record = StagedCompletion {
                 update_id: 7,
+                sequence: 0,
                 payload: "reply-7.json".to_owned(),
                 key: "reply:7".to_owned(),
                 effect: StagedEffect::ReplySession {
@@ -2644,6 +2947,7 @@ mod tests {
                     binding_revision: None,
                 },
                 text: Some("reply body".to_owned()),
+                refused_text: None,
             };
             std::fs::write(
                 dir.join("reply-7.json"),
@@ -2682,6 +2986,7 @@ mod tests {
                     &[],
                     &[DroppedUpdate {
                         update_id: 5,
+                        sequence: 0,
                         raw_kind: "edited_message".to_owned(),
                     }],
                     6,
@@ -2702,6 +3007,7 @@ mod tests {
                     &[],
                     &[DroppedUpdate {
                         update_id: 6,
+                        sequence: 0,
                         raw_kind: "reaction".to_owned(),
                     }],
                     7,
@@ -2726,6 +3032,7 @@ mod tests {
                     &[],
                     &[DroppedUpdate {
                         update_id: 7,
+                        sequence: 0,
                         raw_kind: "reaction".to_owned(),
                     }],
                     8,
@@ -2759,6 +3066,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: Some("held reply".to_owned()),
                         reply_key: Some("reply:7".to_owned()),
@@ -2766,6 +3074,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2809,6 +3118,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: None,
@@ -2816,6 +3126,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2825,7 +3136,7 @@ mod tests {
             // The host rebinds mid-turn: the agent switch clears the
             // session, so the in-flight turn's session effect is stale.
             store.set_agent(9, Some("claude".into())).unwrap();
-            store
+            let reply = store
                 .record_reply_and_session(
                     9,
                     7,
@@ -2833,11 +3144,15 @@ mod tests {
                     Some("turn-session".into()),
                     &expected,
                     |applied| {
-                        assert!(!applied, "the stale effect still applied");
-                        "turn reply".to_owned()
+                        if applied {
+                            "session moved".to_owned()
+                        } else {
+                            "turn reply".to_owned()
+                        }
                     },
                 )
                 .unwrap();
+            assert_eq!(reply, "turn reply", "the stale effect still applied");
             let binding = store.binding(9).cloned().unwrap();
             assert_eq!(binding.agent_id.as_deref(), Some("claude"));
             assert_eq!(
@@ -2866,6 +3181,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: None,
@@ -2873,6 +3189,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2921,6 +3238,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: Some("reply:7".to_owned()),
@@ -2928,6 +3246,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: Some("reply-7.txt".to_owned()),
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -2971,6 +3290,7 @@ mod tests {
                 .admit_updates(
                     &[PendingUpdate {
                         update_id: 7,
+                        sequence: 0,
                         message: inbound_message(7, 9),
                         reply: None,
                         reply_key: None,
@@ -2978,6 +3298,7 @@ mod tests {
                         reply_progress: None,
                         reply_file: None,
                         reply_retry_at_ms: None,
+                        reply_refused: false,
                     }],
                     &[],
                     &[],
@@ -3046,6 +3367,7 @@ mod tests {
                     &[
                         PendingUpdate {
                             update_id: 7,
+                            sequence: 0,
                             message: big,
                             reply: None,
                             reply_key: None,
@@ -3053,9 +3375,11 @@ mod tests {
                             reply_progress: None,
                             reply_file: None,
                             reply_retry_at_ms: None,
+                            reply_refused: false,
                         },
                         PendingUpdate {
                             update_id: 8,
+                            sequence: 0,
                             message: inbound_message(8, 9),
                             reply: None,
                             reply_key: None,
@@ -3063,6 +3387,7 @@ mod tests {
                             reply_progress: None,
                             reply_file: None,
                             reply_retry_at_ms: None,
+                            reply_refused: false,
                         },
                     ],
                     &[],
@@ -3074,6 +3399,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let record = StagedCompletion {
                 update_id: 8,
+                sequence: 0,
                 payload: "reply-8.json".to_owned(),
                 key: "reply:8".to_owned(),
                 effect: StagedEffect::ReplySession {
@@ -3085,6 +3411,7 @@ mod tests {
                     binding_revision: None,
                 },
                 text: Some("staged reply".to_owned()),
+                refused_text: None,
             };
             std::fs::write(
                 dir.join("reply-8.json"),
@@ -3120,6 +3447,141 @@ mod tests {
                 Some("y".repeat(30_000).as_str()),
                 "the staged session did not commit once it fit"
             );
+        });
+    }
+
+    #[test]
+    fn a_restarted_sequence_claims_a_reused_update_id_for_fresh_work() {
+        temp_store(|mut store| {
+            // A dead sequence's retained task claims its id only under
+            // its own sequence: after expiry the same update id admits
+            // fresh work instead of being skipped as already claimed.
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: Some("old reply".to_owned()),
+                        reply_key: Some("reply:7".to_owned()),
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            store.expire_sequence().unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            let tasks = store.pending_updates();
+            assert_eq!(tasks.len(), 2, "the reused id dropped fresh work");
+            assert_eq!(tasks[0].key(), TaskKey::new(0, 7));
+            assert_eq!(tasks[1].key(), TaskKey::new(1, 7));
+            assert!(
+                !tasks[1].has_reply(),
+                "the fresh task inherited the dead record's reply"
+            );
+            // Each record settles on its own key: the fresh task can
+            // complete while the dead record's reply stays owed.
+            store.complete_update(TaskKey::new(1, 7)).unwrap();
+            let tasks = store.pending_updates();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].key(), TaskKey::new(0, 7));
+        });
+    }
+
+    #[test]
+    fn a_recovered_record_binds_the_variant_its_effect_committed() {
+        temp_store(|mut store| {
+            let pending = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(9, Some("codex".into())).unwrap();
+            let expected = store.binding(9).cloned().unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // The binding moves before recovery — while the durable
+            // record only exists as its manifest — so the guarded
+            // session write is stale by the time any mutation can
+            // pick the record up.
+            store.set_agent(9, Some("claude".into())).unwrap();
+            // The crash window the finding names: a staged record that
+            // carries both outcome variants survived on disk while the
+            // document write that would have committed the session and
+            // the reply pointer never landed.
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = StagedCompletion {
+                update_id: 7,
+                sequence: 0,
+                payload: "reply-7.json".to_owned(),
+                key: "reply:7".to_owned(),
+                effect: StagedEffect::ReplySession {
+                    chat_id: 9,
+                    session_id: Some("s2".into()),
+                    user_id: Some(expected.user_id),
+                    agent_id: expected.agent_id.clone(),
+                    prior_session: Some(expected.session_id.clone()),
+                    binding_revision: Some(expected.revision),
+                },
+                text: Some("Bound session: s2".to_owned()),
+                refused_text: Some("The chat moved on — the session was not applied.".to_owned()),
+            };
+            std::fs::write(
+                dir.join("reply-7.json"),
+                serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+            assert!(store.staged_reply_pending(7));
+            store.reconcile_staged().unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert!(task.reply_refused);
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some("The chat moved on — the session was not applied."),
+                "recovery delivered the success text of a refused effect"
+            );
+            let binding = store.binding(9).unwrap();
+            assert_eq!(binding.agent_id.as_deref(), Some("claude"));
+            assert_eq!(binding.session_id, None);
         });
     }
 }

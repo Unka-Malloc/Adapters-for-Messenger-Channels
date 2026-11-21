@@ -488,8 +488,18 @@ fn write_masked_text_frame(stream: &mut dyn Write, payload: &[u8]) -> Result<(),
 
 impl GatewayConnection for LiveGatewayConnection {
     fn read_frame(&mut self, timeout: Duration) -> Result<GatewayRead, DiscordApiError> {
-        self.set_read_timeout(timeout)?;
+        // The budget bounds the whole call, not each internal read:
+        // non-terminal frames are skipped inside this loop, so every
+        // iteration re-arms the socket with only the remaining
+        // deadline — a stream of Ping/Pong/Binary traffic can never
+        // stretch one read_frame past what the session scheduled.
+        let deadline = Instant::now() + timeout;
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(GatewayRead::Timeout);
+            }
+            self.set_read_timeout(remaining)?;
             match self.socket.read() {
                 Ok(tungstenite::Message::Text(text)) => {
                     return Ok(GatewayRead::Text(text.to_string()));
@@ -1428,6 +1438,50 @@ mod tests {
             sent.lock().unwrap().is_empty(),
             "a pre-HELLO connection sent protocol traffic"
         );
+    }
+
+    #[test]
+    fn a_live_read_stays_inside_its_deadline_under_control_traffic() {
+        // A peer that floods non-terminal frames but never sends HELLO:
+        // each internal socket read gets only the remaining budget, so
+        // the call reports Timeout at the deadline instead of looping
+        // on per-read windows that continuous Ping traffic keeps fed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut server = tungstenite::WebSocket::from_raw_socket(
+            server,
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        let flood = std::thread::spawn(move || {
+            for _ in 0..4_000 {
+                if server
+                    .send(tungstenite::Message::Ping(vec![0u8; 4].into()))
+                    .is_err()
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let socket = tungstenite::WebSocket::from_partially_read(
+            Box::new(client) as Box<dyn GatewayStream>,
+            Vec::new(),
+            tungstenite::protocol::Role::Client,
+            None,
+        );
+        let mut connection = LiveGatewayConnection { socket };
+        let started = Instant::now();
+        let read = connection.read_frame(Duration::from_millis(60)).unwrap();
+        assert!(matches!(read, GatewayRead::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "control-frame traffic stretched the read past its deadline"
+        );
+        drop(connection);
+        flood.join().unwrap();
     }
 
     #[test]
