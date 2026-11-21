@@ -391,6 +391,13 @@ pub struct BindingStore {
     path: PathBuf,
     lock: File,
     document: BindingDocument,
+    /// Tasks a committed mutation newly bound a staged reply onto —
+    /// records that could not fit earlier and became deliverable when
+    /// another write freed document space. In-memory only: the
+    /// runtime drains it to queue each recovered reply once for
+    /// resend; anything left at exit stays durable on disk for the
+    /// next restart's reconciliation.
+    bound_replies: Vec<TaskKey>,
     #[cfg(test)]
     fail_next_write: bool,
     /// Mutations allowed to succeed before `fail_next_write` fires —
@@ -418,6 +425,7 @@ impl BindingStore {
             path,
             lock,
             document,
+            bound_replies: Vec::new(),
             #[cfg(test)]
             fail_next_write: false,
             #[cfg(test)]
@@ -478,7 +486,7 @@ impl BindingStore {
             let dir = replies_dir(&self.path);
             let document = read_document(&self.path)?;
             let mut staged = document.clone();
-            apply_staged(&mut staged, &dir);
+            let bound = apply_staged(&mut staged, &dir);
             let mut candidate = staged.clone();
             let value = change(&mut candidate)?;
             // The file must stay readable under its own bound: a
@@ -491,6 +499,7 @@ impl BindingStore {
             if raw.len() + headroom <= MAX_STATE_BYTES {
                 atomic_write_private_text(&self.path, &raw)?;
                 self.document = candidate;
+                self.bound_replies.extend(bound);
                 return Ok(value);
             }
             // The change does not fit — its work stays uncommitted,
@@ -501,6 +510,7 @@ impl BindingStore {
                 if raw.len() <= MAX_STATE_BYTES {
                     atomic_write_private_text(&self.path, &raw)?;
                     self.document = staged;
+                    self.bound_replies.extend(bound);
                 }
             }
             Err(anyhow!("a4mc_telegram_state_full"))
@@ -1305,6 +1315,51 @@ impl BindingStore {
         staged_exists(&replies_dir(&self.path), key.into())
     }
 
+    /// Whether a staged completion for the task is still waiting to
+    /// bind — the durable record exists but the task does not yet
+    /// carry its pointer. A bound completion is the task's reply
+    /// payload itself, not an outstanding bind: a capacity failure on
+    /// a later write — a checkpoint or retry deadline the document no
+    /// longer fits — is not the nonfatal staged-record case the
+    /// runtime tolerates and must surface as the write failure it is.
+    pub fn staged_reply_unbound(&self, key: impl Into<TaskKey>) -> bool {
+        let key = key.into();
+        let dir = replies_dir(&self.path);
+        let Some(manifest) = read_staged_manifest(&dir, key) else {
+            return false;
+        };
+        !self.document.pending_updates.iter().any(|task| {
+            task.key() == key && task.reply_file.as_deref() == Some(manifest.payload.as_str())
+        })
+    }
+
+    /// The tasks a committed mutation newly bound a staged reply onto
+    /// since the last drain — replies that became deliverable when a
+    /// write freed the document space they were waiting for. Drained
+    /// once so the runtime queues each for resend exactly once; a key
+    /// whose task already settled drops out here instead of queueing
+    /// stale work.
+    pub fn take_bound_replies(&mut self) -> Vec<PendingUpdate> {
+        std::mem::take(&mut self.bound_replies)
+            .into_iter()
+            .filter_map(|key| {
+                self.document
+                    .pending_updates
+                    .iter()
+                    .find(|task| task.key() == key && task.has_reply())
+                    .cloned()
+            })
+            .collect()
+    }
+
+    /// Return keys the scheduler could not admit yet — the poller's
+    /// backlog drain offers them again once capacity frees, so a
+    /// newly deliverable reply is never lost between the store and a
+    /// full lane.
+    pub fn restage_bound_replies(&mut self, keys: Vec<TaskKey>) {
+        self.bound_replies.extend(keys);
+    }
+
     /// The update ids this store already durably claimed — settled ids
     /// plus the live-sequence ids of pending tasks. Settled records and
     /// claims mean nothing outside the sequence they were confirmed
@@ -1329,7 +1384,7 @@ impl BindingStore {
     /// with nothing staged it is a pure no-op, never a rewrite.
     pub fn reconcile_staged(&mut self) -> Result<Vec<StrandedReply>> {
         let dir = replies_dir(&self.path);
-        if staged_manifests(&dir).is_empty() {
+        if staged_update_keys(&dir).is_empty() {
             return Ok(Vec::new());
         }
         self.mutate(|document| {
@@ -1381,8 +1436,12 @@ impl BindingStore {
     /// inline; a spilled record's payload lives in its sidecar file.
     /// A task marked `reply_refused` resolves the manifest's refused
     /// variant — for a pointer manifest that text lives in the `.json`
-    /// record, not the payload sidecar. `Ok(None)` means no finished
-    /// reply is recorded.
+    /// record, not the payload sidecar. A bound self-contained record
+    /// is revalidated against the document it sits on: a pairing offer
+    /// whose exact record no longer holds — elapsed during downtime,
+    /// approved, or replaced by a newer request — resolves to its
+    /// refused variant, so a recovered resend can never publish a dead
+    /// code. `Ok(None)` means no finished reply is recorded.
     pub fn reply_text(&self, task: &PendingUpdate) -> Result<Option<String>> {
         if let Some(reply) = &task.reply {
             return Ok(Some(reply.clone()));
@@ -1390,6 +1449,19 @@ impl BindingStore {
         let Some(name) = &task.reply_file else {
             return Ok(None);
         };
+        if name.ends_with(".json") {
+            let staged = read_staged_record(&self.path, name, task.key())?
+                .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))?;
+            let refused =
+                task.reply_refused || pairing_offer_lapsed(&self.document, &staged.effect);
+            return if refused {
+                staged.refused_text.or(staged.text)
+            } else {
+                staged.text
+            }
+            .map(Some)
+            .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"));
+        }
         if task.reply_refused {
             let manifest = manifest_file_name(task.key());
             return read_reply_payload(&self.path, &manifest, task.key(), true)?
@@ -1528,6 +1600,49 @@ fn read_reply_payload(
     Ok(None)
 }
 
+/// Read one bound self-contained record by the file name the task
+/// points at — the store's sidecar directory first, then the legacy
+/// directory. Identity is verified against the task exactly as
+/// discovery verifies it; a record that cannot parse is lost, not
+/// skipped, matching the payload resolution callers replaced.
+fn read_staged_record(path: &Path, name: &str, key: TaskKey) -> Result<Option<StagedCompletion>> {
+    for dir in [replies_dir(path), legacy_replies_dir(path)] {
+        let Some(raw) = read_private_text_bounded(&dir.join(name), MAX_STAGED_BYTES)? else {
+            continue;
+        };
+        return serde_json::from_str::<StagedCompletion>(&raw)
+            .ok()
+            .filter(|staged| staged.update_id == key.update_id && staged.sequence == key.sequence)
+            .map(Some)
+            .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"));
+    }
+    Ok(None)
+}
+
+/// Whether a pairing offer a staged effect recorded no longer holds —
+/// its TTL elapsed, an approval paired the user it was minted for, or
+/// a newer request replaced its code — so the reply publishing it must
+/// resolve to the refused variant instead of a dead code. Revalidated
+/// on the live document at send time: an offer that still holds
+/// delivers its recorded text unchanged.
+fn pairing_offer_lapsed(document: &BindingDocument, effect: &StagedEffect) -> bool {
+    let StagedEffect::ReplyPairing { record } = effect else {
+        return false;
+    };
+    let now = now_secs();
+    record.expires_at <= now
+        || document
+            .chats
+            .get(&record.chat_id.to_string())
+            .is_some_and(|binding| binding.paired && binding.user_id == record.user_id)
+        || !document.pairings.iter().any(|held| {
+            held.code == record.code
+                && held.chat_id == record.chat_id
+                && held.user_id == record.user_id
+                && held.expires_at > now
+        })
+}
+
 fn decode_reply_payload(name: &str, raw: &str, key: TaskKey, refused: bool) -> Result<String> {
     if !name.ends_with(".json") {
         return Ok(raw.to_owned());
@@ -1582,16 +1697,7 @@ fn staged_file_name_id(name: &str) -> Option<(TaskKey, &str)> {
 /// binds its pointer. A self-contained record always qualifies; a
 /// pointer manifest does only while its payload file exists.
 fn staged_exists(dir: &Path, key: TaskKey) -> bool {
-    let Ok(raw) = read_private_text_bounded(&dir.join(manifest_file_name(key)), MAX_STAGED_BYTES)
-    else {
-        return false;
-    };
-    raw.and_then(|raw| serde_json::from_str::<StagedCompletion>(&raw).ok())
-        .filter(|staged| {
-            staged.update_id == key.update_id
-                && staged.sequence == key.sequence
-                && staged_payload_name_ok(staged, key)
-        })
+    read_staged_manifest(dir, key)
         .is_some_and(|staged| staged.text.is_some() || dir.join(&staged.payload).is_file())
 }
 
@@ -1615,33 +1721,23 @@ fn staged_update_keys(dir: &Path) -> Vec<TaskKey> {
     keys
 }
 
-/// Read every staged manifest in the directory. Entries whose file
-/// name, declared identity or declared payload name disagree are
-/// reported as invalid; a manifest for a finished task the document
-/// already answers is ignored by `apply_staged`.
-fn staged_manifests(dir: &Path) -> Vec<(TaskKey, Option<StagedCompletion>)> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some((key, "json")) = staged_file_name_id(name) else {
-            continue;
-        };
-        let staged = read_private_text_bounded(&entry.path(), MAX_STAGED_BYTES)
-            .ok()
-            .flatten()
-            .and_then(|raw| serde_json::from_str::<StagedCompletion>(&raw).ok())
-            .filter(|staged: &StagedCompletion| {
-                staged.update_id == key.update_id
-                    && staged.sequence == key.sequence
-                    && staged_payload_name_ok(staged, key)
-            });
-        out.push((key, staged));
-    }
-    out
+/// Read one staged manifest by its task key — the file name, declared
+/// identity and declared payload name verified exactly as directory
+/// discovery verified them. `None` covers a missing, unreadable or
+/// disagreeing record, which callers report as invalid. Manifests are
+/// read one at a time wherever staged work is reconciled or swept, so
+/// a deep backlog of self-contained records — each carrying its full
+/// reply body — is never resident in memory at once.
+fn read_staged_manifest(dir: &Path, key: TaskKey) -> Option<StagedCompletion> {
+    read_private_text_bounded(&dir.join(manifest_file_name(key)), MAX_STAGED_BYTES)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<StagedCompletion>(&raw).ok())
+        .filter(|staged: &StagedCompletion| {
+            staged.update_id == key.update_id
+                && staged.sequence == key.sequence
+                && staged_payload_name_ok(staged, key)
+        })
 }
 
 /// The document's serialized size — the bound every commit is checked
@@ -1657,10 +1753,14 @@ fn serialized_len(document: &BindingDocument) -> Option<usize> {
 /// performed it, and the task gains the payload pointer and delivery
 /// key. Manifests are read under the caller's lock, so a completion
 /// being written by another mutation is either already durable here or
-/// still staging — never half-read.
-fn apply_staged(document: &mut BindingDocument, dir: &Path) {
+/// still staging — never half-read. Returns the keys this call newly
+/// bound — each a reply that became deliverable, reported so the
+/// runtime can queue it for resend once. A task already holding its
+/// bound reply never re-enters the list.
+fn apply_staged(document: &mut BindingDocument, dir: &Path) -> Vec<TaskKey> {
+    let mut bound = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return bound;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1721,8 +1821,11 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
         task.reply_refused = !applied && staged.refused_text.is_some();
         if serialized_len(document).is_none_or(|len| len > MAX_STATE_BYTES) {
             *document = before;
+        } else {
+            bound.push(key);
         }
     }
+    bound
 }
 
 /// The staged completions a document still has not bound — each with
@@ -1730,7 +1833,8 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
 /// task is gone is ignored: the sweep reclaims it.
 fn stranded_staged(document: &BindingDocument, dir: &Path) -> Vec<StrandedReply> {
     let mut out = Vec::new();
-    for (key, staged) in staged_manifests(dir) {
+    for key in staged_update_keys(dir) {
+        let staged = read_staged_manifest(dir, key);
         let applied = document
             .pending_updates
             .iter()
@@ -1957,7 +2061,8 @@ fn sweep_reply_files(path: &Path, document: &BindingDocument) {
         .iter()
         .filter_map(|task| task.reply_file.clone())
         .collect();
-    for (key, staged) in staged_manifests(&dir) {
+    for key in staged_update_keys(&dir) {
+        let staged = read_staged_manifest(&dir, key);
         let task = document
             .pending_updates
             .iter()
@@ -3807,6 +3912,136 @@ mod tests {
                 store.pending_pairings()
             );
             assert!(store.binding(9).unwrap().paired);
+        });
+    }
+
+    #[test]
+    fn a_replaced_pairing_offer_resolves_its_refused_variant_at_send_time() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // The offer and the reply carrying its code commit bound:
+            // revalidation at send time must leave a still-current
+            // offer's text untouched.
+            let refused = "That pairing offer did not hold — send /start to request a fresh code.";
+            let reply = store
+                .record_pairing_and_reply(
+                    9,
+                    9,
+                    Some("alice".into()),
+                    7,
+                    "reply:7",
+                    |record| format!("Pairing code: {}", record.code),
+                    refused,
+                )
+                .unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert!(!task.reply_refused);
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(reply.as_str()),
+                "a current offer's recorded text resolved refused"
+            );
+            // A newer request replaces the exact offer while the reply
+            // waits to send: the recorded code is dead, so the send
+            // resolves the refused variant instead of publishing it.
+            store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(refused),
+                "a replaced offer's send resolved its recorded code"
+            );
+            // An approval landing while the reply waits lapses the
+            // offer the same way.
+            let pending = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(refused),
+                "an approved user's send resolved its recorded code"
+            );
+        });
+    }
+
+    #[test]
+    fn a_bound_record_is_not_an_unbound_staged_reply() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            assert!(
+                !store.staged_reply_unbound(7),
+                "nothing staged is not an unbound completion"
+            );
+            // A self-contained record still waiting for its document
+            // pointer is the only shape the nonfatal exception covers.
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = StagedCompletion {
+                update_id: 7,
+                sequence: 0,
+                payload: "reply-7.json".to_owned(),
+                key: "reply:7".to_owned(),
+                effect: StagedEffect::Reply,
+                text: Some("staged reply".to_owned()),
+                refused_text: None,
+            };
+            std::fs::write(
+                dir.join("reply-7.json"),
+                serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                store.staged_reply_unbound(7),
+                "a record whose pointer never committed is unbound"
+            );
+            // Once bound the manifest file remains as the task's own
+            // payload: it is still a staged record on disk, but a
+            // capacity refusal on a LATER write — a checkpoint or retry
+            // deadline — is not the stranded-completion case and must
+            // not be classified as one.
+            store.reconcile_staged().unwrap();
+            assert!(
+                store.staged_reply_pending(7),
+                "the bound payload record no longer reads as staged"
+            );
+            assert!(
+                !store.staged_reply_unbound(7),
+                "a bound record classified as unbound masks checkpoint failures"
+            );
         });
     }
 }

@@ -282,75 +282,100 @@ fn parse_gateway_endpoint(url: &str) -> Result<GatewayEndpoint, DiscordApiError>
     })
 }
 
-/// The byte stream under a live websocket. Exposes the read timeout the
-/// session needs to interleave heartbeats with idle waits.
+/// The byte stream under a live websocket. Exposes the deadline the
+/// session arms so one bounded call bounds every socket operation —
+/// reads a TLS layer performs while assembling one record included.
 trait GatewayStream: Read + Write + Send {
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    /// Arm the absolute deadline every underlying socket operation
+    /// enforces, or disarm back to the configured idle timeouts.
+    fn arm_deadline(&mut self, deadline: Option<Instant>);
 }
 
-impl GatewayStream for TcpStream {
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        TcpStream::set_read_timeout(self, timeout)
-    }
-}
-
-impl GatewayStream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.sock.set_read_timeout(timeout)
-    }
-}
-
-/// One absolute deadline enforced at the I/O boundary. Arming a socket
-/// timeout once per `socket.read` cannot bound a fragmented frame:
-/// tungstenite assembles it through several blocking reads and each
-/// would carry the same full budget, so a frame arriving one byte per
-/// timeout window outlives the HELLO/heartbeat deadline it was
-/// scheduled under. This wrapper re-arms the real socket timeout with
-/// only the remaining budget on EVERY read it performs, so no read —
-/// mid-fragment included — can outlive the deadline the caller armed.
-/// `None` leaves the stream's configured idle timeout for traffic
-/// outside a bounded call.
-struct DeadlineStream {
-    inner: Box<dyn GatewayStream>,
+/// One absolute deadline enforced at the TCP socket itself — beneath
+/// the TLS layer, not around it. Arming a socket timeout once per
+/// outer `read` cannot bound the assembly loops above the socket:
+/// `rustls::StreamOwned` reads one TLS record through several TCP
+/// reads, each carrying the same relative budget, so a record
+/// dripping in pieces outlives the HELLO/heartbeat deadline it was
+/// scheduled under. This socket re-arms the real timeout with only
+/// the remaining budget on EVERY read — and on every write, so a Pong
+/// flush a websocket read performs inside the bounded call cannot
+/// hide behind the long idle write timeout either. `None` restores
+/// the configured idle timeouts for traffic outside a bounded call.
+struct DeadlineSocket {
+    sock: TcpStream,
     deadline: Option<Instant>,
 }
 
-impl DeadlineStream {
+impl DeadlineSocket {
     fn arm(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
         if deadline.is_none() {
-            // Outside a bounded call the stream keeps its configured
-            // idle timeout — never a shrunken remainder the last read
-            // left armed.
-            let _ = self.inner.set_read_timeout(Some(IO_TIMEOUT));
+            // Outside a bounded call the socket keeps its configured
+            // idle timeouts — never a shrunken remainder the last
+            // operation left armed.
+            let _ = self.sock.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = self.sock.set_write_timeout(Some(IO_TIMEOUT));
         }
     }
-}
 
-impl Read for DeadlineStream {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(deadline) = self.deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+    /// The budget left under the armed deadline, for one socket
+    /// operation — `Some(zero)` once it has passed.
+    fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// Arm the operation's socket timeout to the remaining budget, or
+    /// fail fast once the deadline passed.
+    fn gate(
+        &self,
+        set: impl FnOnce(Option<Duration>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if let Some(remaining) = self.remaining() {
             if remaining.is_zero() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "read deadline reached",
+                    "deadline reached",
                 ));
             }
-            self.inner
-                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+            set(Some(remaining.max(Duration::from_millis(1))))?;
         }
-        self.inner.read(buffer)
+        Ok(())
     }
 }
 
-impl Write for DeadlineStream {
+impl Read for DeadlineSocket {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.gate(|timeout| self.sock.set_read_timeout(timeout))?;
+        self.sock.read(buffer)
+    }
+}
+
+impl Write for DeadlineSocket {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buffer)
+        self.gate(|timeout| self.sock.set_write_timeout(timeout))?;
+        self.sock.write(buffer)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        self.gate(|timeout| self.sock.set_write_timeout(timeout))?;
+        self.sock.flush()
+    }
+}
+
+impl GatewayStream for DeadlineSocket {
+    fn arm_deadline(&mut self, deadline: Option<Instant>) {
+        self.arm(deadline);
+    }
+}
+
+impl GatewayStream for rustls::StreamOwned<rustls::ClientConnection, DeadlineSocket> {
+    fn arm_deadline(&mut self, deadline: Option<Instant>) {
+        // The deadline reaches the socket under TLS: every TCP read a
+        // record's assembly performs, and every write a read-side
+        // flush performs, enforces it there.
+        self.sock.arm(deadline);
     }
 }
 
@@ -366,7 +391,7 @@ const MAX_HANDSHAKE_RESPONSE: usize = 16 * 1024;
 /// uses the platform root store.
 fn connect_websocket(
     endpoint: &GatewayEndpoint,
-) -> Result<tungstenite::WebSocket<DeadlineStream>, DiscordApiError> {
+) -> Result<tungstenite::WebSocket<Box<dyn GatewayStream>>, DiscordApiError> {
     let failed = || {
         DiscordApiError::new(
             "a4mc_discord_gateway_connect_failed",
@@ -385,6 +410,10 @@ fn connect_websocket(
     let _ = tcp.set_nodelay(true);
     let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
     let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
+    let socket = DeadlineSocket {
+        sock: tcp,
+        deadline: None,
+    };
     let mut stream: Box<dyn GatewayStream> = if endpoint.tls {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut roots = rustls::RootCertStore::empty();
@@ -401,9 +430,11 @@ fn connect_websocket(
             rustls::pki_types::ServerName::try_from(endpoint.host.clone()).map_err(|_| failed())?;
         let conn =
             rustls::ClientConnection::new(Arc::new(config), server_name).map_err(|_| failed())?;
-        Box::new(rustls::StreamOwned::new(conn, tcp))
+        // TLS sits over the deadline socket: the armed deadline bounds
+        // every TCP read a TLS record's assembly performs.
+        Box::new(rustls::StreamOwned::new(conn, socket))
     } else {
-        Box::new(tcp)
+        Box::new(socket)
     };
 
     // Upgrade handshake written directly: the request target never
@@ -470,10 +501,7 @@ fn connect_websocket(
         return Err(failed());
     }
     Ok(tungstenite::WebSocket::from_partially_read(
-        DeadlineStream {
-            inner: stream,
-            deadline: None,
-        },
+        stream,
         leftover,
         tungstenite::protocol::Role::Client,
         None,
@@ -494,14 +522,14 @@ impl GatewayConnector for LiveGatewayConnector {
 }
 
 struct LiveGatewayConnection {
-    socket: tungstenite::WebSocket<DeadlineStream>,
+    socket: tungstenite::WebSocket<Box<dyn GatewayStream>>,
 }
 
 /// Encode one client text frame (FIN, masked) and write it straight to
 /// the stream. tungstenite's send path traces the full frame payload —
 /// hex, but still the bytes — so a token-bearing `IDENTIFY`/`RESUME`
 /// never goes through it.
-fn write_masked_text_frame(stream: &mut dyn Write, payload: &[u8]) -> Result<(), DiscordApiError> {
+fn write_masked_text_frame(stream: &mut impl Write, payload: &[u8]) -> Result<(), DiscordApiError> {
     let mut mask = [0u8; 4];
     OsRng.fill_bytes(&mut mask);
     let mut frame = Vec::with_capacity(payload.len() + 14);
@@ -540,7 +568,7 @@ impl GatewayConnection for LiveGatewayConnection {
         // dripping one byte per timeout window can never stretch one
         // read_frame past what the session scheduled.
         let deadline = Instant::now() + timeout;
-        self.socket.get_mut().arm(Some(deadline));
+        self.socket.get_mut().arm_deadline(Some(deadline));
         let result = loop {
             if deadline.saturating_duration_since(Instant::now()).is_zero() {
                 break Ok(GatewayRead::Timeout);
@@ -576,7 +604,7 @@ impl GatewayConnection for LiveGatewayConnection {
                 }
             }
         };
-        self.socket.get_mut().arm(None);
+        self.socket.get_mut().arm_deadline(None);
         result
     }
 
@@ -1514,10 +1542,10 @@ mod tests {
             }
         });
         let socket = tungstenite::WebSocket::from_partially_read(
-            DeadlineStream {
-                inner: Box::new(client),
+            Box::new(DeadlineSocket {
+                sock: client,
                 deadline: None,
-            },
+            }) as Box<dyn GatewayStream>,
             Vec::new(),
             tungstenite::protocol::Role::Client,
             None,
@@ -1560,10 +1588,10 @@ mod tests {
             }
         });
         let socket = tungstenite::WebSocket::from_partially_read(
-            DeadlineStream {
-                inner: Box::new(client),
+            Box::new(DeadlineSocket {
+                sock: client,
                 deadline: None,
-            },
+            }) as Box<dyn GatewayStream>,
             Vec::new(),
             tungstenite::protocol::Role::Client,
             None,
@@ -1575,6 +1603,72 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(250),
             "a fragmented frame stretched the read past its deadline"
+        );
+        drop(connection);
+        drip.join().unwrap();
+    }
+
+    #[test]
+    fn a_tls_record_dripping_across_tcp_reads_stays_inside_the_deadline() {
+        // The live TLS path: rustls assembles one TLS record through
+        // several TCP reads inside a single stream read, and the peer
+        // drips the record a byte at a time so the whole assembly
+        // outlasts the deadline several times over. The deadline is
+        // armed at the socket UNDER TLS, so every one of those reads
+        // carries only the remaining budget — the call reports Timeout
+        // at the deadline instead of granting each TCP read the same
+        // relative window again.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let drip = std::thread::spawn(move || {
+            let mut server = server;
+            // Consume the ClientHello the client flushes first, then
+            // feed one TLS application-data record a byte at a time:
+            // content type 23, version 3.3, length 0x0100 — its
+            // ciphertext never has to parse, assembly itself is what
+            // the deadline must bound.
+            let mut hello = [0u8; 8192];
+            let _ = server.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = server.read(&mut hello);
+            let mut record = vec![0x17u8, 0x03, 0x03, 0x01, 0x00];
+            record.extend(std::iter::repeat_n(0u8, 256));
+            for byte in record {
+                if server.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let socket = tungstenite::WebSocket::from_partially_read(
+            Box::new(rustls::StreamOwned::new(
+                conn,
+                DeadlineSocket {
+                    sock: client,
+                    deadline: None,
+                },
+            )) as Box<dyn GatewayStream>,
+            Vec::new(),
+            tungstenite::protocol::Role::Client,
+            None,
+        );
+        let mut connection = LiveGatewayConnection { socket };
+        let started = Instant::now();
+        let read = connection.read_frame(Duration::from_millis(60)).unwrap();
+        assert!(matches!(read, GatewayRead::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a TLS record dripping across TCP reads stretched the read past its deadline"
         );
         drop(connection);
         drip.join().unwrap();

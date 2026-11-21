@@ -237,8 +237,7 @@ impl Scheduler {
         self.state.lock().unwrap().admitted
     }
 
-    fn enqueue(&self, job: Scheduled) {
-        let mut state = self.state.lock().unwrap();
+    fn push(state: &mut SchedulerState, job: Scheduled) {
         let chat_id = match &job {
             Scheduled::Message { message, .. } => message.chat_id,
             Scheduled::Resend { task, .. } => task.message.chat_id,
@@ -249,7 +248,28 @@ impl Scheduler {
             state.ready.push_back(chat_id);
             state.queued.insert(chat_id);
         }
+    }
+
+    fn enqueue(&self, job: Scheduled) {
+        let mut state = self.state.lock().unwrap();
+        Self::push(&mut state, job);
         self.wake.notify_one();
+    }
+
+    /// Admit one job only while a slot is free — a reply a mutation
+    /// newly bound is queued through the same bounded admission every
+    /// other job honors, so recovery work can never push admitted
+    /// counts past `max_admitted`. `false` once the pipeline is full
+    /// or drained: the caller re-stages the record for the backlog
+    /// drain instead of enqueueing past the bound.
+    fn try_enqueue(&self, job: Scheduled) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.drained || state.admitted >= self.max_admitted {
+            return false;
+        }
+        Self::push(&mut state, job);
+        self.wake.notify_one();
+        true
     }
 
     /// Spawn the worker pool, reporting processor failures through
@@ -438,12 +458,13 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     let worker_failure = Arc::new(Mutex::new(None::<anyhow::Error>));
     let processor_channel = Arc::clone(&channel);
     let processor_store = Arc::clone(&store);
+    let processor_scheduler = Arc::clone(&scheduler);
     let processor_identity = identity.clone();
     let processor_stop = Arc::clone(&config.stop);
     let processor_stuck = Arc::clone(&on_stuck);
     let turn_deadline = config.turn_deadline;
     let processor = move |chat_id: i64, job: Scheduled| -> Result<()> {
-        match job {
+        let result = match job {
             Scheduled::Resend { task } => {
                 // Reload the durable record: a queued wait may span
                 // another attempt's writes — retrying the stale
@@ -539,14 +560,17 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                     // original error. The task stays claimed for
                     // recovery either way. Exactly one shape stays
                     // nonfatal: a completion whose staged record is
-                    // durable but exceeds document capacity — it binds
-                    // on recovery, so reporting it and continuing is
-                    // the established contract. Every other write
-                    // failure — a checkpoint or progress write that
-                    // could not land included — reaches the supervising
-                    // loop as the resend and fallback paths surface
-                    // theirs, because polling must not continue on a
-                    // store that cannot take writes.
+                    // durable but still UNBOUND — it could not fit the
+                    // document — since it binds on recovery, so
+                    // reporting it and continuing is the established
+                    // contract. A state-full refusal on any later write
+                    // — a checkpoint or retry deadline that no longer
+                    // fits — is a different failure even though the
+                    // task's own bound record still sits in the staged
+                    // directory as its payload: it reaches the
+                    // supervising loop as the resend and fallback paths
+                    // surface theirs, because polling must not continue
+                    // on a store that cannot take writes.
                     Err(error) if is_persistence_failure(&error) => {
                         report_stranded(
                             &processor_store,
@@ -555,7 +579,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                             &failure_code(&error),
                         );
                         let durable_staged = failure_code(&error) == "a4mc_telegram_state_full"
-                            && processor_store.lock().unwrap().staged_reply_pending(key);
+                            && processor_store.lock().unwrap().staged_reply_unbound(key);
                         if durable_staged { Ok(()) } else { Err(error) }
                     }
                     Err(error) => handle_failed_inbound(
@@ -570,7 +594,28 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                     ),
                 }
             }
+        };
+        // A mutation this job committed can newly bind a staged reply
+        // that could not fit before — a completed task freeing
+        // document space is exactly what lets a record stranded since
+        // startup land. Each newly bound reply is queued once for
+        // resend on its own chat lane, so a reply that became
+        // deliverable never waits for a restart; whatever the
+        // admission bound cannot take stays re-staged for the
+        // poller's backlog drain.
+        let mut rest = Vec::new();
+        for task in processor_store.lock().unwrap().take_bound_replies() {
+            let key = task.key();
+            if !processor_scheduler.try_enqueue(Scheduled::Resend {
+                task: Box::new(task),
+            }) {
+                rest.push(key);
+            }
         }
+        if !rest.is_empty() {
+            processor_store.lock().unwrap().restage_bound_replies(rest);
+        }
+        result
     };
 
     let mut pending: VecDeque<Scheduled> = VecDeque::new();
@@ -626,7 +671,11 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     // change. Only the claim decides the lane: a finished reply's
     // body — possibly several MiB spilled to a sidecar — is loaded by
     // the worker that takes the job, not eagerly here, so the whole
-    // backlog's payloads are never resident at once.
+    // backlog's payloads are never resident at once. Replies bound by
+    // the recovery writes above are covered by this same snapshot —
+    // drop them from the newly-bound drain so only binds landing
+    // after startup reach the resend path.
+    let _ = store.lock().unwrap().take_bound_replies();
     let unfinished = store.lock().unwrap().pending_updates();
     for task in unfinished {
         if staged.contains(&task.key()) {
@@ -1140,6 +1189,15 @@ fn poll_updates<T: BotTransport>(
                 cursor.sequence_age.reset();
             }
         }
+        // Mutations since the last round — the batch writes above and
+        // worker commits the scheduler could not take — may have newly
+        // bound a staged reply that was stranded for space. Each joins
+        // the same bounded backlog recovered work took at startup.
+        for task in store.lock().unwrap().take_bound_replies() {
+            pending.push_back(Scheduled::Resend {
+                task: Box::new(task),
+            });
+        }
         admit_available(scheduler, pending);
     }
     Ok(())
@@ -1563,13 +1621,42 @@ fn deliver_recorded_reply<T: BotTransport>(
     wait: bool,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let parts = reply_sends(chat_id, reply_to_message_id, delivery_key, reply);
+    let mut text = reply.to_owned();
+    let mut parts = reply_sends(chat_id, reply_to_message_id, delivery_key, &text);
     if sent >= parts.len() {
         return Ok(());
     }
     let mut resume = progress;
     let mut transient_failures = 0u32;
-    for (index, part) in parts.iter().enumerate().skip(sent) {
+    let mut index = sent;
+    'parts: while index < parts.len() {
+        // Before a send it is still safe to shape — the leading send
+        // with no confirmed part and no uncertain outcome outstanding —
+        // the recorded text is revalidated against the durable record:
+        // a pairing offer whose exact record lapsed while a shutdown or
+        // a policy deferral held the send resolves to its refused
+        // variant, so the first attempt can never publish a dead code.
+        // A confirmed part prefix and an uncertain checkpoint keep the
+        // text they earned — revalidation never rewrites a send the
+        // platform may already have seen.
+        if index == 0
+            && resume
+                .as_ref()
+                .is_none_or(|progress| !progress.outcome_unknown)
+        {
+            let current = {
+                let mut store = store.lock().unwrap();
+                let _ = store.refresh();
+                store
+                    .pending_update(key)
+                    .and_then(|task| store.reply_text(&task).ok().flatten())
+            };
+            if let Some(current) = current.filter(|current| *current != text) {
+                text = current;
+                parts = reply_sends(chat_id, reply_to_message_id, delivery_key, &text);
+                continue 'parts;
+            }
+        }
         loop {
             let mut observe = |checkpoint: &SendProgress| {
                 store
@@ -1583,7 +1670,7 @@ fn deliver_recorded_reply<T: BotTransport>(
                         )
                     })
             };
-            match channel.send_tracked(part, resume.as_ref(), &mut observe) {
+            match channel.send_tracked(&parts[index], resume.as_ref(), &mut observe) {
                 Ok(_) => {
                     resume = None;
                     store
@@ -1651,6 +1738,7 @@ fn deliver_recorded_reply<T: BotTransport>(
                 }
             }
         }
+        index += 1;
     }
     Ok(())
 }
@@ -6952,6 +7040,214 @@ mod tests {
         assert_eq!(
             binding.agent_id, None,
             "the vanished pairing's re-pairing was overwritten"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_replaced_pairing_offer_resends_its_refused_reply() {
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: text_message(9, 9, Some("alice"), "/start", 7),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // The offer and the reply carrying its code commit bound,
+            // then a newer request replaces the exact offer before the
+            // recorded reply ever sends: the restart resend must
+            // publish the refused variant, never the dead code.
+            store
+                .record_pairing_and_reply(
+                    9,
+                    9,
+                    Some("alice".into()),
+                    7,
+                    "reply:7",
+                    |record| format!("Pairing code: {}", record.code),
+                    "That pairing offer did not hold — send /start to request a fresh code.",
+                )
+                .unwrap();
+            store.request_pairing(9, 9, Some("alice".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| !sent.lock().unwrap().is_empty(), Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let posts = sent.lock().unwrap();
+        assert_eq!(
+            posts[0].1, "That pairing offer did not hold — send /start to request a fresh code.",
+            "the resend published a replaced offer's dead code: {posts:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_reply_bound_after_capacity_frees_is_resent_without_a_restart() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+            // Task 1's record fills the bounded document, so task 2's
+            // staged completion — a session change too big to land
+            // alongside it — cannot commit and stays durable but
+            // unbound. Unknown commands keep both neighbors on the
+            // session-neutral reply path, so the stranded record's
+            // session precondition still holds when space frees.
+            store
+                .admit_updates(
+                    &[
+                        PendingUpdate {
+                            update_id: 1,
+                            sequence: 0,
+                            message: text_message(
+                                42,
+                                42,
+                                Some("alice"),
+                                &format!("/noopcmd {}", "x".repeat(200_000)),
+                                1,
+                            ),
+                            reply: None,
+                            reply_key: None,
+                            reply_sent: 0,
+                            reply_progress: None,
+                            reply_file: None,
+                            reply_retry_at_ms: None,
+                            reply_refused: false,
+                        },
+                        PendingUpdate {
+                            update_id: 2,
+                            sequence: 0,
+                            message: text_message(42, 42, Some("alice"), "waiting", 2),
+                            reply: None,
+                            reply_key: None,
+                            reply_sent: 0,
+                            reply_progress: None,
+                            reply_file: None,
+                            reply_retry_at_ms: None,
+                            reply_refused: false,
+                        },
+                        PendingUpdate {
+                            update_id: 3,
+                            sequence: 0,
+                            message: text_message(42, 42, Some("alice"), "/noopcmd", 3),
+                            reply: None,
+                            reply_key: None,
+                            reply_sent: 0,
+                            reply_progress: None,
+                            reply_file: None,
+                            reply_retry_at_ms: None,
+                            reply_refused: false,
+                        },
+                    ],
+                    &[],
+                    &[],
+                    4,
+                )
+                .unwrap();
+            // The record's own commit is refused for document space:
+            // the manifest is already durable — the crash-window shape
+            // startup reconciliation owns — while its session change
+            // cannot land alongside task 1's record.
+            let expected = store.binding(42).unwrap().clone();
+            let error = store
+                .record_reply_and_session(
+                    42,
+                    2,
+                    "reply:2",
+                    Some("s".repeat(150_000)),
+                    &expected,
+                    |_| "staged reply body".to_owned(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_string().as_str(),
+                "a4mc_telegram_state_full",
+                "the oversized record committed instead of stranding: {error}"
+            );
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let stranded = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let observed = Arc::clone(&stranded);
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            on_stuck: Some(Box::new(move |item: &StrandedReply| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((item.update_id, item.code.clone()));
+            })),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || {
+                sent.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, text)| text == "staged reply body")
+            },
+            Duration::from_secs(20),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        reset_lane_output();
+
+        // Startup reported the record stranded for space, but the
+        // reply still delivered once the settling work freed it — no
+        // restart needed.
+        assert_eq!(
+            *stranded.lock().unwrap(),
+            vec![(2, "a4mc_telegram_state_full".to_owned())],
+            "the oversized record was never reported stranded"
+        );
+        assert!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .is_empty(),
+            "the newly bound reply never settled"
         );
         let _ = std::fs::remove_dir_all(root);
     }
