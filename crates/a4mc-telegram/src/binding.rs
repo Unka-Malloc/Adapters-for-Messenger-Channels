@@ -18,13 +18,16 @@ use anyhow::{Result, anyhow, ensure};
 use fs2::FileExt;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STATE_FILE: &str = "bindings.json";
 const MAX_STATE_BYTES: usize = 256 * 1024;
+/// Bound on one spilled reply payload — beyond it a completed outcome
+/// is refused rather than consuming unbounded state space.
+const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DROPPED_UPDATES: usize = 256;
 /// Bound on admitted-but-unfinished tasks: far beyond one long-poll
 /// batch; a fuller backlog cannot be confirmed anyway, so a new admit
@@ -103,6 +106,20 @@ pub struct PendingUpdate {
     /// uncertain outcome is refused rather than blindly reposted.
     #[serde(default)]
     pub reply_progress: Option<crate::transport::SendProgress>,
+    /// File name of the finished reply's spilled payload inside the
+    /// store's sidecar replies directory. Completed outcomes live
+    /// there so a large reply never has to fit the bounded document;
+    /// `None` means the reply (if any) is inline in `reply`.
+    #[serde(default)]
+    pub reply_file: Option<String>,
+}
+
+impl PendingUpdate {
+    /// Whether a finished reply is durably recorded — inline in the
+    /// document or spilled to its sidecar file.
+    pub fn has_reply(&self) -> bool {
+        self.reply.is_some() || self.reply_file.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -203,6 +220,15 @@ impl BindingStore {
             self.document = document;
             Ok(value)
         })();
+        // Sweep spilled reply files under the same lock that wrote the
+        // document: a file is live exactly while a pending task
+        // references it, so completed tasks, settled records and
+        // orphans from a mutation that died mid-write are all collected
+        // here — and a file being written inside another mutation can
+        // never be reached for deletion before its document lands.
+        if result.is_ok() {
+            sweep_reply_files(&self.path, &self.document);
+        }
         let _ = self.lock.unlock();
         result
     }
@@ -442,15 +468,27 @@ impl BindingStore {
     /// send attempt carries — on the admitted task *before* delivery,
     /// so an exit between the lane returning and the send completing
     /// leaves a resumable result under the same key instead of losing
-    /// paid agent work.
+    /// paid agent work. The payload spills to a sidecar file inside
+    /// the mutation's lock: the bounded document only keeps the file
+    /// name, so a reply larger than the remaining store capacity is
+    /// still preserved before the task can settle.
     pub fn record_reply(&mut self, update_id: i64, reply: &str, key: &str) -> Result<()> {
+        ensure!(
+            reply.len() <= MAX_REPLY_BYTES,
+            "a4mc_telegram_reply_too_large"
+        );
+        let dir = replies_dir(&self.path);
+        let name = reply_file_name(update_id);
         self.mutate(|document| {
             if let Some(task) = document
                 .pending_updates
                 .iter_mut()
                 .find(|task| task.update_id == update_id)
             {
-                task.reply = Some(reply.to_owned());
+                ensure_private_dir(&dir)?;
+                atomic_write_private_text(&dir.join(&name), reply)?;
+                task.reply = None;
+                task.reply_file = Some(name.clone());
                 task.reply_key = Some(key.to_owned());
                 task.reply_sent = 0;
                 task.reply_progress = None;
@@ -474,6 +512,12 @@ impl BindingStore {
         key: &str,
         session_id: Option<String>,
     ) -> Result<()> {
+        ensure!(
+            reply.len() <= MAX_REPLY_BYTES,
+            "a4mc_telegram_reply_too_large"
+        );
+        let dir = replies_dir(&self.path);
+        let name = reply_file_name(update_id);
         self.mutate(|document| {
             if let Some(binding) = document.chats.get_mut(&chat_id.to_string())
                 && binding.agent_id.is_some()
@@ -486,7 +530,10 @@ impl BindingStore {
                 .iter_mut()
                 .find(|task| task.update_id == update_id)
             {
-                task.reply = Some(reply.to_owned());
+                ensure_private_dir(&dir)?;
+                atomic_write_private_text(&dir.join(&name), reply)?;
+                task.reply = None;
+                task.reply_file = Some(name.clone());
                 task.reply_key = Some(key.to_owned());
                 task.reply_sent = 0;
                 task.reply_progress = None;
@@ -514,9 +561,10 @@ impl BindingStore {
                 .pending_updates
                 .iter_mut()
                 .find(|task| task.update_id == update_id)
-                && task.reply.is_none()
+                && !task.has_reply()
             {
                 task.reply = Some(reply.to_owned());
+                task.reply_file = None;
                 task.reply_key = Some(key.to_owned());
                 task.reply_sent = 0;
                 task.reply_progress = None;
@@ -568,9 +616,24 @@ impl BindingStore {
         self.mutate(|document| {
             document
                 .pending_updates
-                .retain(|task| task.update_id != update_id || task.reply.is_some());
+                .retain(|task| task.update_id != update_id || task.has_reply());
             Ok(())
         })
+    }
+
+    /// Resolve a task's finished reply text: small records carry it
+    /// inline; a spilled record's payload lives in its sidecar file.
+    /// `Ok(None)` means no finished reply is recorded.
+    pub fn reply_text(&self, task: &PendingUpdate) -> Result<Option<String>> {
+        if let Some(reply) = &task.reply {
+            return Ok(Some(reply.clone()));
+        }
+        let Some(name) = &task.reply_file else {
+            return Ok(None);
+        };
+        read_private_text_bounded(&replies_dir(&self.path).join(name), MAX_REPLY_BYTES)?
+            .map(Some)
+            .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))
     }
 
     /// Persist one update id the runtime could not hand to the host as a
@@ -629,6 +692,39 @@ fn lock_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| "bindings.json".into());
     name.push(".lock");
     path.with_file_name(name)
+}
+
+/// Sidecar directory holding spilled reply payloads next to the state
+/// file: `<state>.replies/reply-<update_id>.txt`. Finished outcomes
+/// live there so a large reply never has to fit the bounded document.
+fn replies_dir(path: &Path) -> PathBuf {
+    path.with_extension("replies")
+}
+
+fn reply_file_name(update_id: i64) -> String {
+    format!("reply-{update_id}.txt")
+}
+
+/// Remove spilled reply files no task record references. Runs inside
+/// `mutate`'s lock after the document lands, so a file is dropped only
+/// once no serialized record can still name it.
+fn sweep_reply_files(path: &Path, document: &BindingDocument) {
+    let live: HashSet<String> = document
+        .pending_updates
+        .iter()
+        .filter_map(|task| task.reply_file.clone())
+        .collect();
+    let Ok(entries) = std::fs::read_dir(replies_dir(path)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if entry.file_type().is_ok_and(|kind| kind.is_file())
+            && name.to_str().is_some_and(|name| !live.contains(name))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn read_document(path: &Path) -> Result<BindingDocument> {
@@ -917,6 +1013,7 @@ mod tests {
                         reply_key: None,
                         reply_sent: 0,
                         reply_progress: None,
+                        reply_file: None,
                     }],
                     &[],
                     8,
@@ -937,7 +1034,7 @@ mod tests {
                 )
                 .unwrap_err();
             assert_eq!(store.binding(9).unwrap().session_id, None);
-            assert!(store.pending_updates()[0].reply.is_none());
+            assert!(!store.pending_updates()[0].has_reply());
             store
                 .record_reply_and_session(
                     9,
@@ -950,7 +1047,7 @@ mod tests {
             assert_eq!(store.binding(9).unwrap().session_id.as_deref(), Some("s2"));
             let task = &store.pending_updates()[0];
             assert_eq!(
-                task.reply.as_deref(),
+                store.reply_text(task).unwrap().as_deref(),
                 Some("Started a new conversation: s2")
             );
             assert_eq!(task.reply_key.as_deref(), Some("reply:7"));
@@ -969,23 +1066,84 @@ mod tests {
                         reply_key: None,
                         reply_sent: 0,
                         reply_progress: None,
+                        reply_file: None,
                     }],
                     &[],
                     4,
                 )
                 .unwrap();
-            // A reply larger than the bounded read limit must be
-            // refused outright: the file it would have replaced stays
-            // readable, so the unacknowledged work can still drain.
-            let oversized = "x".repeat(MAX_STATE_BYTES);
-            let error = store.record_reply(3, &oversized, "reply:3").unwrap_err();
+            // An admitted update larger than the bounded read limit
+            // must be refused outright: the file it would have replaced
+            // stays readable, so the unacknowledged work can still
+            // drain.
+            let mut oversized = inbound_message(4, 9);
+            oversized.text = Some("x".repeat(MAX_STATE_BYTES));
+            let error = store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 4,
+                        message: oversized,
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                    }],
+                    &[],
+                    5,
+                )
+                .unwrap_err();
             assert_eq!(error.to_string(), "a4mc_telegram_state_full");
             let reopened = BindingStore::open(store.path.clone()).unwrap();
             assert_eq!(reopened.poll_offset(), 4);
-            assert!(reopened.pending_updates()[0].reply.is_none());
+            assert!(!reopened.pending_updates()[0].has_reply());
             // Shrinking work still commits after the refusal.
             store.complete_update(3).unwrap();
             assert!(store.pending_updates().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_completed_reply_survives_in_its_sidecar_file_until_the_task_settles() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 5,
+                        message: inbound_message(5, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                    }],
+                    &[],
+                    6,
+                )
+                .unwrap();
+            // A reply larger than the whole bounded document is the
+            // case the inline field could never hold.
+            let reply = "r".repeat(MAX_STATE_BYTES);
+            store.record_reply(5, &reply, "reply:5").unwrap();
+            let task = store.pending_updates().pop().unwrap();
+            assert!(task.has_reply());
+            assert!(task.reply.is_none());
+            let reopened = BindingStore::open(store.path.clone()).unwrap();
+            assert_eq!(
+                reopened.reply_text(&task).unwrap().as_deref(),
+                Some(&*reply)
+            );
+            let document_bytes = std::fs::metadata(&store.path).unwrap().len() as usize;
+            assert!(
+                document_bytes < MAX_STATE_BYTES,
+                "the payload must not live inside the bounded document"
+            );
+            store.complete_update(5).unwrap();
+            let task_file = store.path.with_extension("replies").join("reply-5.txt");
+            assert!(
+                !task_file.exists(),
+                "settling the task collects its payload file"
+            );
         });
     }
 }

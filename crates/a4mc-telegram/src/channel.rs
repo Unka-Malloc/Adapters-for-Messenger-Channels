@@ -13,7 +13,7 @@
 //! [`TelegramChannel::with_outbound_hooks`] or once for every dialect
 //! through `LanePort::outbound_hooks`.
 
-use crate::transport::{BotTransport, SendProgress};
+use crate::transport::{BotTransport, SendBinding, SendProgress, TelegramApiError};
 use a4mc::{
     ChannelAdapter, ChannelDescriptor, ChannelError, ChannelId, ExternalMessageId, LaneMechanism,
     OutboundHooks, OutboundMessage, OutboundPipeline, PreparedSend, SendContext, SendFeature,
@@ -189,7 +189,12 @@ impl<T: BotTransport> TelegramChannel<T> {
         let ctx = SendContext::at(CHANNEL, now_ms);
         let mut observed = None;
         self.pipeline.execute(outbound, &ctx, |prepared| {
-            self.deliver(prepared, None, &mut observed)
+            self.deliver(
+                prepared,
+                None,
+                &mut observed,
+                &mut |_: &SendProgress| Ok(()),
+            )
         })
     }
 
@@ -197,19 +202,23 @@ impl<T: BotTransport> TelegramChannel<T> {
     /// delivery progress: `resume` is the checkpoint an earlier
     /// attempt of the same logical send recorded (the confirmed part
     /// prefix is never reposted; an uncertain stopping outcome is
-    /// refused like a cached `Partial`), and the failure carries the
-    /// checkpoint the attempt left behind so the caller can persist it
-    /// again instead of restarting the send from zero.
+    /// refused like a cached `Partial`), `observe` receives each
+    /// part-level checkpoint the transport reaches — an in-flight
+    /// marker before every POST and the confirmation after it — and
+    /// the failure carries the checkpoint the attempt left behind so
+    /// the caller can persist it again instead of restarting the send
+    /// from zero.
     pub(crate) fn send_tracked(
         &self,
         outbound: &OutboundMessage,
         resume: Option<&SendProgress>,
+        observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
     ) -> Result<SendReceipt, TrackedSendError> {
         let ctx = SendContext::at(CHANNEL, unix_now_ms());
         let mut observed = None;
         self.pipeline
             .execute(outbound, &ctx, |prepared| {
-                self.deliver(prepared, resume, &mut observed)
+                self.deliver(prepared, resume, &mut observed, observe)
             })
             .map_err(|error| TrackedSendError {
                 error,
@@ -221,7 +230,8 @@ impl<T: BotTransport> TelegramChannel<T> {
         &self,
         prepared: &PreparedSend,
         resume: Option<&SendProgress>,
-        observed: &mut Option<SendProgress>,
+        observed: &mut Option<Box<SendProgress>>,
+        observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
     ) -> Result<SendReceipt, ChannelError> {
         let outbound = &prepared.message;
         let chat_id: i64 = outbound.chat_id.as_str().parse().map_err(|_| {
@@ -243,6 +253,11 @@ impl<T: BotTransport> TelegramChannel<T> {
             })
             .transpose()?;
         let key = &prepared.dedupe_key;
+        // A checkpoint only ever resumes the prepared send it was
+        // earned on: the hooks just ran, so a policy that rewrote the
+        // text or the destination cannot borrow the old chunk
+        // position and drop a tail into a different message.
+        let expected = send_binding(chat_id, outbound, key);
         let progress = {
             let mut cache = self.sent_keys.lock().unwrap();
             loop {
@@ -259,26 +274,39 @@ impl<T: BotTransport> TelegramChannel<T> {
                             // blindly reposting.
                             return Err(ambiguous_send_error());
                         }
+                        if !binding_applies(progress.binding.as_ref(), &expected) {
+                            return Err(resume_mismatch_error());
+                        }
                         cache.mark_in_flight(key.clone());
                         break progress;
                     }
                     None => {
-                        // A caller-held checkpoint obeys the same rule
+                        // A caller-held checkpoint obeys the same rules
                         // a cached `Partial` would: an uncertain
-                        // stopping outcome is never reposted blindly.
+                        // stopping outcome is never reposted blindly,
+                        // and a position earned on a different
+                        // prepared send does not apply here.
                         if resume.is_some_and(|progress| progress.outcome_unknown) {
                             return Err(ambiguous_send_error());
                         }
+                        if resume.is_some_and(|p| !binding_applies(p.binding.as_ref(), &expected)) {
+                            return Err(resume_mismatch_error());
+                        }
                         cache.mark_in_flight(key.clone());
-                        break resume.cloned().unwrap_or_default();
+                        let mut progress = resume.cloned().unwrap_or_default();
+                        progress.binding = Some(expected.clone());
+                        break progress;
                     }
                 }
             }
         };
-        match self
-            .transport
-            .send_message(chat_id, &outbound.text, reply_to, Some(&progress))
-        {
+        match self.transport.send_message(
+            chat_id,
+            &outbound.text,
+            reply_to,
+            Some(&progress),
+            observe,
+        ) {
             Ok(message_ids) => {
                 let receipt = SendReceipt {
                     idempotency_key: key.clone(),
@@ -300,7 +328,7 @@ impl<T: BotTransport> TelegramChannel<T> {
                 *observed = error.send_progress.clone();
                 {
                     let mut cache = self.sent_keys.lock().unwrap();
-                    match error.send_progress.clone() {
+                    match error.send_progress.as_deref().cloned() {
                         Some(progress) => cache.set_partial(key.clone(), progress),
                         None => cache.release(key),
                     }
@@ -310,6 +338,32 @@ impl<T: BotTransport> TelegramChannel<T> {
             }
         }
     }
+}
+
+/// The effective-send fingerprint a checkpoint is bound to: the dedupe
+/// key, the lowered destination, and a digest of the lowered payload.
+/// The payload digests rather than duplicates — checkpoints live in
+/// bounded durable state.
+fn send_binding(chat_id: i64, outbound: &OutboundMessage, key: &str) -> SendBinding {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(outbound.text.as_bytes());
+    if let Some(reply_to) = &outbound.reply_to_message_id {
+        hasher.update([0]);
+        hasher.update(reply_to.as_str().as_bytes());
+    }
+    SendBinding {
+        dedupe_key: key.to_owned(),
+        chat_id,
+        payload_digest: format!("{:x}", hasher.finalize()),
+    }
+}
+
+/// Whether a stored checkpoint binding may resume this prepared send.
+/// A checkpoint recorded before bindings existed carries none and
+/// resumes unverifiable — exactly as it did when written.
+fn binding_applies(stored: Option<&SendBinding>, expected: &SendBinding) -> bool {
+    stored.is_none_or(|stored| stored == expected)
 }
 
 /// The stable refusal for a send whose stopping part's outcome never
@@ -322,6 +376,16 @@ fn ambiguous_send_error() -> ChannelError {
     )
 }
 
+/// The stable refusal for a checkpoint that cannot apply to this
+/// prepared send — its position belongs to a different outbound
+/// message.
+fn resume_mismatch_error() -> ChannelError {
+    ChannelError::new(
+        "a4mc_telegram_resume_mismatch",
+        "send checkpoint does not match the prepared send; its progress belongs to a different outbound message",
+    )
+}
+
 /// The failure of one [`TelegramChannel::send_tracked`] call: the
 /// normalized error plus the mid-flight checkpoint the transport
 /// recorded — `None` for failures outside a chunked send or before
@@ -329,7 +393,7 @@ fn ambiguous_send_error() -> ChannelError {
 #[derive(Debug)]
 pub(crate) struct TrackedSendError {
     pub error: ChannelError,
-    pub progress: Option<SendProgress>,
+    pub progress: Option<Box<SendProgress>>,
 }
 
 impl<T: BotTransport> ChannelAdapter for TelegramChannel<T> {
@@ -391,6 +455,7 @@ mod tests {
             text: &str,
             reply_to_message_id: Option<i64>,
             resume: Option<&SendProgress>,
+            observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
         ) -> Result<Vec<i64>, TelegramApiError> {
             self.entered.store(true, Ordering::SeqCst);
             let (mutex, condvar) = &*self.release;
@@ -400,7 +465,7 @@ mod tests {
             }
             drop(released);
             self.inner
-                .send_message(chat_id, text, reply_to_message_id, resume)
+                .send_message(chat_id, text, reply_to_message_id, resume, observe)
         }
     }
 
@@ -523,7 +588,9 @@ mod tests {
         let text = "x".repeat(5000);
         let outbound = OutboundMessage::new("42", &text, "send-tracked");
 
-        let failure = channel.send_tracked(&outbound, None).unwrap_err();
+        let failure = channel
+            .send_tracked(&outbound, None, &mut |_| Ok(()))
+            .unwrap_err();
         assert_eq!(failure.error.code, "a4mc_telegram_api_failed");
         let progress = failure.progress.expect("checkpoint not reported");
         assert_eq!(progress.next_part, 1);
@@ -547,7 +614,9 @@ mod tests {
                     confirmed: vec![7],
                     next_part: 1,
                     outcome_unknown: false,
+                    binding: None,
                 }),
+                &mut |_| Ok(()),
             )
             .unwrap();
         let posts = sent.lock().unwrap();
@@ -571,7 +640,9 @@ mod tests {
                     confirmed: vec![7],
                     next_part: 1,
                     outcome_unknown: true,
+                    binding: None,
                 }),
+                &mut |_| Ok(()),
             )
             .unwrap_err();
         assert_eq!(failure.error.code, "a4mc_telegram_send_ambiguous");
@@ -830,6 +901,93 @@ mod tests {
             transport.sent.lock().unwrap()[2].1,
             "dedupe-a",
             "the deduplicated replay must not post the second payload"
+        );
+    }
+
+    /// A batch hook that rewrites the outbound text to a caller-chosen
+    /// prefix — the finding's "hooks alter the payload" knob.
+    struct ReplacingHooks {
+        prefix: &'static str,
+    }
+
+    impl a4mc::OutboundHooks for ReplacingHooks {
+        fn batch(&self, _: &a4mc::SendContext, message: &OutboundMessage) -> a4mc::BatchDecision {
+            a4mc::BatchDecision::replace(
+                message
+                    .clone()
+                    .with_text(format!("{}{}", self.prefix, message.text)),
+            )
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_from_another_prepared_send_never_resumes() {
+        let transport = MockBotTransport {
+            fail_send_at_part: Some((
+                1,
+                TelegramApiError::new("a4mc_telegram_api_failed", "fixture rejection"),
+                false,
+            )),
+            ..Default::default()
+        };
+        let sent = Arc::clone(&transport.sent);
+        let mut channel = TelegramChannel::new(Arc::new(transport))
+            .with_outbound_hooks(Arc::new(ReplacingHooks { prefix: "first:" }));
+        let text = "x".repeat(5000); // two platform parts
+        let outbound = OutboundMessage::new("42", &text, "send-bound");
+
+        channel.send(&outbound).unwrap_err();
+        assert_eq!(sent.lock().unwrap().len(), 1, "only the prefix posted");
+
+        // The same key, prepared differently this time: the retry must
+        // not borrow the stopped send's chunk position — the tail would
+        // land inside a different message.
+        channel.set_outbound_hooks(Arc::new(ReplacingHooks { prefix: "second:" }));
+        let error = channel.send(&outbound).unwrap_err();
+        assert_eq!(error.code, "a4mc_telegram_resume_mismatch");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "a foreign checkpoint posted its tail under this key"
+        );
+
+        // The unchanged prepared send resumes the same checkpoint.
+        channel.set_outbound_hooks(Arc::new(ReplacingHooks { prefix: "first:" }));
+        let receipt = channel.send(&outbound).unwrap();
+        let posts = sent.lock().unwrap();
+        assert_eq!(posts.len(), 2, "the confirmed prefix was reposted");
+        assert_eq!(posts[1].1.len(), "first:".len() + 5000 - 4096);
+        assert_eq!(receipt.message_ids.len(), 2);
+    }
+
+    #[test]
+    fn a_caller_checkpoint_bound_to_another_send_is_refused() {
+        let transport = MockBotTransport::default();
+        let sent = Arc::clone(&transport.sent);
+        let channel = TelegramChannel::new(Arc::new(transport));
+        let text = "x".repeat(5000);
+        let outbound = OutboundMessage::new("42", &text, "send-foreign");
+
+        let failure = channel
+            .send_tracked(
+                &outbound,
+                Some(&SendProgress {
+                    confirmed: vec![7],
+                    next_part: 1,
+                    outcome_unknown: false,
+                    binding: Some(SendBinding {
+                        dedupe_key: "send-foreign".into(),
+                        chat_id: 43,
+                        payload_digest: "different-payload".into(),
+                    }),
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(failure.error.code, "a4mc_telegram_resume_mismatch");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a checkpoint from a different outbound message posted parts"
         );
     }
 }

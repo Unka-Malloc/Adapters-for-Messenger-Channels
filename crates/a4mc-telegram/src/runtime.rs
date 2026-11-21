@@ -359,7 +359,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
             // shutdown cut the wait short is not a handler failure: no
             // error reply goes out around the policy, and the
             // unfinished task record stays for the restart drain.
-            Err(error) if is_policy_deferral(&error) => Ok(()),
+            Err(error) if is_interrupted_send_wait(&error) => Ok(()),
             Err(error) => {
                 // The fallback error report is persisted — under the
                 // delivery key its first send attempt carries — BEFORE
@@ -430,12 +430,20 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     // change. A resend the host's policy is holding retries after the
     // store lock drops — parking on its deferral window under the lock
     // would stall every worker's store access.
-    let mut held: Vec<crate::binding::PendingUpdate> = Vec::new();
+    let mut held: Vec<(crate::binding::PendingUpdate, String)> = Vec::new();
     let unfinished = store.lock().unwrap().pending_updates();
     for task in unfinished {
-        let Some(reply) = task.reply.clone() else {
-            pending.push_back(task.message.clone());
-            continue;
+        // A finished reply may be spilled to its sidecar file; resolve
+        // the payload once here. A record whose payload cannot be read
+        // stays unfinished — settling over a paid result is never
+        // allowed — while one with none re-queues its message whole.
+        let reply = match store.lock().unwrap().reply_text(&task) {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                pending.push_back(task.message.clone());
+                continue;
+            }
+            Err(_) => continue,
         };
         // The resend repeats the delivery key the first attempt
         // carried and resumes at the persisted checkpoint — the
@@ -466,14 +474,11 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
             // A policy hold parks the remainder for the off-lock wait
             // below; a rejection leaves the record — and the checkpoint
             // it earned — for the next restart's resend.
-            Err(error) if is_policy_deferral(&error) => held.push(task),
+            Err(error) if is_interrupted_send_wait(&error) => held.push((task, reply)),
             Err(_) => {}
         }
     }
-    for task in held {
-        let Some(reply) = task.reply.clone() else {
-            continue;
-        };
+    for (task, reply) in held {
         let key = task
             .reply_key
             .clone()
@@ -621,76 +626,182 @@ fn poll_updates<T: BotTransport>(
                     continue;
                 }
             };
-            let mut tasks = Vec::new();
-            let mut dropped = Vec::new();
-            let mut admitted = Vec::new();
+            let mut records = Vec::with_capacity(updates.len());
             let mut next_offset = cursor.offset;
-            for update in updates {
+            for update in &updates {
                 // The cursor is monotonic: a transport that redelivers an
                 // update below the durable cursor must not drag the offset
                 // back and replay already-confirmed turns. Telegram sends
                 // ascending update ids, so a lower one is a stale replay.
                 let next = update.update_id.saturating_add(1);
                 if next <= cursor.offset {
+                    records.push(BatchRecord::Skip);
                     continue;
                 }
+                next_offset = next;
                 // An update with no dispatchable message body (a
                 // dice/game/service payload, or an unmapped update
                 // type) is handed to the host hook when one is
                 // mounted. Without a hook the id is persisted before
                 // the cursor advances, so the gap is durable instead of
                 // vanishing silently.
-                match unhandled_kind(&update) {
+                match unhandled_kind(update) {
                     Some(raw_kind) => {
-                        let event = crate::lower::lower_event(&update);
+                        let event = crate::lower::lower_event(update);
                         if let Some(on_event) = on_event.as_mut() {
                             on_event(&event).map_err(|error| {
                                 anyhow!("a4mc_telegram_unhandled_event: {error}")
                             })?;
+                            records.push(BatchRecord::Skip);
                         } else {
-                            dropped.push(DroppedUpdate {
+                            records.push(BatchRecord::Dropped(DroppedUpdate {
                                 update_id: update.update_id,
                                 raw_kind: raw_kind.to_owned(),
-                            });
+                            }));
                         }
                     }
                     None => {
-                        if let Some(message) = update.message {
+                        if let Some(message) = update.message.clone() {
                             // Admit the task BEFORE the cursor confirms
                             // it: a crash after confirmation must find
                             // the work record, not a silent skip.
-                            tasks.push(crate::binding::PendingUpdate {
-                                update_id: update.update_id,
-                                message: message.clone(),
-                                reply: None,
-                                reply_key: None,
-                                reply_sent: 0,
-                                reply_progress: None,
-                            });
-                            admitted.push(message);
+                            records.push(BatchRecord::Task(Box::new(
+                                crate::binding::PendingUpdate {
+                                    update_id: update.update_id,
+                                    message,
+                                    reply: None,
+                                    reply_key: None,
+                                    reply_sent: 0,
+                                    reply_progress: None,
+                                    reply_file: None,
+                                },
+                            )));
+                        } else {
+                            records.push(BatchRecord::Skip);
                         }
                     }
                 }
-                next_offset = next;
             }
             if next_offset != cursor.offset {
-                // One write confirms the cursor together with the work
-                // records of the batch — confirmed updates are never
-                // left without their task record, and a write failure
-                // surfaces rather than silently recreating the
-                // replay-a-restart bug it exists to prevent.
-                store
-                    .lock()
-                    .unwrap()
-                    .admit_updates(&tasks, &dropped, next_offset)?;
-                cursor.offset = next_offset;
+                // Each write confirms the cursor only through the work
+                // records that committed with it — confirmed updates are
+                // never left without their task record, and a write
+                // failure surfaces rather than silently recreating the
+                // replay-a-restart bug it exists to prevent. A batch
+                // too big for the bounded document commits its largest
+                // fitting prefix instead of stalling: the first
+                // unadmitted update stays unconfirmed and is refetched
+                // once the backlog drains.
+                let committed = admit_batch_prefix(store, &updates, &records, next_offset)?;
+                if committed == 0 {
+                    // Nothing of this batch fits the store right now —
+                    // not a transport failure, but it must not spin:
+                    // back off like one while workers drain the
+                    // backlog that is holding the space.
+                    consecutive_failures += 1;
+                    if consecutive_failures >= config.max_poll_failures.max(1) {
+                        return Err(anyhow!(
+                            "a4mc_telegram_poll_failed: a4mc_telegram_state_full"
+                        ));
+                    }
+                    if !wait_or_stop(retry_wait(consecutive_failures, None), &config.stop) {
+                        break;
+                    }
+                    continue;
+                }
+                cursor.offset = if committed == records.len() {
+                    next_offset
+                } else {
+                    updates[committed].update_id
+                };
                 cursor.sequence_age.reset();
-                pending.extend(admitted);
+                pending.extend(
+                    records[..committed]
+                        .iter()
+                        .filter_map(|record| match record {
+                            BatchRecord::Task(task) => Some(task.message.clone()),
+                            _ => None,
+                        }),
+                );
             }
         }
         admit_available(scheduler, pending);
     }
     Ok(())
+}
+
+/// What one fetched update contributes to the store write that
+/// confirms the cursor — kept per update so a batch that does not fit
+/// the bounded document can still confirm the largest prefix that
+/// does.
+enum BatchRecord {
+    /// Nothing to persist: a stale replay, or an update consumed by
+    /// the host's event hook.
+    Skip,
+    Dropped(DroppedUpdate),
+    Task(Box<crate::binding::PendingUpdate>),
+}
+
+/// Whether a store write was refused for space — the bounded document
+/// or the pending-task cap — a condition that drains as workers
+/// settle their records, unlike a corruption or IO failure.
+fn is_store_capacity(error: &anyhow::Error) -> bool {
+    matches!(
+        error.to_string().as_str(),
+        "a4mc_telegram_state_full" | "a4mc_telegram_pending_updates_full"
+    )
+}
+
+/// One durable admit write for a batch prefix: the records of
+/// `updates[..records.len()]` commit with the cursor confirmed at
+/// `offset`.
+fn admit_batch(store: &Mutex<BindingStore>, records: &[BatchRecord], offset: i64) -> Result<()> {
+    let mut tasks = Vec::new();
+    let mut dropped = Vec::new();
+    for record in records {
+        match record {
+            BatchRecord::Task(task) => tasks.push(task.as_ref().clone()),
+            BatchRecord::Dropped(item) => dropped.push(item.clone()),
+            BatchRecord::Skip => {}
+        }
+    }
+    store
+        .lock()
+        .unwrap()
+        .admit_updates(&tasks, &dropped, offset)
+}
+
+/// Confirm as much of the fetched batch as the bounded store can hold,
+/// in order: the largest leading run of updates whose records commit.
+/// Each successful probe is itself a durable cursor advance, so a
+/// crash mid-search loses nothing already admitted. Returns the number
+/// of leading updates durably admitted.
+fn admit_batch_prefix(
+    store: &Mutex<BindingStore>,
+    updates: &[crate::transport::Update],
+    records: &[BatchRecord],
+    next_offset: i64,
+) -> Result<usize> {
+    match admit_batch(store, records, next_offset) {
+        Ok(()) => return Ok(records.len()),
+        Err(error) if !is_store_capacity(&error) => return Err(error),
+        Err(_) => {}
+    }
+    // Binary search the largest committable prefix; a write only
+    // happens where a prefix actually fits. `updates[k]` is the first
+    // update a prefix of length `k` leaves unconfirmed, so its id is
+    // exactly the cursor that prefix earns.
+    let mut lo = 0usize;
+    let mut hi = records.len();
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        match admit_batch(store, &records[..mid], updates[mid].update_id) {
+            Ok(()) => lo = mid,
+            Err(error) if is_store_capacity(&error) => hi = mid,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(lo)
 }
 
 /// Classify an update the message-oriented runtime cannot dispatch.
@@ -859,25 +970,45 @@ fn is_outbound_deferral(error: &a4mc::ChannelError) -> bool {
     )
 }
 
-/// Whether a handler failure is only a policy deferral interrupted by
-/// shutdown: no error reply fires around the policy and the unfinished
-/// task record stays for the restart drain.
-fn is_policy_deferral(error: &anyhow::Error) -> bool {
+/// Whether a handler failure is only a send wait interrupted by
+/// shutdown — a policy deferral or a platform-hinted transient retry
+/// cut short by `stop`: no error reply fires around the wait and the
+/// unfinished task record stays for the restart drain. A transient
+/// send failure only escapes the retry loop this way, so seeing one
+/// here always means the wait was interrupted.
+fn is_interrupted_send_wait(error: &anyhow::Error) -> bool {
     matches!(
         error.to_string().split(':').next().map(str::trim),
-        Some("a4mc_outbound_batched") | Some("a4mc_outbound_throttled")
+        Some("a4mc_outbound_batched")
+            | Some("a4mc_outbound_throttled")
+            | Some("a4mc_telegram_throttled")
+            | Some("a4mc_telegram_connect_failed")
     )
+}
+
+/// Whether a failed send is safe to retry from its checkpoint: the
+/// platform either never saw the request — a pre-connect failure — or
+/// definitively rejected it and said when to come back (429). An
+/// outcome that may already be posted is never retried.
+fn is_transient_send_failure(error: &a4mc::ChannelError, progress: Option<&SendProgress>) -> bool {
+    matches!(
+        error.code.as_str(),
+        "a4mc_telegram_throttled" | "a4mc_telegram_connect_failed"
+    ) && progress.is_none_or(|progress| !progress.outcome_unknown)
 }
 
 /// Drive one outbound send under the host's policy. A deferral waits
 /// out its hinted window and retries — the policy holds the send, it is
-/// not a failure to report; `stop` ends the wait and returns the
-/// deferral error itself so the caller can keep the work record.
+/// not a failure to report; a transient platform failure retries from
+/// the channel's cached checkpoint on the same schedule — honoring the
+/// platform's hint where one exists. `stop` ends the wait and returns
+/// the held error itself so the caller can keep the work record.
 fn send_policy_wait<T: BotTransport>(
     channel: &TelegramChannel<T>,
     outbound: &a4mc::OutboundMessage,
     stop: &AtomicBool,
 ) -> Result<(), a4mc::ChannelError> {
+    let mut transient_failures = 0u32;
     loop {
         match channel.send(outbound) {
             Ok(_) => return Ok(()),
@@ -886,6 +1017,16 @@ fn send_policy_wait<T: BotTransport>(
                     .retry_after_ms
                     .map(Duration::from_millis)
                     .unwrap_or(DEFERRED_RETRY_WAIT);
+                if !wait_or_stop(wait, stop) {
+                    return Err(error);
+                }
+            }
+            Err(error) if is_transient_send_failure(&error, None) => {
+                transient_failures += 1;
+                let wait = error
+                    .retry_after_ms
+                    .map(Duration::from_millis)
+                    .unwrap_or_else(|| retry_wait(transient_failures, None));
                 if !wait_or_stop(wait, stop) {
                     return Err(error);
                 }
@@ -915,9 +1056,13 @@ fn deliver_sends<T: BotTransport>(
 /// resumes the platform-level progress its last attempt recorded.
 /// Every confirmed part and every mid-flight checkpoint lands in the
 /// store, so a restart resumes instead of reposting confirmed work or
-/// blindly retrying a part whose outcome is uncertain. `wait` parks
-/// on the host's deferral window; without it the first deferral
-/// returns so the caller can wait off any lock it holds.
+/// blindly retrying a part whose outcome is uncertain. The observer
+/// marks each platform POST in flight before it leaves — a crash after
+/// the platform accepts it leaves an honestly-uncertain record to
+/// reconcile, never a silent repost. `wait` parks on the host's
+/// deferral window and the platform's retry hint; without it the
+/// first held send returns so the caller can wait off any lock it
+/// holds.
 #[allow(clippy::too_many_arguments)]
 fn deliver_recorded_reply<T: BotTransport>(
     channel: &TelegramChannel<T>,
@@ -937,9 +1082,22 @@ fn deliver_recorded_reply<T: BotTransport>(
         return Ok(());
     }
     let mut resume = progress;
+    let mut transient_failures = 0u32;
     for (index, part) in parts.iter().enumerate().skip(sent) {
         loop {
-            match channel.send_tracked(part, resume.as_ref()) {
+            let mut observe = |checkpoint: &SendProgress| {
+                store
+                    .lock()
+                    .unwrap()
+                    .record_reply_progress(update_id, index, Some(checkpoint.clone()))
+                    .map_err(|_| {
+                        crate::transport::TelegramApiError::new(
+                            "a4mc_telegram_checkpoint_failed",
+                            "reply checkpoint write failed",
+                        )
+                    })
+            };
+            match channel.send_tracked(part, resume.as_ref(), &mut observe) {
                 Ok(_) => {
                     resume = None;
                     store
@@ -947,16 +1105,6 @@ fn deliver_recorded_reply<T: BotTransport>(
                         .unwrap()
                         .record_reply_progress(update_id, index + 1, None)?;
                     break;
-                }
-                Err(tracked) if is_outbound_deferral(&tracked.error) => {
-                    let window = tracked
-                        .error
-                        .retry_after_ms
-                        .map(Duration::from_millis)
-                        .unwrap_or(DEFERRED_RETRY_WAIT);
-                    if !wait || !wait_or_stop(window, stop) {
-                        return Err(channel_err(tracked.error));
-                    }
                 }
                 Err(tracked) => {
                     // Persist the checkpoint the attempt left behind —
@@ -968,10 +1116,38 @@ fn deliver_recorded_reply<T: BotTransport>(
                         store.lock().unwrap().record_reply_progress(
                             update_id,
                             index,
-                            Some(progress),
+                            Some((*progress).clone()),
                         )?;
+                        resume = Some(*progress);
                     }
-                    return Err(channel_err(tracked.error));
+                    let error = tracked.error;
+                    if is_outbound_deferral(&error) {
+                        let window = error
+                            .retry_after_ms
+                            .map(Duration::from_millis)
+                            .unwrap_or(DEFERRED_RETRY_WAIT);
+                        if !wait || !wait_or_stop(window, stop) {
+                            return Err(channel_err(error));
+                        }
+                        continue;
+                    }
+                    // A failure nothing could have posted — or a
+                    // definitive rejection carrying its retry hint —
+                    // retries from the persisted checkpoint here
+                    // instead of stranding the recorded reply until a
+                    // restart.
+                    if is_transient_send_failure(&error, resume.as_ref()) {
+                        transient_failures += 1;
+                        let window = error
+                            .retry_after_ms
+                            .map(Duration::from_millis)
+                            .unwrap_or_else(|| retry_wait(transient_failures, None));
+                        if !wait || !wait_or_stop(window, stop) {
+                            return Err(channel_err(error));
+                        }
+                        continue;
+                    }
+                    return Err(channel_err(error));
                 }
             }
         }
@@ -1714,9 +1890,10 @@ mod tests {
             text: &str,
             reply_to_message_id: Option<i64>,
             resume: Option<&SendProgress>,
+            observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
         ) -> Result<Vec<i64>, TelegramApiError> {
             self.inner
-                .send_message(chat_id, text, reply_to_message_id, resume)
+                .send_message(chat_id, text, reply_to_message_id, resume, observe)
         }
     }
 
@@ -1764,9 +1941,10 @@ mod tests {
             text: &str,
             reply_to_message_id: Option<i64>,
             resume: Option<&SendProgress>,
+            observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
         ) -> Result<Vec<i64>, TelegramApiError> {
             self.inner
-                .send_message(chat_id, text, reply_to_message_id, resume)
+                .send_message(chat_id, text, reply_to_message_id, resume, observe)
         }
     }
 
@@ -2287,6 +2465,8 @@ mod tests {
                             reply_key: None,
                             reply_sent: 0,
                             reply_progress: None,
+
+                            reply_file: None,
                         },
                         crate::binding::PendingUpdate {
                             update_id: 2,
@@ -2295,6 +2475,8 @@ mod tests {
                             reply_key: None,
                             reply_sent: 0,
                             reply_progress: None,
+
+                            reply_file: None,
                         },
                     ],
                     &[],
@@ -2527,13 +2709,17 @@ mod tests {
             sent.lock().unwrap().is_empty(),
             "a held reply must not be answered with an error around the policy"
         );
-        let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
+        let reopened = BindingStore::open_in(&root).unwrap();
+        let tasks = reopened.pending_updates();
         assert_eq!(
             tasks.len(),
             1,
             "the deferred reply's task record was settled: {tasks:?}"
         );
-        assert_eq!(tasks[0].reply.as_deref(), Some("synthetic"));
+        assert_eq!(
+            reopened.reply_text(&tasks[0]).unwrap().as_deref(),
+            Some("synthetic")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2555,6 +2741,7 @@ mod tests {
                         reply_key: None,
                         reply_sent: 0,
                         reply_progress: None,
+                        reply_file: None,
                     }],
                     &[],
                     3,
@@ -2787,14 +2974,15 @@ mod tests {
             1,
             "the /new command did not open exactly one conversation"
         );
-        let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
+        let reopened = BindingStore::open_in(&root).unwrap();
+        let tasks = reopened.pending_updates();
         assert_eq!(
             tasks.len(),
             1,
             "the deferred command was settled: {tasks:?}"
         );
         assert_eq!(
-            tasks[0].reply.as_deref(),
+            reopened.reply_text(&tasks[0]).unwrap().as_deref(),
             Some("Started a new conversation: counted-session."),
             "the finished command's confirmation was not persisted: {tasks:?}"
         );
@@ -3617,6 +3805,7 @@ mod tests {
                         reply_key: None,
                         reply_sent: 0,
                         reply_progress: None,
+                        reply_file: None,
                     }],
                     &[],
                     3,
@@ -3650,7 +3839,7 @@ mod tests {
             "the failed fallback record was settled over: {tasks:?}"
         );
         assert!(
-            tasks[0].reply.is_none(),
+            !tasks[0].has_reply(),
             "the failed write still recorded a reply: {tasks:?}"
         );
         assert!(
@@ -3687,6 +3876,7 @@ mod tests {
                         reply_key: None,
                         reply_sent: 0,
                         reply_progress: None,
+                        reply_file: None,
                     }],
                     &[],
                     2,
@@ -3815,6 +4005,7 @@ mod tests {
                         reply_key: None,
                         reply_sent: 0,
                         reply_progress: None,
+                        reply_file: None,
                     }],
                     &[],
                     3,
@@ -3888,7 +4079,9 @@ mod tests {
                             confirmed: vec![91],
                             next_part: 1,
                             outcome_unknown: false,
+                            binding: None,
                         }),
+                        reply_file: None,
                     }],
                     &[],
                     3,
@@ -3960,7 +4153,9 @@ mod tests {
                             confirmed: vec![91],
                             next_part: 1,
                             outcome_unknown: true,
+                            binding: None,
                         }),
+                        reply_file: None,
                     }],
                     &[],
                     3,
@@ -4056,6 +4251,318 @@ mod tests {
         let progress = task.reply_progress.expect("checkpoint not persisted");
         assert_eq!(progress.next_part, 1);
         assert!(!progress.outcome_unknown);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Redelivers its batch on every poll at or above the updates' ids:
+    /// the platform's at-least-once model for updates the cursor never
+    /// confirmed.
+    struct RedeliveringTransport {
+        inner: MockBotTransport,
+        batch: Vec<Update>,
+    }
+
+    impl BotTransport for RedeliveringTransport {
+        fn get_me(&self) -> Result<BotIdentity, TelegramApiError> {
+            self.inner.get_me()
+        }
+        fn delete_webhook(&self) -> Result<(), TelegramApiError> {
+            self.inner.delete_webhook()
+        }
+        fn set_my_commands(&self, commands: &[(String, String)]) -> Result<(), TelegramApiError> {
+            self.inner.set_my_commands(commands)
+        }
+        fn get_updates(
+            &self,
+            offset: i64,
+            _timeout_secs: u64,
+        ) -> Result<Vec<Update>, TelegramApiError> {
+            self.inner.observed_offsets.lock().unwrap().push(offset);
+            Ok(self
+                .batch
+                .iter()
+                .filter(|update| update.update_id >= offset)
+                .cloned()
+                .collect())
+        }
+        fn send_message(
+            &self,
+            chat_id: i64,
+            text: &str,
+            reply_to_message_id: Option<i64>,
+            resume: Option<&SendProgress>,
+            observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
+        ) -> Result<Vec<i64>, TelegramApiError> {
+            self.inner
+                .send_message(chat_id, text, reply_to_message_id, resume, observe)
+        }
+    }
+
+    #[test]
+    fn an_oversized_batch_commits_its_largest_fitting_prefix() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        a4mc::lane::clear();
+        let root = temp_root();
+        // The first update's record nearly fills the bounded document,
+        // so the pair cannot be confirmed in one write. The loop must
+        // commit the prefix, advance the cursor only to the first
+        // unadmitted update, and redeliver the rest once the admitted
+        // work settles — never stall on the same batch.
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let observed_offsets = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let transport = RedeliveringTransport {
+            inner: MockBotTransport {
+                sent: Arc::clone(&sent),
+                observed_offsets: Arc::clone(&observed_offsets),
+                ..MockBotTransport::default()
+            },
+            batch: vec![
+                Update {
+                    update_id: 1,
+                    message: Some(text_message(42, 42, Some("alice"), &"x".repeat(200_000), 1)),
+                },
+                Update {
+                    update_id: 2,
+                    message: Some(text_message(43, 43, Some("bob"), &"z".repeat(200_000), 2)),
+                },
+            ],
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        // Both updates are answered — each unpaired chat earns its
+        // pairing reply — proving the prefix committed and the
+        // remainder arrived on a later poll.
+        wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(20));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let reopened = BindingStore::open_in(&root).unwrap();
+        assert_eq!(
+            reopened.poll_offset(),
+            3,
+            "the cursor did not reach past the whole batch"
+        );
+        assert!(
+            reopened.pending_updates().is_empty(),
+            "admitted work stayed pending"
+        );
+        assert!(
+            observed_offsets.lock().unwrap().contains(&2),
+            "the unadmitted update was never refetched: {:?}",
+            observed_offsets.lock().unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_reply_too_large_for_the_document_is_still_recorded_and_delivered() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A lane output that could never fit the 256 KiB document: the
+        // completed outcome still has to land somewhere durable before
+        // the task may settle — the finding's exact loss.
+        let big = "y".repeat(300_000);
+        install_lane_with_output(big.clone());
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 5,
+                message: Some(text_message(42, 42, Some("alice"), "hello agent", 5)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        // Wait on delivery evidence — the recorded reply's platform
+        // parts — rather than the record set, which is empty before
+        // admission too.
+        wait_until(
+            || {
+                sent.lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, text)| text.len())
+                    .sum::<usize>()
+                    == big.len()
+            },
+            Duration::from_secs(20),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        reset_lane_output();
+
+        assert!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .is_empty(),
+            "the delivered reply's task never settled"
+        );
+        let posts = sent.lock().unwrap();
+        let reassembled: String = posts.iter().map(|(_, text)| text.as_str()).collect();
+        assert_eq!(
+            reassembled.len(),
+            big.len(),
+            "the delivered reply lost bytes: {} posts",
+            posts.len()
+        );
+        assert_eq!(reassembled, big);
+        let document_bytes = std::fs::metadata(root.join("bindings.json")).unwrap().len() as usize;
+        assert!(
+            document_bytes < 256 * 1024,
+            "the finished reply stayed inside the bounded document"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_pre_send_failure_retries_the_checkpoint_instead_of_stranding() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_lane_with_output("x".repeat(5_000));
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        // A failure before any request byte leaves: nothing can have
+        // reached the platform, so the send retries from its
+        // checkpoint inside the same run instead of stranding the
+        // recorded reply until a restart.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 5,
+                message: Some(text_message(42, 42, Some("alice"), "hello agent", 5)),
+            }])),
+            fail_send_at_part: Some((
+                0,
+                TelegramApiError::new("a4mc_telegram_connect_failed", "Bot API connection failure"),
+                false,
+            )),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        // Wait on delivery evidence, not the record set — it is empty
+        // before admission too.
+        wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(15));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        reset_lane_output();
+
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "the retried send did not post both platform parts"
+        );
+        assert!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .is_empty(),
+            "the delivered reply's task never settled"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_throttled_reply_retries_from_the_checkpoint_honoring_the_hint() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_lane_with_output("x".repeat(5_000));
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        // Part 0 is confirmed; part 1 is definitively rate-limited with
+        // a retry hint. The run must wait the hint out and resume at
+        // the rejected part — never repost the confirmed prefix and
+        // never strand the reply until a restart.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 5,
+                message: Some(text_message(42, 42, Some("alice"), "hello agent", 5)),
+            }])),
+            fail_send_at_part: Some((
+                1,
+                TelegramApiError::new(
+                    "a4mc_telegram_throttled",
+                    "sendMessage: Bot API rate limited",
+                )
+                .with_retry_after(Some(0)),
+                false,
+            )),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        // Wait on delivery evidence, not the record set — it is empty
+        // before admission too.
+        wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(15));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        reset_lane_output();
+
+        let posts = sent.lock().unwrap();
+        assert_eq!(
+            posts.len(),
+            2,
+            "the throttled send reposted its confirmed prefix: {posts:?}"
+        );
+        assert_eq!(posts[1].1.len(), 5_000 - 4096);
+        assert!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .is_empty(),
+            "the delivered reply's task never settled"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

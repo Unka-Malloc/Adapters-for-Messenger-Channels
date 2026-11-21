@@ -40,8 +40,8 @@ pub use inbound::{InboundKind, InboundMessage, MediaRef, ReplyRef};
 pub use lower::{lower_event, lower_message, lower_update};
 pub use runtime::{OnEvent, OnStarted, RuntimeConfig, run_channel_loop};
 pub use transport::{
-    BotIdentity, BotTransport, LiveBotTransport, MockBotTransport, SendProgress, TelegramApiError,
-    Update, bot_commands, live_transport, validate_bot_token,
+    BotIdentity, BotTransport, LiveBotTransport, MockBotTransport, SendBinding, SendProgress,
+    TelegramApiError, Update, bot_commands, live_transport, validate_bot_token,
 };
 
 /// The lane port is process-wide; test modules that install it must

@@ -38,8 +38,26 @@ pub struct TelegramApiError {
     /// Progress of a chunked `sendMessage` call that stopped mid-flight:
     /// the confirmed prefix and where it stopped, so the idempotency
     /// owner can resume instead of reposting delivered parts. `None`
-    /// for failures outside a multi-part send.
-    pub send_progress: Option<SendProgress>,
+    /// for failures outside a multi-part send. Boxed so a `Result`
+    /// carrying this error stays small on the hot path.
+    pub send_progress: Option<Box<SendProgress>>,
+}
+
+/// The effective send a checkpoint is bound to: the dedupe key, the
+/// lowered destination, and a digest of the lowered payload. A saved
+/// chunk position may only resume the send it was earned on — a retry
+/// whose prepared destination, text or key differs is refused rather
+/// than continuing someone else's message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendBinding {
+    /// The dedupe key the original send attempt ran under.
+    pub dedupe_key: String,
+    /// The lowered destination chat.
+    pub chat_id: i64,
+    /// SHA-256 hex over the effective text and reply target, so the
+    /// full payload need not be duplicated into the checkpoint.
+    pub payload_digest: String,
 }
 
 /// Where a chunked `sendMessage` send stopped, kept by the idempotency
@@ -56,6 +74,11 @@ pub struct SendProgress {
     /// platform may have posted it. False when the platform definitively
     /// rejected the part and it is safe to send again.
     pub outcome_unknown: bool,
+    /// The prepared send this checkpoint was earned on. Absent on
+    /// checkpoints recorded before the binding existed; those resume
+    /// unverifiable, exactly as they did when written.
+    #[serde(default)]
+    pub binding: Option<SendBinding>,
 }
 
 impl TelegramApiError {
@@ -76,7 +99,7 @@ impl TelegramApiError {
 
     /// Attach the mid-flight progress of a stopped chunked send.
     pub fn with_send_progress(mut self, progress: SendProgress) -> Self {
-        self.send_progress = Some(progress);
+        self.send_progress = Some(Box::new(progress));
         self
     }
 }
@@ -126,14 +149,21 @@ pub trait BotTransport: Send + Sync {
     /// attempt of the same logical send recorded: parts before
     /// `resume.next_part` are confirmed and never reposted. Returns the
     /// platform message ids of the parts this call transmitted, in send
-    /// order. A mid-flight failure carries the updated progress on the
-    /// error so the caller can resume or refuse to retry.
+    /// order. `observe` runs as each part reaches a checkpoint — an
+    /// in-flight marker (`next_part` at the part about to post,
+    /// `outcome_unknown` set) before every POST and the confirmed
+    /// progress after it — so a persistent observer can surface an
+    /// interrupted attempt instead of silently reposting it. An
+    /// observer error aborts the send before the part is posted. A
+    /// mid-flight failure carries the updated progress on the error so
+    /// the caller can resume or refuse to retry.
     fn send_message(
         &self,
         chat_id: i64,
         text: &str,
         reply_to_message_id: Option<i64>,
         resume: Option<&SendProgress>,
+        observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
     ) -> Result<Vec<i64>, TelegramApiError>;
 }
 
@@ -158,8 +188,9 @@ impl<T: BotTransport + ?Sized> BotTransport for Arc<T> {
         text: &str,
         reply_to_message_id: Option<i64>,
         resume: Option<&SendProgress>,
+        observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
     ) -> Result<Vec<i64>, TelegramApiError> {
-        (**self).send_message(chat_id, text, reply_to_message_id, resume)
+        (**self).send_message(chat_id, text, reply_to_message_id, resume, observe)
     }
 }
 
@@ -390,6 +421,12 @@ fn https_post(
     path: &str,
     payload: &[u8],
 ) -> Result<HttpResponse, TelegramApiError> {
+    // Failures before any request byte leaves are distinct from
+    // failures in flight: nothing can have reached the platform, so
+    // the send is safe to retry — the two outcomes must not share a
+    // code.
+    let connect_failed =
+        || TelegramApiError::new("a4mc_telegram_connect_failed", "Bot API connection failure");
     let failed =
         || TelegramApiError::new("a4mc_telegram_network_failed", "Bot API transport failure");
     let stream = (endpoint.host.as_str(), endpoint.port)
@@ -400,7 +437,7 @@ fn https_post(
                 .into_iter()
                 .find_map(|addr| TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok())
         })
-        .ok_or_else(failed)?;
+        .ok_or_else(connect_failed)?;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
@@ -427,15 +464,15 @@ fn https_post(
             let _ = roots.add(cert);
         }
         if roots.is_empty() {
-            return Err(failed());
+            return Err(connect_failed());
         }
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let server_name =
-            rustls::pki_types::ServerName::try_from(endpoint.host.clone()).map_err(|_| failed())?;
-        let conn =
-            rustls::ClientConnection::new(Arc::new(config), server_name).map_err(|_| failed())?;
+        let server_name = rustls::pki_types::ServerName::try_from(endpoint.host.clone())
+            .map_err(|_| connect_failed())?;
+        let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|_| connect_failed())?;
         let mut stream = rustls::StreamOwned::new(conn, stream);
         write_request(&mut stream)?;
         read_response(&mut stream)
@@ -593,6 +630,7 @@ impl BotTransport for LiveBotTransport {
         text: &str,
         reply_to_message_id: Option<i64>,
         resume: Option<&SendProgress>,
+        observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
     ) -> Result<Vec<i64>, TelegramApiError> {
         let chunks = bounded_send_parts(text)?;
         let start = resume.map_or(0, |progress| progress.next_part);
@@ -602,8 +640,25 @@ impl BotTransport for LiveBotTransport {
                 "send resume position is outside the chunked text",
             ));
         }
+        let mut progress = SendProgress {
+            confirmed: resume.map_or_else(Vec::new, |p| p.confirmed.clone()),
+            next_part: start,
+            outcome_unknown: false,
+            binding: resume.and_then(|p| p.binding.clone()),
+        };
         let mut sent_ids = Vec::with_capacity(chunks.len() - start);
         for (index, chunk) in chunks.iter().enumerate().skip(start) {
+            // In-flight marker before the POST: a crash after the
+            // platform accepts the request leaves this part honestly
+            // uncertain, so restart reconciles instead of reposting.
+            progress.next_part = index;
+            progress.outcome_unknown = true;
+            if let Err(error) = observe(&progress) {
+                // The marker could not be recorded — but nothing was
+                // posted either, so the checkpoint is safe to retry.
+                progress.outcome_unknown = false;
+                return Err(error.with_send_progress(progress));
+            }
             let mut body = json!({
                 "chat_id": chat_id,
                 "text": chunk,
@@ -616,17 +671,21 @@ impl BotTransport for LiveBotTransport {
                 body["allow_sending_without_reply"] = json!(true);
             }
             match self.call_json("sendMessage", body) {
-                Ok(result) => sent_ids.push(result["message_id"].as_i64().unwrap_or_default()),
+                Ok(result) => {
+                    let id = result["message_id"].as_i64().unwrap_or_default();
+                    sent_ids.push(id);
+                    progress.confirmed.push(id);
+                    progress.next_part = index + 1;
+                    progress.outcome_unknown = false;
+                    if let Err(error) = observe(&progress) {
+                        return Err(error.with_send_progress(progress));
+                    }
+                }
                 Err(error) => {
-                    let confirmed = resume
-                        .map(|progress| progress.confirmed.clone())
-                        .unwrap_or_default();
                     let outcome_unknown = result_is_unknown(&error);
-                    return Err(error.with_send_progress(SendProgress {
-                        confirmed: confirmed.into_iter().chain(sent_ids).collect(),
-                        next_part: index,
-                        outcome_unknown,
-                    }));
+                    progress.next_part = index;
+                    progress.outcome_unknown = outcome_unknown;
+                    return Err(error.with_send_progress(progress));
                 }
             }
         }
@@ -883,6 +942,7 @@ impl BotTransport for MockBotTransport {
         text: &str,
         _reply_to_message_id: Option<i64>,
         resume: Option<&SendProgress>,
+        observe: &mut dyn FnMut(&SendProgress) -> Result<(), TelegramApiError>,
     ) -> Result<Vec<i64>, TelegramApiError> {
         if let Some(error) = self.fail_send_with.lock().unwrap().clone() {
             return Err(error);
@@ -895,26 +955,42 @@ impl BotTransport for MockBotTransport {
                 "send resume position is outside the chunked text",
             ));
         }
+        let mut progress = SendProgress {
+            confirmed: resume.map_or_else(Vec::new, |p| p.confirmed.clone()),
+            next_part: start,
+            outcome_unknown: false,
+            binding: resume.and_then(|p| p.binding.clone()),
+        };
         let mut sent_ids = Vec::with_capacity(parts.len() - start);
         for (index, part) in parts.iter().enumerate().skip(start) {
+            // Same cadence as the live transport: the marker precedes
+            // the post, the confirmation follows it.
+            progress.next_part = index;
+            progress.outcome_unknown = true;
+            if let Err(error) = observe(&progress) {
+                progress.outcome_unknown = false;
+                return Err(error.with_send_progress(progress));
+            }
             if let Some((at, error, unknown)) = self.fail_send_at_part.as_ref()
                 && *at == index
                 && self.fired_parts.lock().unwrap().insert(index)
             {
-                let confirmed = resume
-                    .map(|progress| progress.confirmed.clone())
-                    .unwrap_or_default();
-                return Err(error.clone().with_send_progress(SendProgress {
-                    confirmed: confirmed.into_iter().chain(sent_ids).collect(),
-                    next_part: index,
-                    outcome_unknown: *unknown,
-                }));
+                progress.next_part = index;
+                progress.outcome_unknown = *unknown;
+                return Err(error.clone().with_send_progress(progress));
             }
             self.sent
                 .lock()
                 .unwrap()
                 .push((chat_id, (*part).to_owned()));
-            sent_ids.push(self.next_message_id.fetch_add(1, Ordering::SeqCst));
+            let id = self.next_message_id.fetch_add(1, Ordering::SeqCst);
+            sent_ids.push(id);
+            progress.confirmed.push(id);
+            progress.next_part = index + 1;
+            progress.outcome_unknown = false;
+            if let Err(error) = observe(&progress) {
+                return Err(error.with_send_progress(progress));
+            }
         }
         Ok(sent_ids)
     }
@@ -1185,7 +1261,7 @@ mod tests {
         let transport =
             LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
         let ids = transport
-            .send_message(42, &markdown, Some(7), None)
+            .send_message(42, &markdown, Some(7), None, &mut |_| Ok(()))
             .unwrap();
         assert_eq!(ids.len(), expected_parts);
 
@@ -1253,7 +1329,9 @@ mod tests {
         let (port, handle) = serve_once_with_headers(429, "application/json", "", body);
         let transport =
             LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
-        let error = transport.send_message(42, "hello", None, None).unwrap_err();
+        let error = transport
+            .send_message(42, "hello", None, None, &mut |_| Ok(()))
+            .unwrap_err();
         let bodies = handle.join().unwrap();
         assert_eq!(bodies.len(), 1, "a throttle must not retry post blindly");
         assert_eq!(error.code, "a4mc_telegram_throttled");
@@ -1297,5 +1375,54 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(error.code, "a4mc_telegram_json_invalid");
         assert!(!error.message.contains("CANARY_BODY"));
+    }
+
+    #[test]
+    fn an_in_flight_marker_precedes_every_part_post() {
+        let transport = MockBotTransport::default();
+        let calls: Arc<Mutex<Vec<(usize, bool, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let mut observe = move |progress: &SendProgress| {
+            recorded.lock().unwrap().push((
+                progress.next_part,
+                progress.outcome_unknown,
+                progress.confirmed.len(),
+            ));
+            Ok(())
+        };
+        let text = "x".repeat(5000); // two platform parts
+        transport
+            .send_message(42, &text, None, None, &mut observe)
+            .unwrap();
+        // Marker (uncertain, next_part = the part about to post) then
+        // confirmation (certain, next_part advanced) — alternating for
+        // every part, never a post left unmarked.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(0, true, 0), (1, false, 1), (1, true, 1), (2, false, 2),]
+        );
+    }
+
+    #[test]
+    fn a_pre_connect_failure_is_distinct_and_certain() {
+        // A port nothing listens on: connect fails before any request
+        // byte leaves, so the send's outcome is certain — safe to
+        // retry — and must not share a code with in-flight failures.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let error = transport
+            .send_message(42, "hello", None, None, &mut |_| Ok(()))
+            .unwrap_err();
+        assert_eq!(error.code, "a4mc_telegram_connect_failed");
+        assert!(
+            !result_is_unknown(&error),
+            "a failure before the request left must not read uncertain"
+        );
+        let progress = error.send_progress.expect("no checkpoint reported");
+        assert!(!progress.outcome_unknown);
+        assert_eq!(progress.next_part, 0);
     }
 }
