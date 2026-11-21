@@ -359,6 +359,24 @@ impl LiveBotTransport {
             )
         })?;
         let response = https_post(&self.endpoint, &path, &payload)?;
+        // A 429 is classified from the status line alone — the body may
+        // be empty or non-JSON while the Retry-After header still
+        // carries the platform's wait. Requiring JSON first would
+        // reclassify a clean throttle as an ambiguous parse failure.
+        if response.status == 429 {
+            let hinted = serde_json::from_slice::<Value>(&response.body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/parameters/retry_after")
+                        .and_then(Value::as_u64)
+                });
+            return Err(TelegramApiError::new(
+                "a4mc_telegram_throttled",
+                format!("{method}: Bot API rate limited"),
+            )
+            .with_retry_after(response.retry_after.or(hinted)));
+        }
         let value: Value = serde_json::from_slice(&response.body).map_err(|_| {
             TelegramApiError::new(
                 "a4mc_telegram_json_invalid",
@@ -1309,6 +1327,44 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(error.code, "a4mc_telegram_throttled");
         assert_eq!(error.retry_after, Some(11));
+    }
+
+    #[test]
+    fn throttled_status_with_an_empty_body_uses_the_header() {
+        // A 429 whose body never arrived is still a throttle: the
+        // status line and Retry-After header classify it before any
+        // JSON is required — never an ambiguous failure.
+        let (port, handle) = serve_once_with_headers(429, "text/plain", "Retry-After: 4\r\n", "");
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let error = transport.get_updates(0, 1).unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_throttled");
+        assert_eq!(error.retry_after, Some(4));
+    }
+
+    #[test]
+    fn throttled_status_with_a_non_json_body_uses_the_header() {
+        // Proxies and frontends answer 429 with HTML or plain text;
+        // the classification must not depend on parsing it.
+        let (port, handle) = serve_once_with_headers(
+            429,
+            "text/html",
+            "Retry-After: 2\r\n",
+            "<html>rate limited</html>",
+        );
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let error = transport
+            .send_message(42, "hello", None, None, &mut |_| Ok(()))
+            .unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_throttled");
+        assert_eq!(error.retry_after, Some(2));
+        assert!(
+            !result_is_unknown(&error),
+            "a throttle must not read as an ambiguous send"
+        );
     }
 
     #[test]

@@ -33,12 +33,13 @@ pub mod transport;
 
 pub use binding::{
     BINDING_SCHEMA, BindingStore, ChatBinding, DroppedUpdate, PairingRecord, PendingUpdate,
+    StrandedReply,
 };
 pub use channel::{CHANNEL, TelegramChannel, descriptor};
 pub use control::{ControlCommand, ControlOutcome, parse_control_command};
 pub use inbound::{InboundKind, InboundMessage, MediaRef, ReplyRef};
 pub use lower::{lower_event, lower_message, lower_update};
-pub use runtime::{OnEvent, OnStarted, RuntimeConfig, run_channel_loop};
+pub use runtime::{OnEvent, OnStarted, OnStuck, RuntimeConfig, run_channel_loop};
 pub use transport::{
     BotIdentity, BotTransport, LiveBotTransport, MockBotTransport, SendBinding, SendProgress,
     TelegramApiError, Update, bot_commands, live_transport, validate_bot_token,

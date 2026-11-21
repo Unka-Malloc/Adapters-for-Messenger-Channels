@@ -258,6 +258,17 @@ impl<T: BotTransport> TelegramChannel<T> {
         // text or the destination cannot borrow the old chunk
         // position and drop a tail into a different message.
         let expected = send_binding(chat_id, outbound, key);
+        // The caller's checkpoint is validated against the prepared
+        // send BEFORE the key's cache is consulted: a hook that remapped
+        // this send onto a key another send already used must not let a
+        // foreign checkpoint inherit that send's receipt or resume its
+        // partial progress.
+        if resume.is_some_and(|progress| progress.outcome_unknown) {
+            return Err(ambiguous_send_error());
+        }
+        if resume.is_some_and(|p| !binding_applies(p.binding.as_ref(), &expected)) {
+            return Err(resume_mismatch_error());
+        }
         let progress = {
             let mut cache = self.sent_keys.lock().unwrap();
             loop {
@@ -281,17 +292,6 @@ impl<T: BotTransport> TelegramChannel<T> {
                         break progress;
                     }
                     None => {
-                        // A caller-held checkpoint obeys the same rules
-                        // a cached `Partial` would: an uncertain
-                        // stopping outcome is never reposted blindly,
-                        // and a position earned on a different
-                        // prepared send does not apply here.
-                        if resume.is_some_and(|progress| progress.outcome_unknown) {
-                            return Err(ambiguous_send_error());
-                        }
-                        if resume.is_some_and(|p| !binding_applies(p.binding.as_ref(), &expected)) {
-                            return Err(resume_mismatch_error());
-                        }
                         cache.mark_in_flight(key.clone());
                         let mut progress = resume.cloned().unwrap_or_default();
                         progress.binding = Some(expected.clone());
@@ -347,10 +347,20 @@ impl<T: BotTransport> TelegramChannel<T> {
 fn send_binding(chat_id: i64, outbound: &OutboundMessage, key: &str) -> SendBinding {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
+    // Field-separated encoding: every field is length-prefixed so a
+    // text tail can never collide with a reply-target prefix — text
+    // ending in NUL + "7" with no target hashes differently from the
+    // bare text with reply target "7".
+    hasher.update((outbound.text.len() as u64).to_be_bytes());
     hasher.update(outbound.text.as_bytes());
-    if let Some(reply_to) = &outbound.reply_to_message_id {
-        hasher.update([0]);
-        hasher.update(reply_to.as_str().as_bytes());
+    match &outbound.reply_to_message_id {
+        Some(reply_to) => {
+            let bytes = reply_to.as_str().as_bytes();
+            hasher.update([1u8]);
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        None => hasher.update([0u8]),
     }
     SendBinding {
         dedupe_key: key.to_owned(),
@@ -989,5 +999,91 @@ mod tests {
             sent.lock().unwrap().is_empty(),
             "a checkpoint from a different outbound message posted parts"
         );
+    }
+
+    #[test]
+    fn the_payload_digest_separates_text_from_the_reply_target() {
+        // A text suffix must never collide with a reply target: both
+        // payloads below are contract-valid and used to hash to the
+        // same byte stream.
+        let mut bare = OutboundMessage::new("42", "note\u{0}7", "send-digest");
+        bare.reply_to_message_id = None;
+        let mut targeted = OutboundMessage::new("42", "note", "send-digest");
+        targeted.reply_to_message_id = Some(a4mc::ExternalMessageId::from("7"));
+        assert_ne!(
+            send_binding(42, &bare, "send-digest").payload_digest,
+            send_binding(42, &targeted, "send-digest").payload_digest,
+            "a text suffix collided with the reply target"
+        );
+        // Field separation, not mere field presence: the same text
+        // with and without a target also digests differently.
+        let mut third = OutboundMessage::new("42", "note\u{0}7", "send-digest");
+        third.reply_to_message_id = Some(a4mc::ExternalMessageId::from("7"));
+        assert_ne!(
+            send_binding(42, &bare, "send-digest").payload_digest,
+            send_binding(42, &third, "send-digest").payload_digest,
+        );
+    }
+
+    #[test]
+    fn a_cached_receipt_never_bypasses_caller_checkpoint_validation() {
+        // The first send leaves a receipt under its effective key; a
+        // caller-supplied checkpoint bound to a different prepared
+        // send must be refused before that receipt is returned — the
+        // cache is not a shortcut around checkpoint validation.
+        let transport = MockBotTransport::default();
+        let channel = TelegramChannel::new(Arc::new(transport));
+        let outbound = OutboundMessage::new("42", "hello", "send-cached");
+        channel.send(&outbound).unwrap();
+
+        let failure = channel
+            .send_tracked(
+                &outbound,
+                Some(&SendProgress {
+                    confirmed: vec![7],
+                    next_part: 1,
+                    outcome_unknown: false,
+                    binding: Some(SendBinding {
+                        dedupe_key: "send-cached".into(),
+                        chat_id: 42,
+                        payload_digest: "foreign".into(),
+                    }),
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(failure.error.code, "a4mc_telegram_resume_mismatch");
+
+        // An uncertain caller checkpoint against a finished key is
+        // refused as ambiguous, not satisfied by the cached receipt.
+        let failure = channel
+            .send_tracked(
+                &outbound,
+                Some(&SendProgress {
+                    confirmed: vec![7],
+                    next_part: 0,
+                    outcome_unknown: true,
+                    binding: None,
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(failure.error.code, "a4mc_telegram_send_ambiguous");
+
+        // The bound checkpoint still resolves against the cache.
+        let expected = send_binding(42, &outbound, "send-cached");
+        let receipt = channel
+            .send_tracked(
+                &outbound,
+                Some(&SendProgress {
+                    confirmed: vec![],
+                    next_part: 0,
+                    outcome_unknown: false,
+                    binding: Some(expected),
+                }),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(receipt.idempotency_key, "send-cached");
     }
 }
