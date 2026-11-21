@@ -119,12 +119,14 @@ enum Scheduled {
         key: TaskKey,
         message: Box<InboundMessage>,
     },
-    /// A recorded reply restart recovery re-queues: the worker waits
-    /// its persisted deadline, resumes at the checkpoint and settles
-    /// the record on delivery.
+    /// A recorded reply restart recovery re-queues — only the durable
+    /// task record travels: the reply body is loaded once the job
+    /// reaches a worker, so a deep backlog of spilled sidecar replies
+    /// is never resident in memory at once. The worker waits its
+    /// persisted deadline, resumes at the checkpoint and settles the
+    /// record on delivery.
     Resend {
         task: Box<crate::binding::PendingUpdate>,
-        reply: String,
     },
 }
 
@@ -396,7 +398,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 .unwrap_or(Duration::ZERO),
         ),
         offset: 0,
-        sequence_expired: false,
+        expired_sequence: None,
     };
     cursor.offset = if cursor.sequence_age.elapsed() >= config.poll_sequence_idle {
         // The confirmed id sequence is dead: claims minted under it —
@@ -404,8 +406,8 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         // while outstanding tasks and staged records keep their
         // dead-sequence keys so a restarted numbering's reused ids can
         // never collide with them.
+        cursor.expired_sequence = Some(store.poll_sequence());
         store.expire_sequence()?;
-        cursor.sequence_expired = true;
         0
     } else {
         store.poll_offset()
@@ -442,7 +444,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     let turn_deadline = config.turn_deadline;
     let processor = move |chat_id: i64, job: Scheduled| -> Result<()> {
         match job {
-            Scheduled::Resend { task, reply } => {
+            Scheduled::Resend { task } => {
                 // Reload the durable record: a queued wait may span
                 // another attempt's writes — retrying the stale
                 // snapshot would repost confirmed work or skip a
@@ -463,6 +465,23 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 {
                     return Ok(());
                 }
+                // The reply body is read only now that the job has a
+                // worker: recovery queued the claim alone, so a backlog
+                // of large spilled replies is never resident at once. A
+                // record whose payload cannot be resolved stays
+                // unfinished — settling over a paid result is never
+                // allowed — and the host is told it is stuck.
+                let reply = match processor_store.lock().unwrap().reply_text(&task) {
+                    Ok(Some(reply)) => reply,
+                    Ok(None) => {
+                        notify_stuck(&processor_stuck, task.key(), "a4mc_telegram_reply_lost");
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        notify_stuck(&processor_stuck, task.key(), &failure_code(&error));
+                        return Ok(());
+                    }
+                };
                 let delivery_key = task
                     .reply_key
                     .clone()
@@ -518,25 +537,26 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                     // failure would settle work whose result was never
                     // recorded, and the supervisor would never see the
                     // original error. The task stays claimed for
-                    // recovery either way; only a failure that left
-                    // nothing durable reaches the caller, while a
-                    // completion retained staged — one whose document
-                    // could not take it — keeps the established
-                    // nonfatal report-and-continue contract.
+                    // recovery either way. Exactly one shape stays
+                    // nonfatal: a completion whose staged record is
+                    // durable but exceeds document capacity — it binds
+                    // on recovery, so reporting it and continuing is
+                    // the established contract. Every other write
+                    // failure — a checkpoint or progress write that
+                    // could not land included — reaches the supervising
+                    // loop as the resend and fallback paths surface
+                    // theirs, because polling must not continue on a
+                    // store that cannot take writes.
                     Err(error) if is_persistence_failure(&error) => {
-                        let retained = {
-                            let store = processor_store.lock().unwrap();
-                            store
-                                .pending_update(key)
-                                .is_some_and(|task| task.has_reply())
-                                || store.staged_reply_pending(key)
-                        };
-                        if retained {
-                            notify_stuck(&processor_stuck, key, &failure_code(&error));
-                            Ok(())
-                        } else {
-                            Err(error)
-                        }
+                        report_stranded(
+                            &processor_store,
+                            &processor_stuck,
+                            key,
+                            &failure_code(&error),
+                        );
+                        let durable_staged = failure_code(&error) == "a4mc_telegram_state_full"
+                            && processor_store.lock().unwrap().staged_reply_pending(key);
+                        if durable_staged { Ok(()) } else { Err(error) }
                     }
                     Err(error) => handle_failed_inbound(
                         &processor_channel,
@@ -603,30 +623,24 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     // while their stage is unfinished, so nothing paid or already
     // confirmed runs twice; the binding's routing is already committed
     // — recovery only re-delivers, it never re-applies a superseded
-    // change.
+    // change. Only the claim decides the lane: a finished reply's
+    // body — possibly several MiB spilled to a sidecar — is loaded by
+    // the worker that takes the job, not eagerly here, so the whole
+    // backlog's payloads are never resident at once.
     let unfinished = store.lock().unwrap().pending_updates();
     for task in unfinished {
         if staged.contains(&task.key()) {
             continue;
         }
-        // A finished reply may be spilled to its sidecar file; resolve
-        // the payload once here. A record whose payload cannot be read
-        // stays unfinished — settling over a paid result is never
-        // allowed — and the host is told it is stuck rather than the
-        // record being parked silently; one with none re-queues its
-        // message whole.
-        match store.lock().unwrap().reply_text(&task) {
-            Ok(Some(reply)) => pending.push_back(Scheduled::Resend {
+        if task.has_reply() {
+            pending.push_back(Scheduled::Resend {
                 task: Box::new(task),
-                reply,
-            }),
-            Ok(None) => pending.push_back(Scheduled::Message {
+            });
+        } else {
+            pending.push_back(Scheduled::Message {
                 key: task.key(),
                 message: Box::new(task.message.clone()),
-            }),
-            Err(error) => {
-                notify_stuck(&on_stuck, task.key(), &failure_code(&error));
-            }
+            });
         }
     }
     // Workers spawn only after every recovery write has run: a
@@ -830,14 +844,17 @@ impl SequenceAge {
 /// The polling cursor plus the freshness of the id sequence it
 /// confirms: silent past [`RuntimeConfig::poll_sequence_idle`], the
 /// stale high-water mark is dropped so a restarted sequence's lower
-/// first ids are seen. The drop happens at most once per run: after
-/// the resync, the cursor this process advanced is the live mark —
-/// expiring again would roll a confirmed offset back to zero and
-/// re-expose dead-sequence ids for re-admission.
+/// first ids are seen. Expiry is tracked per sequence — each new
+/// numbering earns its own idle check, so a run that already rolled
+/// over once still resyncs when the live sequence goes silent past the
+/// window again.
 struct PollCursor {
     offset: i64,
     sequence_age: SequenceAge,
-    sequence_expired: bool,
+    /// The sequence last retired — `None` while none has been.
+    /// Expiry may fire only for a sequence that has not already been
+    /// rolled over, so the check can never loop on a dead numbering.
+    expired_sequence: Option<u64>,
 }
 
 fn poll_updates<T: BotTransport>(
@@ -865,7 +882,8 @@ fn poll_updates<T: BotTransport>(
             // redeliver updates the platform still holds unconfirmed,
             // while passing the stale offset would acknowledge the new
             // sequence's lower first ids unseen.
-            if !cursor.sequence_expired
+            let live_sequence = store.lock().unwrap().poll_sequence();
+            if cursor.expired_sequence != Some(live_sequence)
                 && cursor.offset != 0
                 && cursor.sequence_age.elapsed() >= config.poll_sequence_idle
             {
@@ -874,14 +892,14 @@ fn poll_updates<T: BotTransport>(
                 // belong to it, and a restarted numbering may lawfully
                 // reuse those ids — while dead-sequence tasks and staged
                 // records keep their keys so the reused ids can never
-                // collide with retained work. Fires once per run: an
-                // offset this process already resynced is the live mark,
-                // not a stale one, and re-expiring would renumber the
-                // live sequence and re-admit its retained ids.
+                // collide with retained work. Each live sequence earns
+                // its own idle check: a cursor this process resynced
+                // still rolls over if ITS numbering later goes silent
+                // past the window.
+                cursor.expired_sequence = Some(live_sequence);
                 store.lock().unwrap().expire_sequence()?;
                 cursor.offset = 0;
                 cursor.sequence_age.reset();
-                cursor.sequence_expired = true;
             }
             let updates = match transport.get_updates(cursor.offset, config.poll_timeout_secs) {
                 Ok(updates) => {
@@ -1332,14 +1350,15 @@ fn handle_inbound<T: BotTransport>(
 /// from the fallback error report for the same update (`error`), so a
 /// recorded agent reply can never be shadowed by an observed error
 /// receipt under the same dedupe key. The claim's sequence names the
-/// key: a restarted id sequence can never mint a key that collides
-/// with a dead sequence's retained delivery. Sequence `0` keeps the
-/// revision-one key shape so records staged before the field existed
-/// still resume under the key they wrote.
+/// key — in a form disjoint from every legacy key, since a bare
+/// `purpose:id` or `purpose:id:part` could be re-minted verbatim by a
+/// restarted numbering. Sequence `0` keeps the revision-one key shape
+/// so records staged before the field existed still resume under the
+/// key they wrote.
 fn reply_key(key: TaskKey, purpose: &str) -> String {
     match key.sequence {
         0 => format!("{purpose}:{}", key.update_id),
-        sequence => format!("{purpose}:{sequence}:{}", key.update_id),
+        sequence => format!("{purpose}:s{sequence}:{}", key.update_id),
     }
 }
 
@@ -1779,13 +1798,21 @@ fn handle_command<T: BotTransport>(
         ControlCommand::Agent {
             agent_id: Some(agent_id),
         } => {
-            require_paired(store, message)?;
-            // The authorized binding — revision included — is captured
-            // BEFORE the host call: a rebind the user lands while
-            // `ensure_known_agent` runs must not become this command's
-            // expected revision, or the guarded write would overwrite
-            // the intervening change it was meant to refuse.
-            let expected = store_binding(store, message.chat_id)?;
+            // Authorization and the routing snapshot are ONE store
+            // read: a rebind landing between two refreshes would be
+            // adopted as this command's expected revision — and a
+            // pairing that disappears between them would leave the
+            // guarded write with no precondition at all. Capturing the
+            // paired binding once means the guarded write commits only
+            // against the revision the command was authorized under —
+            // an intervening rebind or re-pairing is refused, never
+            // overwritten.
+            let Some(expected) = store_paired_binding(store, message.chat_id, message.user_id)?
+            else {
+                return Err(anyhow!(
+                    "Not paired. Send /start to request a pairing code."
+                ));
+            };
             ensure_known_agent(&agent_id).map_err(|error| anyhow!(error.to_string()))?;
             // The rebind and its confirmation commit in one write, so
             // recovery only ever resumes delivery — it never re-runs
@@ -1799,7 +1826,7 @@ fn handle_command<T: BotTransport>(
                 agent_id.clone(),
                 &reply_key(key, "reply"),
                 message.user_id,
-                expected.as_ref(),
+                &expected,
                 |applied| {
                     if applied {
                         format!(
@@ -1995,7 +2022,10 @@ fn handle_pair_request<T: BotTransport>(
     }
     // The pairing record and the reply carrying its code commit in one
     // write: a restart never re-mints a second code for a confirmation
-    // the platform already accepted.
+    // the platform already accepted. The recovered record binds the
+    // refused variant when its offer can no longer apply — an
+    // intervening approval or a TTL that elapsed during downtime must
+    // never deliver a dead code.
     let delivery_key = reply_key(key, "reply");
     let text = store.lock().unwrap().record_pairing_and_reply(
         message.chat_id,
@@ -2004,6 +2034,7 @@ fn handle_pair_request<T: BotTransport>(
         key,
         &delivery_key,
         |record| pairing_code_text(&record.code),
+        "That pairing offer did not hold — send /start to request a fresh code.",
     )?;
     deliver_recorded_reply(
         channel,
@@ -2045,6 +2076,7 @@ fn handle_ordinary<T: BotTransport>(
             key,
             &delivery_key,
             |record| format!("Pairing required.\n{}", pairing_code_text(&record.code)),
+            "Pairing is still required — send /start to request a fresh code.",
         )?;
         deliver_recorded_reply(
             channel,
@@ -4281,12 +4313,15 @@ mod tests {
             offsets.iter().skip(1).any(|offset| *offset == 0),
             "the stale cursor kept being confirmed after the idle window: {offsets:?}"
         );
-        drop(offsets);
-        assert_eq!(
-            BindingStore::open_in(&root).unwrap().poll_offset(),
-            6,
+        // The restarted sequence's first commit is confirmed as the
+        // live mark on later polls — the durable cursor itself may
+        // already have rolled over a second time by the time the run
+        // is read back.
+        assert!(
+            offsets.contains(&6),
             "the restarted sequence did not advance from its first id"
         );
+        drop(offsets);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6112,7 +6147,7 @@ mod tests {
         let mut cursor = PollCursor {
             offset: 0,
             sequence_age: SequenceAge::resumed(Duration::ZERO),
-            sequence_expired: false,
+            expired_sequence: None,
         };
         let mut pending = VecDeque::new();
         let mut on_event = None;
@@ -6552,10 +6587,15 @@ mod tests {
         // A restarted id sequence mints keys in its own namespace, so a
         // retained dead-sequence delivery can never collide with the
         // fresh sequence's reply for the same update id. Sequence zero
-        // keeps the revision-one shape older records resume under.
+        // keeps the revision-one shape older records resume under. The
+        // sequenced form carries a non-numeric marker so it can never
+        // re-mint a legacy multipart key — `reply:1:1` is update 1's
+        // second part, and a bare `reply:1:1` minted for sequence 1,
+        // update 1 would read as exactly that.
         assert_eq!(reply_key(TaskKey::from(7), "reply"), "reply:7");
-        assert_eq!(reply_key(TaskKey::new(1, 7), "reply"), "reply:1:7");
-        assert_eq!(reply_key(TaskKey::new(1, 7), "error"), "error:1:7");
+        assert_eq!(reply_key(TaskKey::new(1, 7), "reply"), "reply:s1:7");
+        assert_eq!(reply_key(TaskKey::new(1, 7), "error"), "error:s1:7");
+        assert_ne!(reply_key(TaskKey::new(1, 1), "reply"), "reply:1:1");
     }
 
     #[test]
@@ -6598,5 +6638,321 @@ mod tests {
             0,
             "a worker survived the failed spawn"
         );
+    }
+
+    #[test]
+    fn a_legacy_multipart_resend_and_a_fresh_update_share_one_dedupe_pipeline() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+            // A dead-sequence reply too large for one send: its parts
+            // deliver under `reply:1` and `reply:1:1` — the second
+            // being exactly the key a bare `purpose:sequence:id`
+            // format would mint for sequence 1, update 1.
+            let oversized = "d".repeat(a4mc::MAX_OUTBOUND_TEXT_CHARS + 200);
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 1,
+                        sequence: 0,
+                        message: text_message(42, 42, Some("alice"), "hello", 1),
+                        reply: Some(oversized),
+                        reply_key: Some("reply:1".to_owned()),
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    2,
+                )
+                .unwrap();
+            // The sequence rolls over and the restarted numbering
+            // lawfully reuses update id 1 for a fresh turn — its reply
+            // must post under a key no dead-sequence part key can
+            // equal, or the dedupe cache suppresses it as a repeat.
+            store.expire_sequence().unwrap();
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 1,
+                        sequence: 0,
+                        message: text_message(42, 42, Some("alice"), "again", 1),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    2,
+                )
+                .unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        // The first contract part (32K) chunks at the platform bound
+        // into 8 posts, its tail posts under `reply:1:1`, and the fresh
+        // turn posts its own reply: 10 sends in all.
+        wait_until(|| sent.lock().unwrap().len() == 10, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let posts = sent.lock().unwrap();
+        assert!(
+            posts
+                .iter()
+                .any(|(_, text)| text.len() == 200 && text.chars().all(|c| c == 'd')),
+            "the legacy resend's second part never posted: {:?}",
+            posts.iter().map(|(_, text)| text.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            posts.iter().filter(|(_, text)| text == "synthetic").count(),
+            1,
+            "the fresh sequence's reply was suppressed by the dead sequence's part key"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn each_live_sequence_earns_its_own_idle_check() {
+        let root = temp_root();
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let updates = Arc::new(Mutex::new(vec![Update {
+            update_id: 9,
+            message: Some(text_message(42, 42, Some("alice"), "/whoami", 9)),
+        }]));
+        let observed_offsets = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::clone(&updates),
+            observed_offsets: Arc::clone(&observed_offsets),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            poll_sequence_idle: Duration::from_millis(60),
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        // A second handle watches the sequence counter: the first
+        // rollover is not the last — a cursor this run resynced is the
+        // live mark, and ITS silent numbering must roll over too.
+        let watcher = Arc::new(Mutex::new(BindingStore::open_in(&root).unwrap()));
+        let sequence = |watcher: &Mutex<BindingStore>| {
+            let mut store = watcher.lock().unwrap();
+            store.refresh().unwrap();
+            store.poll_sequence()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        wait_until(|| sequence(&watcher) == 1, Duration::from_secs(10));
+        // The restarted numbering reuses a lower id — only deliverable
+        // while the poller passes the restarted cursor.
+        updates.lock().unwrap().push(Update {
+            update_id: 4,
+            message: Some(text_message(88, 88, Some("zoe"), "/whoami", 4)),
+        });
+        wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(10));
+        // The second idle window must roll the second sequence too —
+        // a once-per-run latch would keep confirming this cursor's
+        // high-water mark instead.
+        wait_until(|| sequence(&watcher) == 2, Duration::from_secs(10));
+        updates.lock().unwrap().push(Update {
+            update_id: 3,
+            message: Some(text_message(99, 99, Some("max"), "/whoami", 3)),
+        });
+        wait_until(|| sent.lock().unwrap().len() == 3, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        // Every cursor the poller confirmed after a commit is a live
+        // mark: each rollover is a nonzero-to-zero transition, and two
+        // committed sequences rolling over in one run is the fix under
+        // test — a once-per-run latch would show exactly one.
+        let offsets = observed_offsets.lock().unwrap();
+        let resets = offsets
+            .windows(2)
+            .filter(|window| window[0] != 0 && window[1] == 0)
+            .count();
+        assert!(
+            resets >= 2,
+            "the second rollover never reset the cursor: {offsets:?}"
+        );
+        assert!(
+            BindingStore::open_in(&root).unwrap().poll_sequence() >= 2,
+            "the second rollover never fired"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_checkpoint_write_failure_reaches_the_supervisor() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+        store.approve(&pending.code).unwrap();
+        store.set_agent(42, Some("codex".into())).unwrap();
+        store
+            .admit_updates(
+                &[crate::binding::PendingUpdate {
+                    update_id: 9,
+                    sequence: 0,
+                    message: text_message(42, 42, Some("alice"), "hello agent", 9),
+                    reply: None,
+                    reply_key: None,
+                    reply_sent: 0,
+                    reply_progress: None,
+                    reply_file: None,
+                    reply_retry_at_ms: None,
+                    reply_refused: false,
+                }],
+                &[],
+                &[],
+                10,
+            )
+            .unwrap();
+        // The reply record lands; the first checkpoint write — the
+        // in-flight marker ahead of the platform post — fails. A store
+        // that cannot take writes must reach the supervising loop,
+        // never be treated as handled because the task has a reply.
+        store.fail_next_write_after_for_test(1);
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(true));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let error = run_channel_loop(transport, store, config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a4mc_telegram_checkpoint_failed"),
+            "the checkpoint failure never reached the supervisor: {error}"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a send posted after its checkpoint write failed"
+        );
+        {
+            let reopened = BindingStore::open_in(&root).unwrap();
+            let task = reopened
+                .pending_update(9)
+                .expect("the recorded reply was settled over");
+            assert!(task.has_reply());
+        }
+        // Recovery resends the retained reply — the failed checkpoint
+        // costs one restart, not the paid result.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| !sent.lock().unwrap().is_empty(), Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(sent.lock().unwrap()[0].1, "synthetic");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_agent_command_refuses_after_its_authorized_pairing_vanishes() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        // The pairing the command was authorized under disappears while
+        // `ensure_known_agent` runs, and the user re-pairs fresh: the
+        // command's captured revision must refuse the write — a `None`
+        // snapshot would commit over the subsequent pairing instead.
+        let racing_root = root.clone();
+        *MID_SCAN_ACTION.lock().unwrap() = Some(Box::new(move || {
+            let mut store = BindingStore::open_in(&racing_root).unwrap();
+            store.revoke(42).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+        }));
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 9,
+                message: Some(text_message(42, 42, Some("alice"), "/agent codex", 9)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| !sent.lock().unwrap().is_empty(), Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(
+            sent.lock().unwrap()[0].1,
+            "The chat's pairing moved while the command ran — the agent was not changed.",
+            "the command confirmed a rebind it did not commit"
+        );
+        let reopened = BindingStore::open_in(&root).unwrap();
+        let binding = reopened.binding(42).unwrap();
+        assert!(binding.paired);
+        assert_eq!(
+            binding.agent_id, None,
+            "the vanished pairing's re-pairing was overwritten"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

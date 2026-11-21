@@ -393,6 +393,10 @@ pub struct BindingStore {
     document: BindingDocument,
     #[cfg(test)]
     fail_next_write: bool,
+    /// Mutations allowed to succeed before `fail_next_write` fires —
+    /// so a test can poison a write in the middle of a sequence.
+    #[cfg(test)]
+    healthy_writes: usize,
     #[cfg(test)]
     fail_next_admit_capacity: bool,
 }
@@ -416,6 +420,8 @@ impl BindingStore {
             document,
             #[cfg(test)]
             fail_next_write: false,
+            #[cfg(test)]
+            healthy_writes: 0,
             #[cfg(test)]
             fail_next_admit_capacity: false,
         };
@@ -460,7 +466,9 @@ impl BindingStore {
         change: impl FnOnce(&mut BindingDocument) -> Result<R>,
     ) -> Result<R> {
         #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_write) {
+        if self.healthy_writes > 0 {
+            self.healthy_writes -= 1;
+        } else if std::mem::take(&mut self.fail_next_write) {
             return Err(anyhow!("a4mc_telegram_state_write_failed"));
         }
         self.lock
@@ -681,6 +689,15 @@ impl BindingStore {
         self.fail_next_write = true;
     }
 
+    /// Let `healthy` mutations succeed, then fail one — a write in the
+    /// middle of a sequence can be poisoned without timing a real
+    /// failure.
+    #[cfg(test)]
+    pub fn fail_next_write_after_for_test(&mut self, healthy: usize) {
+        self.healthy_writes = healthy;
+        self.fail_next_write = true;
+    }
+
     /// Make the next admission answer a capacity refusal without
     /// writing — the shape a probe against a momentarily full document
     /// takes, so a caller's drain-and-retry path can be exercised
@@ -850,20 +867,40 @@ impl BindingStore {
     }
 
     /// Retire the confirmed id sequence in one durable write: the
-    /// sequence counter advances, the settled-id tail and the pending
-    /// event markers — claims only meaningful inside the dead sequence —
-    /// are released, and the cursor restarts so a restarted numbering's
-    /// lower first ids are fetched instead of acknowledged unseen.
-    /// Outstanding tasks and staged records keep their dead-sequence
-    /// keys: their replies still deliver under the keys they recorded,
-    /// but they no longer claim the id a fresh sequence may reuse.
+    /// sequence counter advances, the settled-id tail is released, the
+    /// pending event markers — records only meaningful inside the dead
+    /// sequence — become their durable dropped records under their
+    /// original sequence, and the cursor restarts so a restarted
+    /// numbering's lower first ids are fetched instead of acknowledged
+    /// unseen. Outstanding tasks and staged records keep their
+    /// dead-sequence keys: their replies still deliver under the keys
+    /// they recorded, but they no longer claim the id a fresh sequence
+    /// may reuse.
     pub fn expire_sequence(&mut self) -> Result<()> {
         self.mutate(|document| {
             document.poll_sequence += 1;
             document.settled_updates.clear();
-            document
+            // A marker whose sequence died can neither be refetched for
+            // a callback nor settled by one — moving it into the bounded
+            // dropped history keeps the event visible instead of erasing
+            // it with the claims it hung on.
+            let dead: Vec<DroppedUpdate> = document
                 .pending_events
-                .retain(|item| item.sequence == document.poll_sequence);
+                .extract_if(.., |item| item.sequence != document.poll_sequence)
+                .collect();
+            for event in dead {
+                document
+                    .dropped_updates
+                    .retain(|item| item.key() != event.key());
+                document.dropped_updates.push(event);
+            }
+            let excess = document
+                .dropped_updates
+                .len()
+                .saturating_sub(MAX_DROPPED_UPDATES);
+            if excess > 0 {
+                document.dropped_updates.drain(..excess);
+            }
             document.poll_offset = 0;
             document.poll_offset_advanced_at = Some(now_secs());
             Ok(())
@@ -1032,12 +1069,12 @@ impl BindingStore {
     /// Commit a chat's agent rebind and the reply confirming it in one
     /// write — a changed agent clears the session exactly as
     /// `set_agent` does. The rebind is applied only while the chat is
-    /// still paired for the user the command ran for and, when
-    /// `expected` carries the binding the command observed, while that
-    /// binding's revision still holds. `text` is rendered for both
-    /// outcomes, so a recovered record binds the answer matching what
-    /// the guarded rebind actually commits; the reply record never
-    /// depends on it. Returns the reply text.
+    /// still paired for the user the command ran for and while the
+    /// revision of `expected` — the binding the command was authorized
+    /// under — still holds. `text` is rendered for both outcomes, so a
+    /// recovered record binds the answer matching what the guarded
+    /// rebind actually commits; the reply record never depends on it.
+    /// Returns the reply text.
     #[allow(clippy::too_many_arguments)]
     pub fn record_reply_and_agent(
         &mut self,
@@ -1046,7 +1083,7 @@ impl BindingStore {
         agent_id: String,
         delivery_key: &str,
         user_id: i64,
-        expected: Option<&ChatBinding>,
+        expected: &ChatBinding,
         text: impl Fn(bool) -> String,
     ) -> Result<String> {
         let key = key.into();
@@ -1056,7 +1093,7 @@ impl BindingStore {
                 chat_id,
                 agent_id,
                 user_id: Some(user_id),
-                binding_revision: expected.map(|binding| binding.revision),
+                binding_revision: Some(expected.revision),
             };
             let applied = apply_effect(document, &effect);
             let (applied_text, refused_text) = (text(true), text(false));
@@ -1087,8 +1124,11 @@ impl BindingStore {
     /// Commit a fresh pairing record and the reply carrying its code in
     /// one write — same admission rules as `request_pairing` — so the
     /// code a user receives always has its durable record. `text`
-    /// receives the record minted for the document. Returns the reply
-    /// text.
+    /// receives the record minted for the document; `refused_text` is
+    /// the outcome bound instead when recovery finds the offer refused
+    /// — an intervening approval or a TTL that elapsed during downtime
+    /// must never deliver the staged code. Returns the reply text.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_pairing_and_reply(
         &mut self,
         chat_id: i64,
@@ -1097,6 +1137,7 @@ impl BindingStore {
         key: impl Into<TaskKey>,
         delivery_key: &str,
         text: impl FnOnce(&PairingRecord) -> String,
+        refused_text: &str,
     ) -> Result<String> {
         let key = key.into();
         let dir = replies_dir(&self.path);
@@ -1132,7 +1173,7 @@ impl BindingStore {
                 &dir,
                 key,
                 &reply,
-                None,
+                Some(refused_text),
                 true,
                 delivery_key,
                 effect,
@@ -1876,6 +1917,14 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
             applies
         }
         StagedEffect::ReplyPairing { record } => {
+            let now = now_secs();
+            document.pairings.retain(|held| held.expires_at > now);
+            if record.expires_at <= now {
+                // The offer's TTL elapsed while it waited to bind —
+                // replaying it would publish a dead code, so the
+                // record binds its refused variant instead.
+                return false;
+            }
             if document
                 .chats
                 .get(&record.chat_id.to_string())
@@ -3582,6 +3631,182 @@ mod tests {
             let binding = store.binding(9).unwrap();
             assert_eq!(binding.agent_id.as_deref(), Some("claude"));
             assert_eq!(binding.session_id, None);
+        });
+    }
+
+    #[test]
+    fn an_expired_sequence_moves_pending_events_into_dropped_history() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[],
+                    &[],
+                    &[DroppedUpdate {
+                        update_id: 6,
+                        sequence: 0,
+                        raw_kind: "reaction".to_owned(),
+                    }],
+                    7,
+                )
+                .unwrap();
+            assert_eq!(store.poll_sequence(), 0);
+            store.expire_sequence().unwrap();
+            assert_eq!(store.poll_sequence(), 1);
+            // The dead sequence's marker can neither be refetched for a
+            // callback nor settled by one — it must survive as its
+            // dropped record under the sequence it was claimed in, not
+            // be erased with the claims it hung on.
+            let dropped = store.dropped_updates();
+            assert!(
+                dropped.iter().any(|item| item.update_id == 6
+                    && item.sequence == 0
+                    && item.raw_kind == "reaction"),
+                "the dead sequence's marker was erased instead of dropped: {dropped:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn an_expired_pairing_offer_binds_its_refused_variant() {
+        temp_store(|mut store| {
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // The offer's TTL elapsed during downtime while only the
+            // durable record existed: replaying its effect must never
+            // re-publish the dead code.
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = StagedCompletion {
+                update_id: 7,
+                sequence: 0,
+                payload: "reply-7.json".to_owned(),
+                key: "reply:7".to_owned(),
+                effect: StagedEffect::ReplyPairing {
+                    record: PairingRecord {
+                        code: "ABCD-EFGH".to_owned(),
+                        chat_id: 9,
+                        user_id: 9,
+                        username: Some("alice".to_owned()),
+                        created_at: 1,
+                        expires_at: 2,
+                    },
+                },
+                text: Some("Pairing code: ABCD-EFGH".to_owned()),
+                refused_text: Some(
+                    "That pairing offer did not hold — send /start to request a fresh code."
+                        .to_owned(),
+                ),
+            };
+            std::fs::write(
+                dir.join("reply-7.json"),
+                serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+            store.reconcile_staged().unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert!(task.reply_refused);
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some("That pairing offer did not hold — send /start to request a fresh code."),
+                "recovery delivered a pairing code whose TTL elapsed"
+            );
+            assert!(
+                store.pending_pairings().is_empty(),
+                "an expired offer was re-published: {:?}",
+                store.pending_pairings()
+            );
+        });
+    }
+
+    #[test]
+    fn a_superseded_pairing_offer_binds_its_refused_variant() {
+        temp_store(|mut store| {
+            // The user fully paired while only the durable record of a
+            // code offer existed: replaying the offer must never
+            // re-publish it over the live pairing.
+            let pending = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        sequence: 0,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = StagedCompletion {
+                update_id: 7,
+                sequence: 0,
+                payload: "reply-7.json".to_owned(),
+                key: "reply:7".to_owned(),
+                effect: StagedEffect::ReplyPairing {
+                    record: PairingRecord {
+                        code: "WXYZ-1234".to_owned(),
+                        chat_id: 9,
+                        user_id: 9,
+                        username: Some("alice".to_owned()),
+                        created_at: now_secs(),
+                        expires_at: now_secs() + PAIRING_TTL.as_secs(),
+                    },
+                },
+                text: Some("Pairing code: WXYZ-1234".to_owned()),
+                refused_text: Some(
+                    "That pairing offer did not hold — send /start to request a fresh code."
+                        .to_owned(),
+                ),
+            };
+            std::fs::write(
+                dir.join("reply-7.json"),
+                serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+            store.reconcile_staged().unwrap();
+            let task = store.pending_update(7).unwrap();
+            assert!(task.reply_refused);
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some("That pairing offer did not hold — send /start to request a fresh code."),
+                "recovery re-published an offer a full pairing superseded"
+            );
+            assert!(
+                store
+                    .pending_pairings()
+                    .iter()
+                    .all(|record| record.code != "WXYZ-1234"),
+                "a superseded offer was re-published: {:?}",
+                store.pending_pairings()
+            );
+            assert!(store.binding(9).unwrap().paired);
         });
     }
 }

@@ -300,6 +300,60 @@ impl GatewayStream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> 
     }
 }
 
+/// One absolute deadline enforced at the I/O boundary. Arming a socket
+/// timeout once per `socket.read` cannot bound a fragmented frame:
+/// tungstenite assembles it through several blocking reads and each
+/// would carry the same full budget, so a frame arriving one byte per
+/// timeout window outlives the HELLO/heartbeat deadline it was
+/// scheduled under. This wrapper re-arms the real socket timeout with
+/// only the remaining budget on EVERY read it performs, so no read —
+/// mid-fragment included — can outlive the deadline the caller armed.
+/// `None` leaves the stream's configured idle timeout for traffic
+/// outside a bounded call.
+struct DeadlineStream {
+    inner: Box<dyn GatewayStream>,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineStream {
+    fn arm(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+        if deadline.is_none() {
+            // Outside a bounded call the stream keeps its configured
+            // idle timeout — never a shrunken remainder the last read
+            // left armed.
+            let _ = self.inner.set_read_timeout(Some(IO_TIMEOUT));
+        }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "read deadline reached",
+                ));
+            }
+            self.inner
+                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        }
+        self.inner.read(buffer)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_HANDSHAKE_RESPONSE: usize = 16 * 1024;
@@ -312,7 +366,7 @@ const MAX_HANDSHAKE_RESPONSE: usize = 16 * 1024;
 /// uses the platform root store.
 fn connect_websocket(
     endpoint: &GatewayEndpoint,
-) -> Result<tungstenite::WebSocket<Box<dyn GatewayStream>>, DiscordApiError> {
+) -> Result<tungstenite::WebSocket<DeadlineStream>, DiscordApiError> {
     let failed = || {
         DiscordApiError::new(
             "a4mc_discord_gateway_connect_failed",
@@ -416,7 +470,10 @@ fn connect_websocket(
         return Err(failed());
     }
     Ok(tungstenite::WebSocket::from_partially_read(
-        stream,
+        DeadlineStream {
+            inner: stream,
+            deadline: None,
+        },
         leftover,
         tungstenite::protocol::Role::Client,
         None,
@@ -437,21 +494,7 @@ impl GatewayConnector for LiveGatewayConnector {
 }
 
 struct LiveGatewayConnection {
-    socket: tungstenite::WebSocket<Box<dyn GatewayStream>>,
-}
-
-impl LiveGatewayConnection {
-    fn set_read_timeout(&self, timeout: Duration) -> Result<(), DiscordApiError> {
-        self.socket
-            .get_ref()
-            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
-            .map_err(|_| {
-                DiscordApiError::new(
-                    "a4mc_discord_gateway_failed",
-                    "Gateway read timeout could not be set",
-                )
-            })
-    }
+    socket: tungstenite::WebSocket<DeadlineStream>,
 }
 
 /// Encode one client text frame (FIN, masked) and write it straight to
@@ -488,49 +531,53 @@ fn write_masked_text_frame(stream: &mut dyn Write, payload: &[u8]) -> Result<(),
 
 impl GatewayConnection for LiveGatewayConnection {
     fn read_frame(&mut self, timeout: Duration) -> Result<GatewayRead, DiscordApiError> {
-        // The budget bounds the whole call, not each internal read:
-        // non-terminal frames are skipped inside this loop, so every
-        // iteration re-arms the socket with only the remaining
-        // deadline — a stream of Ping/Pong/Binary traffic can never
-        // stretch one read_frame past what the session scheduled.
+        // The budget bounds the whole call, frame assembly included:
+        // the deadline is armed on the stream itself, so every blocking
+        // read tungstenite performs — inside one socket.read while a
+        // fragmented frame is still arriving, and across the loop that
+        // skips non-terminal frames — carries only the remaining
+        // budget. A stream of Ping/Pong/Binary traffic or a frame
+        // dripping one byte per timeout window can never stretch one
+        // read_frame past what the session scheduled.
         let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(GatewayRead::Timeout);
+        self.socket.get_mut().arm(Some(deadline));
+        let result = loop {
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                break Ok(GatewayRead::Timeout);
             }
-            self.set_read_timeout(remaining)?;
             match self.socket.read() {
                 Ok(tungstenite::Message::Text(text)) => {
-                    return Ok(GatewayRead::Text(text.to_string()));
+                    break Ok(GatewayRead::Text(text.to_string()));
                 }
                 Ok(tungstenite::Message::Binary(_))
                 | Ok(tungstenite::Message::Ping(_))
                 | Ok(tungstenite::Message::Pong(_))
                 | Ok(tungstenite::Message::Frame(_)) => {}
                 Ok(tungstenite::Message::Close(frame)) => {
-                    return Ok(GatewayRead::Closed(
+                    break Ok(GatewayRead::Closed(
                         frame.map(|frame| u16::from(frame.code)),
                     ));
                 }
                 Err(tungstenite::Error::ConnectionClosed)
-                | Err(tungstenite::Error::AlreadyClosed) => return Ok(GatewayRead::Closed(None)),
+                | Err(tungstenite::Error::AlreadyClosed) => break Ok(GatewayRead::Closed(None)),
                 Err(tungstenite::Error::Io(error))
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    return Ok(GatewayRead::Timeout);
+                    break Ok(GatewayRead::Timeout);
                 }
                 Err(_) => {
-                    return Err(DiscordApiError::new(
+                    break Err(DiscordApiError::new(
                         "a4mc_discord_gateway_failed",
                         "Gateway read failed",
                     ));
                 }
             }
-        }
+        };
+        self.socket.get_mut().arm(None);
+        result
     }
 
     fn send_text(&mut self, text: &str) -> Result<(), DiscordApiError> {
@@ -1467,7 +1514,10 @@ mod tests {
             }
         });
         let socket = tungstenite::WebSocket::from_partially_read(
-            Box::new(client) as Box<dyn GatewayStream>,
+            DeadlineStream {
+                inner: Box::new(client),
+                deadline: None,
+            },
             Vec::new(),
             tungstenite::protocol::Role::Client,
             None,
@@ -1482,6 +1532,52 @@ mod tests {
         );
         drop(connection);
         flood.join().unwrap();
+    }
+
+    #[test]
+    fn a_slowly_arriving_fragmented_frame_stays_inside_the_deadline() {
+        // The peer drips one fragmented text frame a byte at a time:
+        // assembling it takes many blocking reads inside a single
+        // socket.read, and the whole drip outlasts the deadline several
+        // times over. The deadline armed on the stream bounds every one
+        // of those reads, so the call reports Timeout at the deadline
+        // instead of surviving on per-read timeout windows.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let drip = std::thread::spawn(move || {
+            let mut server = server;
+            // FIN=0 text fragment "he", then the FIN=1 continuation
+            // "llo" — every byte its own write so assembly can never
+            // complete inside one socket read.
+            let bytes = [0x01u8, 0x02, b'h', b'e', 0x80, 0x03, b'l', b'l', b'o'];
+            for byte in bytes {
+                if server.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let socket = tungstenite::WebSocket::from_partially_read(
+            DeadlineStream {
+                inner: Box::new(client),
+                deadline: None,
+            },
+            Vec::new(),
+            tungstenite::protocol::Role::Client,
+            None,
+        );
+        let mut connection = LiveGatewayConnection { socket };
+        let started = Instant::now();
+        let read = connection.read_frame(Duration::from_millis(60)).unwrap();
+        assert!(matches!(read, GatewayRead::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a fragmented frame stretched the read past its deadline"
+        );
+        drop(connection);
+        drip.join().unwrap();
     }
 
     #[test]
