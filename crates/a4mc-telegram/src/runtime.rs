@@ -361,13 +361,26 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
             // unfinished task record stays for the restart drain.
             Err(error) if is_policy_deferral(&error) => Ok(()),
             Err(error) => {
-                let _ = processor_channel.send(&reply_message(
+                // The fallback error reply is an outbound send like
+                // any other: it waits out a policy deferral rather
+                // than being discarded on the first attempt. If the
+                // wait ends undelivered — shutdown cut it short, or
+                // the channel refused — the report is persisted on
+                // the task so the restart drain still delivers it
+                // instead of deleting the update unserved.
+                let fallback = reply_message(
                     chat_id,
                     message.message_id,
                     update_id,
                     "error",
                     &sanitize_error(&error),
-                ));
+                );
+                if send_policy_wait(&processor_channel, &fallback, &processor_stop).is_err() {
+                    let _ = processor_store
+                        .lock()
+                        .unwrap()
+                        .record_fallback_reply(update_id, &fallback.text);
+                }
                 // A task whose finished reply never got delivered keeps
                 // its record — restart resumes that stage; anything else
                 // was fully handled and settles here.
@@ -922,19 +935,21 @@ fn handle_command<T: BotTransport>(
                     Some(opened.clone())
                 },
             )?;
-            send_reply(
-                channel,
-                message,
-                &format!(
-                    "Started a new conversation{}.",
-                    if opened.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {opened}")
-                    }
-                ),
-                stop,
-            )?;
+            let confirmation = format!(
+                "Started a new conversation{}.",
+                if opened.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {opened}")
+                }
+            );
+            // Persist the finished command and its confirmation before
+            // waiting on outbound policy: if shutdown interrupts a
+            // deferral, recovery resumes delivery of this reply instead
+            // of re-running the command and opening a second
+            // conversation.
+            store_record_reply(store, message.update_id, &confirmation, None)?;
+            send_reply(channel, message, &confirmation, stop)?;
         }
         ControlCommand::Stop => {
             send_reply(
@@ -2268,6 +2283,236 @@ mod tests {
                 .pending_updates()
                 .is_empty(),
             "the resumed reply stayed recorded after its deferred send"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Counts lane `open_or_resume` calls so a restart can be proven
+    /// not to open a second conversation for one command.
+    static OPEN_SESSION_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn install_open_counting_lane() {
+        use a4mc::lane::{self, LanePort};
+        use serde_json::json;
+        fn scan_targets() -> Result<serde_json::Value, a4mc::ChannelError> {
+            Ok(json!({"candidates": [{
+                "target": "codex",
+                "label": "Codex",
+                "binaryPath": "/fixture-root/bin/codex",
+                "adapterCapabilities": {
+                    "conversationDriver": "native",
+                    "conversationReadiness": "ready",
+                },
+            }]}))
+        }
+        fn empty(params: &serde_json::Value) -> Result<serde_json::Value, a4mc::ChannelError> {
+            let _ = params;
+            Ok(json!({"sessions": []}))
+        }
+        lane::clear();
+        OPEN_SESSION_CALLS.store(0, Ordering::SeqCst);
+        let _ = lane::install(LanePort {
+            scan_targets,
+            conversation_list: empty,
+            open_or_resume: |params| {
+                OPEN_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
+                let _ = params;
+                Ok(json!({"sessionId": "counted-session"}))
+            },
+            dispatch: |_, _| {
+                Ok(json!({"ok": true, "output": "synthetic", "sessionId": "synthetic"}))
+            },
+            outbound_hooks: None,
+        });
+    }
+
+    #[test]
+    fn a_deferred_fallback_reply_is_persisted_and_delivered_on_restart() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_synthetic_lane();
+        let root = temp_root();
+        // An unpaired chat's /agent fails admission; the fallback error
+        // reply is the only outbound send the update earns.
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 2,
+                message: Some(text_message(7, 7, Some("zed"), "/agent", 2)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let hooks = Arc::new(DeferringHooks {
+            attempts: AtomicUsize::new(0),
+            deferrals: usize::MAX,
+            retry_after_ms: 60_000,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks.clone()),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || hooks.attempts.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(sent.lock().unwrap().is_empty());
+        let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the interrupted fallback was not persisted: {tasks:?}"
+        );
+        assert!(
+            tasks[0]
+                .reply
+                .as_deref()
+                .is_some_and(|reply| reply.starts_with("Error:")),
+            "the recorded reply is not the fallback report: {tasks:?}"
+        );
+
+        // Restart with the policy now allowing sends: the drain delivers
+        // the recorded fallback instead of dropping the update unserved.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let messages = sent.lock().unwrap();
+        assert_eq!(messages.len(), 1, "delivered sends: {messages:?}");
+        assert_eq!(messages[0].0, 7);
+        assert!(
+            messages[0].1.starts_with("Error:"),
+            "the fallback report was not delivered on restart: {messages:?}"
+        );
+        drop(messages);
+        assert!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .is_empty(),
+            "the delivered fallback stayed recorded"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_deferred_new_command_resumes_delivery_without_a_second_conversation() {
+        let _lane_guard = crate::LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        install_open_counting_lane();
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            let pending = store.request_pairing(42, 42, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(42, Some("codex".into())).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 5,
+                message: Some(text_message(42, 42, Some("alice"), "/new", 5)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let hooks = Arc::new(DeferringHooks {
+            attempts: AtomicUsize::new(0),
+            deferrals: usize::MAX,
+            retry_after_ms: 60_000,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks.clone()),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || hooks.attempts.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(
+            OPEN_SESSION_CALLS.load(Ordering::SeqCst),
+            1,
+            "the /new command did not open exactly one conversation"
+        );
+        let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the deferred command was settled: {tasks:?}"
+        );
+        assert_eq!(
+            tasks[0].reply.as_deref(),
+            Some("Started a new conversation: counted-session."),
+            "the finished command's confirmation was not persisted: {tasks:?}"
+        );
+
+        // Restart with sends unheld: recovery delivers the recorded
+        // confirmation — it must not re-run /new and open a second
+        // conversation.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(
+            sent.lock().unwrap()[0],
+            (
+                42,
+                "Started a new conversation: counted-session.".to_owned()
+            )
+        );
+        assert_eq!(
+            OPEN_SESSION_CALLS.load(Ordering::SeqCst),
+            1,
+            "recovery re-ran the command and opened a second conversation"
+        );
+        assert!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .is_empty(),
+            "the delivered confirmation stayed recorded"
         );
         let _ = std::fs::remove_dir_all(root);
     }

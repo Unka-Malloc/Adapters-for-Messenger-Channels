@@ -600,13 +600,16 @@ pub fn run_socket_session(
         });
         let outcome = socket_loop(connection, &seen, stop, &work_tx, &ack_rx);
         // Let the worker finish what it queued so a reconnect does not
-        // redeliver work the host actually accepted, then collect the
-        // late answers: acks go out best-effort (a miss only re-asks
-        // for the retry the mark already covers), a failure surfaces.
+        // redeliver work the host actually accepted. Drain the report
+        // channel *while* it exits — one in-flight envelope plus a full
+        // queue can leave one more report than the channel's bound, so
+        // joining before draining would deadlock on the last send —
+        // then collect the late answers: acks go out best-effort (a
+        // miss only re-asks for the retry the mark already covers), a
+        // failure surfaces.
         drop(work_tx);
-        let panicked = worker.join().is_err();
         let mut first_failure = None;
-        while let Ok(report) = ack_rx.try_recv() {
+        while let Ok(report) = ack_rx.recv() {
             match report {
                 AcceptReport::Ack(envelope_id) => {
                     let _ = connection.send_text(&ack_frame(&envelope_id));
@@ -616,6 +619,7 @@ pub fn run_socket_session(
                 }
             }
         }
+        let panicked = worker.join().is_err();
         if panicked {
             return Err(SlackApiError::new(
                 "a4mc_slack_handler_failed",
@@ -943,6 +947,9 @@ mod tests {
         fail_read: Option<SlackApiError>,
         fail_send: Option<SlackApiError>,
         reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
+        /// Simulated per-read cost so the handler worker can claim a
+        /// dispatch before the bounded handoff fills.
+        read_delay: Duration,
     }
 
     impl ScriptedConnection {
@@ -956,12 +963,16 @@ mod tests {
                 fail_read: None,
                 fail_send: None,
                 reads: None,
+                read_delay: Duration::ZERO,
             }
         }
     }
 
     impl SocketConnection for ScriptedConnection {
         fn read(&mut self, _timeout: Duration) -> Result<SocketRead, SlackApiError> {
+            if !self.read_delay.is_zero() {
+                std::thread::sleep(self.read_delay);
+            }
             if let Some(counter) = &self.reads {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
@@ -1113,6 +1124,65 @@ mod tests {
         assert!(seen.contains("e1"));
         assert!(seen.contains("e2"));
         assert!(seen.contains("e3"));
+    }
+
+    #[test]
+    fn a_saturated_queue_still_drains_before_the_worker_joins() {
+        // One envelope in flight plus a full 64-slot handoff leaves 65
+        // reports for a 64-slot channel at teardown: joining the worker
+        // before draining that channel deadlocked, so teardown drains
+        // while the worker exits and joins it after.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let mut frames: Vec<String> = (1..=65)
+            .map(|index| {
+                envelope(
+                    &format!("e{index}"),
+                    "events_api",
+                    message_payload(&format!("1700000000.{index:06}")),
+                )
+            })
+            .collect();
+        frames.push(json!({"type": "disconnect", "reason": "test_done"}).to_string());
+        let mut connection = ScriptedConnection::new(frames, Arc::clone(&sent));
+        connection.reads = Some(Arc::clone(&reads));
+        // Paced reads let the worker claim the first envelope before
+        // the handoff fills, so the queue saturates deterministically
+        // instead of racing the read loop.
+        connection.read_delay = Duration::from_millis(5);
+        let mut handler = BlockableHandler {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let mut seen = SeenEnvelopes::new(128);
+        let stop = AtomicBool::new(false);
+
+        let outcome = std::thread::scope(|scope| {
+            let session =
+                scope.spawn(|| run_socket_session(&mut connection, &mut handler, &mut seen, &stop));
+            // The first handler call parks while the read loop fills
+            // the bounded handoff and consumes the disconnect frame.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while entered.load(Ordering::SeqCst) == 0 || reads.load(Ordering::SeqCst) < 66 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the read loop stalled behind a blocked handler"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (lock, condvar) = &*release;
+            *lock.lock().unwrap() = true;
+            condvar.notify_all();
+            session.join().unwrap()
+        });
+
+        assert_eq!(outcome.unwrap(), SessionOutcome::Reconnect);
+        assert_eq!(entered.load(Ordering::SeqCst), 65);
+        assert_eq!(sent.lock().unwrap().len(), 65);
+        assert!(seen.contains("e1"));
+        assert!(seen.contains("e65"));
     }
 
     #[test]

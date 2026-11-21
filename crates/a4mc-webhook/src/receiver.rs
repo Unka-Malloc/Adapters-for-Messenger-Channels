@@ -12,6 +12,13 @@
 //! fresh event instead of being answered success unseen. The cache
 //! holds digests only — never bodies, secrets or signatures of failed
 //! verifications.
+//!
+//! Suppression is best-effort inside the timestamp window: the FIFO
+//! cache holds the newest 1,024 committed signatures and can evict one
+//! that is still valid, and receive-then-commit is not atomic, so
+//! overlapping retries of the same delivery can both reach the handler
+//! before either commits. Durable host acceptance must be idempotent
+//! for overlapping retries.
 
 use crate::error::WebhookError;
 use crate::request::WebhookRequest;

@@ -692,20 +692,30 @@ pub fn run_gateway_session(
         let outcome = session_loop(connection, token, session, config, stop, &work_tx, &ack_rx);
         // No more work will be handed off; let the worker finish what it
         // queued so a resumed session does not rerun work the host
-        // actually accepted, then collect every late answer.
+        // actually accepted. Drain the result channel *while* it exits —
+        // one active dispatch plus a full queue can leave one more
+        // answer than the channel's bound, so joining before draining
+        // would deadlock on the last send — and commit only the
+        // contiguous accepted prefix: answers arrive in receive order,
+        // so once a failure is seen nothing behind it may advance the
+        // resume cursor past work the host rejected.
         drop(work_tx);
-        let panicked = worker.join().is_err();
+        let mut accepted_prefix = outcome
+            .as_ref()
+            .err()
+            .is_none_or(|error| error.code != HANDLER_FAILED_CODE);
         let mut first_failure = None;
-        while let Ok(ack) = ack_rx.try_recv() {
+        while let Ok(ack) = ack_rx.recv() {
             match ack.result {
-                Ok(()) => commit_dispatch(session, ack.sequence),
+                Ok(()) if accepted_prefix => commit_dispatch(session, ack.sequence),
+                Ok(()) => {}
                 Err(error) => {
-                    if first_failure.is_none() {
-                        first_failure = Some(error);
-                    }
+                    accepted_prefix = false;
+                    first_failure.get_or_insert(error);
                 }
             }
         }
+        let panicked = worker.join().is_err();
         if panicked {
             return Err(DiscordApiError::new(
                 HANDLER_FAILED_CODE,
@@ -891,17 +901,31 @@ fn session_loop(
                                 .and_then(Value::as_str)
                                 .filter(|value| !value.is_empty())
                                 .map(str::to_owned);
-                        }
-                        // READY/RESUMED are session lifecycle, not
-                        // channel updates; their state is recorded above
-                        // and they are not lowered as host work.
-                        if matches!(event_name, "READY" | "RESUMED") {
+                            // READY opens a fresh session: no earlier
+                            // work can be queued behind it, so its
+                            // sequence commits directly.
                             commit_dispatch(session, payload.sequence);
                             continue;
                         }
-                        let events =
-                            crate::lower::lower_events(event_name, &payload.data, payload.sequence);
-                        let work = DispatchWork { events, payload };
+                        // RESUMED ends a resume replay while earlier
+                        // replayed dispatches can still be queued. Its
+                        // marker travels the same ordered handoff — an
+                        // empty event set produces only a commit answer —
+                        // so the cursor crosses it only after every
+                        // dispatch before it was accepted.
+                        let work = if event_name == "RESUMED" {
+                            DispatchWork {
+                                events: Vec::new(),
+                                payload,
+                            }
+                        } else {
+                            let events = crate::lower::lower_events(
+                                event_name,
+                                &payload.data,
+                                payload.sequence,
+                            );
+                            DispatchWork { events, payload }
+                        };
                         if deferred.is_some() {
                             // One deferral already waits for room; a
                             // second means the host cannot keep up.
@@ -1259,6 +1283,10 @@ mod tests {
 
     fn reconnect() -> GatewayRead {
         GatewayRead::Text(json!({"op": OP_RECONNECT}).to_string())
+    }
+
+    fn resumed(sequence: u64) -> GatewayRead {
+        GatewayRead::Text(json!({"op": 0, "s": sequence, "t": "RESUMED", "d": {}}).to_string())
     }
 
     #[test]
@@ -1947,5 +1975,213 @@ mod tests {
         );
         // The parked dispatch was committed after the handler accepted.
         assert_eq!(session.sequence, Some(2));
+    }
+
+    /// The host turn parks until released and counts entries, so a test
+    /// can prove the bounded handoff saturated before teardown began.
+    struct PausableHandler {
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl GatewayHandler for PausableHandler {
+        fn on_dispatch(
+            &mut self,
+            _event: &ChannelEvent,
+            _payload: &GatewayPayload,
+        ) -> Result<(), DiscordApiError> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let (mutex, condvar) = &*self.release;
+            let mut released = mutex.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    /// Rejects the first `failures` dispatches it sees, accepts the rest.
+    struct FailFirstHandler {
+        failures: usize,
+    }
+
+    impl GatewayHandler for FailFirstHandler {
+        fn on_dispatch(
+            &mut self,
+            _event: &ChannelEvent,
+            _payload: &GatewayPayload,
+        ) -> Result<(), DiscordApiError> {
+            if self.failures > 0 {
+                self.failures -= 1;
+                return Err(DiscordApiError::new(
+                    "a4mc_discord_fixture_handler",
+                    "fixture rejected one dispatch",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_saturated_dispatch_queue_still_drains_before_the_worker_joins() {
+        // One dispatch in flight plus a full 64-slot handoff leaves 65
+        // answers for a 64-slot channel at teardown: joining the worker
+        // before draining that channel deadlocked, so teardown drains
+        // while the worker exits and joins it after.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut frames = vec![hello(), ready()];
+        frames.extend((2..=66).map(message));
+        frames.push(reconnect());
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let mut handler = PausableHandler {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let runner = std::thread::spawn(move || {
+            // Paced reads let the worker claim the first dispatch
+            // before the handoff fills, so the queue saturates
+            // deterministically instead of racing the read loop.
+            let mut connection = ScriptedConnection {
+                frames: frames.into_iter().collect(),
+                sent,
+                read_delay: Duration::from_millis(5),
+            };
+            let mut session = GatewaySession::default();
+            let stop = AtomicBool::new(false);
+            let token = SecretToken::try_from_string(fixture_token()).unwrap();
+            let outcome = run_gateway_session(
+                &mut connection,
+                &token,
+                &mut handler,
+                &mut session,
+                &GatewayConfig::default(),
+                &stop,
+            );
+            (outcome, session)
+        });
+        // The first dispatch parks the worker while the read loop fills
+        // the bounded handoff and consumes the reconnect frame.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while entered.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "dispatch never reached the handler"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        {
+            let (mutex, condvar) = &*release;
+            *mutex.lock().unwrap() = true;
+            condvar.notify_all();
+        }
+        let (outcome, session) = runner.join().unwrap();
+        let outcome = outcome.unwrap();
+
+        assert_eq!(outcome, SessionOutcome::Reconnect);
+        assert_eq!(entered.load(Ordering::SeqCst), 65);
+        // READY plus every queued dispatch committed: the saturated
+        // session exited with its accepted sequence recorded.
+        assert_eq!(session.sequence, Some(66));
+    }
+
+    #[test]
+    fn a_rejected_dispatch_keeps_the_cursor_behind_later_accepted_work() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = ScriptedConnection::new(
+            [hello(), ready(), message(2), message(3), reconnect()],
+            Arc::clone(&sent),
+        );
+        let mut handler = FailFirstHandler { failures: 1 };
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let error = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, HANDLER_FAILED_CODE);
+        // READY committed 1; rejected dispatch 2 stays replayable even
+        // though dispatch 3 was accepted behind it — the resume cursor
+        // only advances across a contiguous accepted prefix.
+        assert_eq!(session.sequence, Some(1));
+        assert_eq!(session.last_dispatched, Some(1));
+    }
+
+    #[test]
+    fn a_resumed_marker_commits_only_after_the_replayed_dispatch() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = ScriptedConnection::new(
+            [hello(), message(5), resumed(6), reconnect()],
+            Arc::clone(&sent),
+        );
+        let mut handler = RecordingHandler::default();
+        let mut session = GatewaySession {
+            sequence: Some(4),
+            session_id: Some("session-1".into()),
+            resume_gateway_url: None,
+            last_dispatched: None,
+        };
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let outcome = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, SessionOutcome::Reconnect);
+        assert_eq!(handler.events.len(), 1);
+        // The marker behind the replayed dispatch still commits — the
+        // ordering it protects is the accepted prefix, not the frame.
+        assert_eq!(session.sequence, Some(6));
+    }
+
+    #[test]
+    fn a_resumed_marker_never_crosses_a_rejected_replay() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = ScriptedConnection::new(
+            [hello(), message(5), resumed(6), reconnect()],
+            Arc::clone(&sent),
+        );
+        let mut handler = FailFirstHandler { failures: 1 };
+        let mut session = GatewaySession {
+            sequence: Some(4),
+            session_id: Some("session-1".into()),
+            resume_gateway_url: None,
+            last_dispatched: None,
+        };
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let error = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, HANDLER_FAILED_CODE);
+        // The replayed dispatch was rejected, so the RESUMED marker
+        // queued behind it committed nothing: the session stays
+        // resumable at the last contiguous accepted sequence.
+        assert_eq!(session.sequence, Some(4));
+        assert!(session.can_resume());
     }
 }

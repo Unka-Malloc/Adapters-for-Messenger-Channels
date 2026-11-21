@@ -83,7 +83,14 @@ Replay suppression commits only after the host has accepted the event —
 stored it durably or handled it successfully — so a failed handler
 answers an error and the sender's retry verifies as a fresh event; once
 committed, exact replays inside the window are acknowledged without
-running the update again.
+running the update again. Two bounds qualify that promise. The replay
+cache is a bounded FIFO of the newest 1,024 committed signatures: a
+burst of deliveries can evict a committed signature while it is still
+inside the timestamp window, and the evicted retry then verifies as a
+fresh event. And `receive`/`commit` is not atomic across requests —
+overlapping deliveries of the same payload can both be classified
+`Event` before either commits — so the host's durable acceptance must
+be idempotent for overlapping retries.
 
 ```rust
 // Once, at server startup — the shared receiver owns the replay cache.

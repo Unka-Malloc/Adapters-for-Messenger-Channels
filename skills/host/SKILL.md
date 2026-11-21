@@ -106,3 +106,10 @@ host.
   the same ordered `OutboundPipeline`. Leave the lane provider as `None`
   for pass-through sends. Never put Quiet/Already-Told/Digest logic in a
   dialect.
+- Webhook replay suppression is best-effort inside the timestamp
+  window. The receiver's cache holds the newest 1,024 committed
+  signatures and can evict one that is still valid, so an evicted retry
+  verifies as a fresh event; and `receive`/`commit` is not atomic, so
+  overlapping retries of the same delivery can both reach the handler
+  before either commits. Durable host acceptance must be idempotent for
+  overlapping retries.

@@ -438,6 +438,24 @@ impl BindingStore {
         })
     }
 
+    /// Record an undelivered fallback error report on the admitted
+    /// task — only when it holds no finished reply already: a paid
+    /// agent result is never shadowed by an error report. The restart
+    /// drain then delivers the fallback like any recorded reply.
+    pub fn record_fallback_reply(&mut self, update_id: i64, reply: &str) -> Result<()> {
+        self.mutate(|document| {
+            if let Some(task) = document
+                .pending_updates
+                .iter_mut()
+                .find(|task| task.update_id == update_id)
+                && task.reply.is_none()
+            {
+                task.reply = Some(reply.to_owned());
+            }
+            Ok(())
+        })
+    }
+
     /// Drop an admitted task once it is fully processed.
     pub fn complete_update(&mut self, update_id: i64) -> Result<()> {
         self.mutate(|document| {
