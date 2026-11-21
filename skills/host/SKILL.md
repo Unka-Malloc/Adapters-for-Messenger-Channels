@@ -53,7 +53,10 @@ let request = a4mc_webhook::WebhookRequest::new(method, body)
     .with_header(a4mc_webhook::TIMESTAMP_HEADER, timestamp)
     .with_header(a4mc_webhook::SIGNATURE_HEADER, signature);
 match receiver.receive(&request, now_unix)? {
-    a4mc_webhook::DeliveryOutcome::Event(delivery) => handle(delivery.event),
+    a4mc_webhook::DeliveryOutcome::Event(delivery) => {
+        handle(delivery.event)?;                  // durable host acceptance
+        receiver.commit(&delivery);               // only then suppress replays
+    }
     a4mc_webhook::DeliveryOutcome::Duplicate => {}           // answer 2xx
 }
 ```
