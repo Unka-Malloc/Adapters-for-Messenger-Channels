@@ -6,6 +6,7 @@ members = [
     "crates/a4mc-slack",
     "crates/a4mc-telegram",
     "crates/a4mc-webhook",
+    "fixtures/downstream-host",
 ]
 
 [workspace.package]
@@ -15,7 +16,7 @@ license = "Apache-2.0"
 repository = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels"
 
 [workspace.dependencies]
-a4mc = { path = "crates/a4mc", version = "0.1.0" }
+a4mc = { path = "crates/a4mc", version = "0.2.0" }
 anyhow = "1"
 fs2 = "0.4"
 hmac = "0.12"

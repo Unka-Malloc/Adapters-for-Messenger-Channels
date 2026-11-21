@@ -13,11 +13,17 @@
 //! every part's message id; a failure after a prefix was posted releases
 //! the idempotency key, so a retry can repeat that prefix — the platform
 //! offers no transaction across parts.
+//!
+//! The send path runs through [`a4mc::OutboundPipeline`]. No policy is
+//! mounted by default; the host may supply one per channel through
+//! [`DiscordChannel::with_outbound_hooks`] or once for every dialect
+//! through `LanePort::outbound_hooks`.
 
 use crate::transport::{DiscordApi, PostMessageRequest};
 use a4mc::{
     ChannelAdapter, ChannelDescriptor, ChannelError, ChannelId, ExternalMessageId, LaneMechanism,
-    OutboundMessage, SendFeature, SendReceipt, Support, UpdateKind,
+    OutboundHooks, OutboundMessage, OutboundPipeline, PreparedSend, SendContext, SendFeature,
+    SendReceipt, Support, UpdateKind, unix_now_ms,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
@@ -71,6 +77,7 @@ pub fn descriptor() -> ChannelDescriptor {
 /// The normalized channel surface over one Discord REST client.
 pub struct DiscordChannel<A: DiscordApi> {
     api: Arc<A>,
+    pipeline: OutboundPipeline,
     sent_keys: Mutex<IdempotencyCache>,
     send_wake: Condvar,
 }
@@ -121,6 +128,7 @@ impl<A: DiscordApi> DiscordChannel<A> {
     pub fn new(api: Arc<A>) -> Self {
         Self {
             api,
+            pipeline: OutboundPipeline::from_lane(CHANNEL),
             sent_keys: Mutex::new(IdempotencyCache::new()),
             send_wake: Condvar::new(),
         }
@@ -130,15 +138,52 @@ impl<A: DiscordApi> DiscordChannel<A> {
         &self.api
     }
 
+    /// The channel's outbound pipeline. A fresh channel resolves the
+    /// host's `LanePort::outbound_hooks` provider; without one it is
+    /// pass-through.
+    pub fn outbound_pipeline(&self) -> &OutboundPipeline {
+        &self.pipeline
+    }
+
+    /// Mount one caller policy on this channel. It replaces any policy
+    /// resolved from the lane port.
+    pub fn with_outbound_hooks(mut self, hooks: Arc<dyn OutboundHooks>) -> Self {
+        self.pipeline = OutboundPipeline::with_hooks(CHANNEL, hooks);
+        self
+    }
+
+    /// Mount one caller policy on an already-shared channel.
+    pub fn set_outbound_hooks(&mut self, hooks: Arc<dyn OutboundHooks>) {
+        self.pipeline = OutboundPipeline::with_hooks(CHANNEL, hooks);
+    }
+
     /// Send one normalized outbound message.
     ///
-    /// The contract validates first; the idempotency key is reserved
-    /// under the cache lock before the first API call, so a repeat key
-    /// while a send is in flight waits and replays the observed receipt
-    /// instead of double-posting. A failed send releases its reservation
-    /// so the waiter or a later retry performs its own call.
+    /// The contract validates first; the mounted outbound policy then
+    /// runs (`skip` → `batch` → `throttle` → `dedupe_key`) before the
+    /// idempotency key is reserved under the cache lock and the first API
+    /// call is made, so a repeat key while a send is in flight waits and
+    /// replays the observed receipt instead of double-posting. A failed
+    /// send releases its reservation so the waiter or a later retry
+    /// performs its own call.
     pub fn send(&self, outbound: &OutboundMessage) -> Result<SendReceipt, ChannelError> {
-        outbound.validate()?;
+        self.send_at(outbound, unix_now_ms())
+    }
+
+    /// Send at a caller-supplied clock. Tests pin the clock so a
+    /// mounted window/throttle policy is deterministic.
+    pub fn send_at(
+        &self,
+        outbound: &OutboundMessage,
+        now_ms: u64,
+    ) -> Result<SendReceipt, ChannelError> {
+        let ctx = SendContext::at(CHANNEL, now_ms);
+        self.pipeline
+            .execute(outbound, &ctx, |prepared| self.deliver(prepared))
+    }
+
+    fn deliver(&self, prepared: &PreparedSend) -> Result<SendReceipt, ChannelError> {
+        let outbound = &prepared.message;
         let channel = outbound.chat_id.as_str().trim();
         // Discord channel ids are snowflakes. Restrict the path segment to
         // alphanumerics and a bounded length so an untrusted id can never
@@ -162,16 +207,17 @@ impl<A: DiscordApi> DiscordChannel<A> {
             Some(reply) => Some(reply.as_str().to_owned()),
             None => None,
         };
+        let key = &prepared.dedupe_key;
         {
             let mut cache = self.sent_keys.lock().unwrap();
             loop {
-                match cache.get(&outbound.idempotency_key) {
+                match cache.get(key) {
                     Some(SendState::Done(receipt)) => return Ok(receipt),
                     Some(SendState::InFlight) => {
                         cache = self.send_wake.wait(cache).unwrap();
                     }
                     None => {
-                        cache.mark_in_flight(outbound.idempotency_key.clone());
+                        cache.mark_in_flight(key.clone());
                         break;
                     }
                 }
@@ -185,28 +231,25 @@ impl<A: DiscordApi> DiscordChannel<A> {
                 channel_id: channel.to_owned(),
                 content: (*part).to_owned(),
                 reply_to_message_id: if index == 0 { reply_to.clone() } else { None },
-                nonce: client_nonce(&outbound.idempotency_key, index),
+                nonce: client_nonce(key, index),
             };
             match self.api.post_message(&request) {
                 Ok(posted) => message_ids.push(ExternalMessageId::from(posted.id)),
                 Err(error) => {
-                    self.sent_keys
-                        .lock()
-                        .unwrap()
-                        .release(&outbound.idempotency_key);
+                    self.sent_keys.lock().unwrap().release(key);
                     self.send_wake.notify_all();
                     return Err(ChannelError::from(error));
                 }
             }
         }
         let receipt = SendReceipt {
-            idempotency_key: outbound.idempotency_key.clone(),
+            idempotency_key: key.clone(),
             message_ids,
         };
         self.sent_keys
             .lock()
             .unwrap()
-            .complete(outbound.idempotency_key.clone(), receipt.clone());
+            .complete(key.clone(), receipt.clone());
         self.send_wake.notify_all();
         Ok(receipt)
     }
@@ -516,5 +559,152 @@ mod tests {
         let second = second.join().unwrap().unwrap();
         assert_eq!(first, second);
         assert_eq!(api.posted_requests().len(), 1);
+    }
+
+    /// One caller policy fixture, shared with the Telegram and Slack
+    /// channel suites: the same decisions must give the same observable
+    /// behavior in every dialect.
+    #[derive(Default)]
+    struct HookTrace {
+        calls: Mutex<Vec<&'static str>>,
+        receipts: Mutex<Vec<SendReceipt>>,
+    }
+
+    struct HookPolicy {
+        trace: Arc<HookTrace>,
+    }
+
+    impl HookPolicy {
+        fn record(&self, call: &'static str) {
+            self.trace.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl a4mc::OutboundHooks for HookPolicy {
+        fn skip(&self, _: &a4mc::SendContext, message: &OutboundMessage) -> a4mc::SkipDecision {
+            self.record("skip");
+            if message.text == "skip-me" {
+                a4mc::SkipDecision::skip("caller policy")
+            } else {
+                a4mc::SkipDecision::Send
+            }
+        }
+
+        fn batch(&self, _: &a4mc::SendContext, message: &OutboundMessage) -> a4mc::BatchDecision {
+            self.record("batch");
+            if message.text == "batch-me" {
+                a4mc::BatchDecision::replace(
+                    message
+                        .clone()
+                        .with_text(format!("batched:{}", message.text)),
+                )
+            } else {
+                a4mc::BatchDecision::PassThrough
+            }
+        }
+
+        fn throttle(
+            &self,
+            _: &a4mc::SendContext,
+            message: &OutboundMessage,
+        ) -> a4mc::ThrottleDecision {
+            self.record("throttle");
+            if message.text == "throttle-me" {
+                a4mc::ThrottleDecision::defer("budget exhausted", Some(Duration::from_millis(1500)))
+            } else {
+                a4mc::ThrottleDecision::Allow
+            }
+        }
+
+        fn dedupe_key(&self, _: &a4mc::SendContext, message: &OutboundMessage) -> Option<String> {
+            self.record("dedupe");
+            message
+                .text
+                .starts_with("dedupe")
+                .then(|| "hook-dedupe".to_owned())
+        }
+
+        fn on_receipt(&self, _: &a4mc::SendContext, _: &OutboundMessage, receipt: &SendReceipt) {
+            self.record("receipt");
+            self.trace.receipts.lock().unwrap().push(receipt.clone());
+        }
+    }
+
+    #[test]
+    fn unmounted_outbound_policy_is_a_pass_through() {
+        let (channel, api) = channel();
+        assert!(channel.outbound_pipeline().hooks().is_none());
+        let receipt = channel
+            .send_at(&OutboundMessage::new("C1", "plain", "plain-1"), 1_000)
+            .unwrap();
+        assert_eq!(receipt.idempotency_key, "plain-1");
+        assert_eq!(receipt.message_ids.len(), 1);
+        let posted = api.posted_requests();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].content, "plain");
+    }
+
+    #[test]
+    fn mounted_hooks_apply_uniformly_to_every_send_decision() {
+        let (channel, api) = channel();
+        let trace = Arc::new(HookTrace::default());
+        let channel = channel.with_outbound_hooks(Arc::new(HookPolicy {
+            trace: Arc::clone(&trace),
+        }));
+
+        let plain = channel
+            .send_at(&OutboundMessage::new("C1", "plain", "plain-1"), 1_000)
+            .unwrap();
+        assert_eq!(plain.idempotency_key, "plain-1");
+        assert_eq!(trace.receipts.lock().unwrap().len(), 1);
+        assert_eq!(
+            *trace.calls.lock().unwrap(),
+            vec!["skip", "batch", "throttle", "dedupe", "receipt"]
+        );
+
+        let skipped = channel
+            .send_at(&OutboundMessage::new("C1", "skip-me", "skip-1"), 1_000)
+            .unwrap();
+        assert!(skipped.is_skipped());
+        assert_eq!(skipped.idempotency_key, "skip-1");
+        assert_eq!(api.posted_requests().len(), 1);
+        assert_eq!(trace.receipts.lock().unwrap().len(), 1);
+
+        let batched = channel
+            .send_at(&OutboundMessage::new("C1", "batch-me", "batch-1"), 1_000)
+            .unwrap();
+        assert_eq!(batched.message_ids.len(), 1);
+        assert_eq!(api.posted_requests()[1].content, "batched:batch-me");
+        assert_eq!(trace.receipts.lock().unwrap().len(), 2);
+
+        let error = channel
+            .send_at(
+                &OutboundMessage::new("C1", "throttle-me", "throttle-1"),
+                1_000,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "a4mc_outbound_throttled");
+        assert!(error.message.contains("retryAfterMs=1500"));
+        assert_eq!(api.posted_requests().len(), 2);
+        assert_eq!(trace.receipts.lock().unwrap().len(), 2);
+
+        let first = channel
+            .send_at(&OutboundMessage::new("C1", "dedupe-a", "contract-a"), 1_000)
+            .unwrap();
+        let replay = channel
+            .send_at(&OutboundMessage::new("C1", "dedupe-b", "contract-b"), 1_000)
+            .unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(first.idempotency_key, "hook-dedupe");
+        assert_eq!(api.posted_requests().len(), 3);
+        assert_eq!(
+            api.posted_requests()[2].content,
+            "dedupe-a",
+            "the deduplicated replay must not post the second payload"
+        );
+        assert_eq!(
+            api.posted_requests()[2].nonce,
+            client_nonce("hook-dedupe", 0)
+        );
     }
 }

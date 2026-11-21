@@ -9,10 +9,13 @@
 //!
 //! Every delivered envelope is acknowledged before it is handed to the
 //! host. That keeps the three-second acknowledgement budget independent
-//! of agent work; delivery is at-most-once locally, with a bounded
-//! envelope-id cache so a Slack retry is acknowledged again but not
-//! re-dispatched. A `disconnect` frame ends the session and the loop
-//! reconnects with a fresh socket URL.
+//! of agent work, and the envelope id is recorded only after the ACK
+//! write succeeds: a transient write failure leaves the envelope
+//! uncommitted so Slack's explicit retry is dispatched instead of being
+//! mistaken for a duplicate. A successful ACK followed by a handler
+//! failure is surfaced to the host as `a4mc_slack_handler_failed`; it is
+//! not folded into the reconnect backoff. A `disconnect` frame ends the
+//! session and the loop reconnects with a fresh socket URL.
 
 use crate::transport::{SlackApi, SlackApiError, SocketUrl};
 use a4mc::ChannelEvent;
@@ -214,22 +217,37 @@ impl SeenEnvelopes {
         }
     }
 
-    /// Mark `envelope_id` seen and report whether this is its first
-    /// delivery. Empty ids are always first (there is nothing to dedupe).
-    pub fn is_first(&mut self, envelope_id: &str) -> bool {
-        if envelope_id.is_empty() {
-            return true;
+    /// Report whether `envelope_id` was already committed, without
+    /// committing it. The session checks this before writing the ACK so
+    /// a failed write leaves the envelope eligible for redelivery.
+    pub fn contains(&self, envelope_id: &str) -> bool {
+        !envelope_id.is_empty() && self.seen.contains(envelope_id)
+    }
+
+    /// Commit `envelope_id` after its ACK write succeeded. Empty ids are
+    /// not recorded (there is nothing to dedupe).
+    pub fn remember(&mut self, envelope_id: &str) {
+        if envelope_id.is_empty() || !self.seen.insert(envelope_id.to_owned()) {
+            return;
         }
-        if self.seen.contains(envelope_id) {
-            return false;
-        }
-        self.seen.insert(envelope_id.to_owned());
         self.order.push_back(envelope_id.to_owned());
         while self.order.len() > self.capacity {
             if let Some(oldest) = self.order.pop_front() {
                 self.seen.remove(&oldest);
             }
         }
+    }
+
+    /// Mark `envelope_id` seen and report whether this is its first
+    /// delivery. Empty ids are always first (there is nothing to dedupe).
+    pub fn is_first(&mut self, envelope_id: &str) -> bool {
+        if envelope_id.is_empty() {
+            return true;
+        }
+        if self.contains(envelope_id) {
+            return false;
+        }
+        self.remember(envelope_id);
         true
     }
 }
@@ -263,7 +281,8 @@ pub enum SessionOutcome {
 /// Run one already-connected Socket Mode session until disconnect, close
 /// or stop. Every envelope is acknowledged before the handler runs; a
 /// duplicate envelope id is acknowledged again but dispatched at most
-/// once.
+/// once. Membership is committed only after the ACK write succeeds, so a
+/// failed write leaves the envelope eligible for Slack's explicit retry.
 pub fn run_socket_session(
     connection: &mut dyn SocketConnection,
     handler: &mut dyn SocketHandler,
@@ -281,20 +300,35 @@ pub fn run_socket_session(
             SocketFrame::Hello { .. } | SocketFrame::Unknown { .. } => {}
             SocketFrame::Disconnect { .. } => return Ok(SessionOutcome::Reconnect),
             SocketFrame::Envelope(envelope) => {
-                let first = seen.is_first(&envelope.envelope_id);
+                let duplicate = seen.contains(&envelope.envelope_id);
+                // Commit only after the ACK is on the wire. If this write
+                // fails, `?` returns before the id is remembered, so the
+                // retried envelope is dispatched instead of dropped as a
+                // duplicate.
                 connection.send_text(&ack_frame(&envelope.envelope_id))?;
-                if !first {
+                seen.remember(&envelope.envelope_id);
+                if duplicate {
                     continue;
                 }
-                if envelope.kind == "events_api" {
+                let result = if envelope.kind == "events_api" {
                     let event = crate::lower::lower_event(&envelope.payload);
-                    handler.on_event(&event, &envelope)?;
+                    handler.on_event(&event, &envelope)
                 } else {
-                    handler.on_other(&envelope)?;
-                }
+                    handler.on_other(&envelope)
+                };
+                result.map_err(handler_error)?;
             }
         }
     }
+}
+
+/// Give a host handler failure its own code so [`run_socket_mode`] can
+/// return it instead of treating it as a broken socket and reconnecting.
+fn handler_error(error: SlackApiError) -> SlackApiError {
+    SlackApiError::new(
+        "a4mc_slack_handler_failed",
+        format!("{}: {}", error.code, error.message),
+    )
 }
 
 /// Reconnect policy for [`run_socket_mode`].
@@ -368,6 +402,12 @@ pub fn run_socket_mode(
                 config.reconnect_delay
             }
             Err(error) => {
+                // A host handler failure is not a transport outage:
+                // reconnecting cannot undo it and would hide it behind
+                // the backoff loop. Return it to the host.
+                if error.code == "a4mc_slack_handler_failed" {
+                    return Err(error);
+                }
                 if config.max_sessions != 0 && sessions >= config.max_sessions {
                     return Err(error);
                 }
@@ -440,6 +480,7 @@ mod tests {
         incoming: VecDeque<String>,
         sent: Arc<Mutex<Vec<String>>>,
         fail_read: Option<SlackApiError>,
+        fail_next_send: Option<SlackApiError>,
     }
 
     impl ScriptedConnection {
@@ -448,6 +489,7 @@ mod tests {
                 incoming: incoming.into(),
                 sent,
                 fail_read: None,
+                fail_next_send: None,
             }
         }
     }
@@ -461,6 +503,9 @@ mod tests {
         }
 
         fn send_text(&mut self, text: &str) -> Result<(), SlackApiError> {
+            if let Some(error) = self.fail_next_send.take() {
+                return Err(error);
+            }
             self.sent.lock().unwrap().push(text.to_owned());
             Ok(())
         }
@@ -560,7 +605,79 @@ mod tests {
         let error =
             run_socket_session(&mut connection, &mut handler, &mut seen, &stop).unwrap_err();
         assert_eq!(error.code, "a4mc_slack_handler_failed");
+        assert!(error.message.contains("fixture handler failure"));
         assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_ack_does_not_commit_the_envelope_for_dedupe() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut failing = ScriptedConnection::new(
+            vec![envelope(
+                "e1",
+                "events_api",
+                message_payload("1700000000.000001"),
+            )],
+            Arc::clone(&sent),
+        );
+        failing.fail_next_send = Some(SlackApiError::new(
+            "a4mc_slack_socket_failed",
+            "fixture ack write failed",
+        ));
+        let mut seen = SeenEnvelopes::new(8);
+        let stop = AtomicBool::new(false);
+        let mut handler = RecordingHandler::default();
+
+        let error = run_socket_session(&mut failing, &mut handler, &mut seen, &stop).unwrap_err();
+        assert_eq!(error.code, "a4mc_slack_socket_failed");
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(
+            !seen.contains("e1"),
+            "a failed ACK must leave the envelope eligible for redelivery"
+        );
+
+        // Slack's explicit retry of the same envelope is dispatched.
+        let mut retry = ScriptedConnection::new(
+            vec![envelope(
+                "e1",
+                "events_api",
+                message_payload("1700000000.000001"),
+            )],
+            Arc::clone(&sent),
+        );
+        let outcome = run_socket_session(&mut retry, &mut handler, &mut seen, &stop).unwrap();
+        assert_eq!(outcome, SessionOutcome::Reconnect);
+        assert_eq!(handler.events.len(), 1);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(seen.contains("e1"));
+    }
+
+    #[test]
+    fn socket_mode_returns_a_handler_failure_instead_of_folding_it_into_backoff() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let connection = ScriptedConnection::new(
+            vec![envelope(
+                "e1",
+                "events_api",
+                message_payload("1700000000.000001"),
+            )],
+            Arc::clone(&sent),
+        );
+        let connector = ScriptedConnector {
+            connections: Mutex::new(VecDeque::from([
+                Box::new(connection) as Box<dyn SocketConnection>
+            ])),
+        };
+        let api = crate::transport::MockSlackApi::default();
+        let mut handler = FailingHandler;
+        let config = SocketModeConfig {
+            max_sessions: 0,
+            reconnect_delay: Duration::ZERO,
+            ..SocketModeConfig::default()
+        };
+
+        let error = run_socket_mode(&api, &connector, &mut handler, &config).unwrap_err();
+        assert_eq!(error.code, "a4mc_slack_handler_failed");
     }
 
     #[test]

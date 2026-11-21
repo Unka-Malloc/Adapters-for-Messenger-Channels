@@ -949,6 +949,7 @@ mod tests {
                 let _ = operation;
                 Ok(json!({"ok": true, "output": "synthetic", "sessionId": "synthetic"}))
             },
+            outbound_hooks: None,
         });
     }
 

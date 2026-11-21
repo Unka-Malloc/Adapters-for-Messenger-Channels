@@ -22,6 +22,7 @@ install the two ports once per process and run the channel loops.
 a4mc::custody::install(Arc::new(MyCustody))?;   // impl CustodyPort: channel_token(&ChannelId)
 a4mc::lane::install(LanePort {
     scan_targets, conversation_list, open_or_resume, dispatch,
+    outbound_hooks: None,                       // None = pass-through sends
 })?;
 
 let transport = a4mc_telegram::live_transport(None)?;        // resolves the token via custody
@@ -59,8 +60,10 @@ match receiver.receive(&request, now_unix)? {
 
 `RuntimeConfig` carries `poll_timeout_secs`, `worker_count`,
 `max_admitted`, `turn_deadline`, `max_poll_failures`, the shared `stop`
-flag and `on_started` — the host's readiness hook invoked once after
-the Bot API handshake. The loop runs until `stop` and returns the bot
+flag, `on_started` — the host's readiness hook invoked once after the
+Bot API handshake — and `on_event`, the observer for fetched updates
+this runtime cannot dispatch as a message (when it is not mounted the
+update id is persisted durably before the poll cursor advances). The loop runs until `stop` and returns the bot
 identity it served under. Slack's `SocketModeConfig` carries the
 bounded session count, reconnect delay, envelope-dedupe capacity and
 the same shared `stop` flag. Discord's `GatewayModeConfig` carries the
@@ -88,3 +91,11 @@ host.
 - Channel identity (`ChannelUser`, `ChannelChat`, `ChatKind`) is what
   the platform asserts; mapping it to a host principal is host policy,
   never the adapter's.
+- Outbound policy is host-side too. Mount an `a4mc::OutboundHooks`
+  implementation per channel (`with_outbound_hooks`) or answer
+  `LanePort::outbound_hooks` once so every channel constructed afterwards
+  shares it. Hooks supply skip, window batching, throttle budget,
+  dedupe-key derivation and receipt observation; the adapters only apply
+  the same ordered `OutboundPipeline`. Leave the lane provider as `None`
+  for pass-through sends. Never put Quiet/Already-Told/Digest logic in a
+  dialect.

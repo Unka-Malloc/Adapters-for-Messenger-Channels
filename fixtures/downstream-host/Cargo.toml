@@ -1,0 +1,19 @@
+[package]
+name = "a4mc-fixture-downstream-host"
+description = "A4MC downstream host fixture: consumes only the public a4mc surface a composing host links against, pinning the LanePort initialization contract including an unconfigured outbound policy."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+version = "0.0.0"
+
+# Not a published crate — a probe standing in for the composing host.
+# If a contract change breaks a downstream initializer that the
+# workspace's own callers were updated around, this fixture still fails
+# before nightly packaging does.
+[dependencies]
+a4mc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

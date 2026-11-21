@@ -23,7 +23,13 @@ the other; it never reaches into host internals.
 - `OutboundMessage` sends mapped onto the platform's send surface,
   honouring the contract's `MAX_*` bounds and carrying the idempotency
   key as far as the platform allows — adapter-side dedupe when it
-  offers none.
+  offers none. Drive every send through `a4mc::OutboundPipeline`
+  (`execute` around the platform lowering) so caller-mounted skip,
+  batching, throttle, dedupe-key and receipt hooks behave the same as in
+  every other dialect; resolve the pipeline with
+  `OutboundPipeline::from_lane(CHANNEL)` and expose
+  `with_outbound_hooks`. A dialect embeds no Quiet/Already-Told/Digest
+  rule of its own.
 - A `ChannelAdapter::descriptor()` report complete over the contract
   vocabulary: `native`, `adapted` or `unsupported` per `UpdateKind`
   and `SendFeature` — incomplete support declared, never claimed and

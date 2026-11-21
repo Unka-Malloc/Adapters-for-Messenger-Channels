@@ -37,6 +37,18 @@ pub fn atomic_write_private_text(path: &Path, text: &str) -> Result<()> {
             .map_err(|_| anyhow!("a4mc_telegram_state_write_failed"))?;
     }
     fs::rename(&tmp, path).map_err(|_| anyhow!("a4mc_telegram_state_write_failed"))?;
+    // Flush the renamed entry too: the poll cursor claims to be durable,
+    // so a reader after a crash must not see the previous document just
+    // because the directory entry was not persisted.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(directory) = File::open(parent)
+    {
+        // Some filesystems reject directory fsync; the rename itself has
+        // already succeeded, so this stays best-effort rather than
+        // failing an otherwise durable state write.
+        let _ = directory.sync_all();
+    }
     Ok(())
 }
 

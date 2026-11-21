@@ -13,6 +13,11 @@ pub const MAX_IDEMPOTENCY_KEY_CHARS: usize = 128;
 /// callers derive it so a retried send is safe (e.g. `reply:<update>`).
 /// Whether the platform or the adapter honors the key is declared per
 /// adapter via [`crate::descriptor::SendFeature::Idempotency`].
+///
+/// The message stays a pure serializable DTO. A caller mounts send policy
+/// (skip, batching, throttle, dedupe-key derivation, receipt observation)
+/// through [`crate::outbound::OutboundHooks`]; the channel carries the
+/// resulting [`crate::outbound::PreparedSend`] alongside this payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutboundMessage {
@@ -35,6 +40,24 @@ impl OutboundMessage {
             reply_to_message_id: None,
             idempotency_key: idempotency_key.into(),
         }
+    }
+
+    /// The idempotency/dedupe key this message carries by default.
+    ///
+    /// A mounted [`crate::outbound::OutboundHooks::dedupe_key`] may derive
+    /// an alternative key for one send; that override travels beside the
+    /// message in [`crate::outbound::PreparedSend`] and never mutates the
+    /// contract payload.
+    pub fn dedupe_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    /// Replace the body while preserving routing and the contract key.
+    /// Batching hooks use this to build a window payload without having
+    /// to reconstruct the message.
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
     }
 
     /// Bounded-payload check run at the contract edge. Adapters validate
@@ -79,4 +102,21 @@ pub struct SendReceipt {
     /// Platform message ids, one per transmitted part (a dialect that
     /// chunks long text reports every part's id, in send order).
     pub message_ids: Vec<ExternalMessageId>,
+}
+
+impl SendReceipt {
+    /// A caller policy intentionally suppressed this send: the channel
+    /// accepted it but transmitted nothing, so there are no platform ids.
+    pub fn skipped(idempotency_key: impl Into<String>) -> Self {
+        Self {
+            idempotency_key: idempotency_key.into(),
+            message_ids: Vec::new(),
+        }
+    }
+
+    /// Whether this receipt represents a skipped send rather than one or
+    /// more transmitted messages.
+    pub fn is_skipped(&self) -> bool {
+        self.message_ids.is_empty()
+    }
 }

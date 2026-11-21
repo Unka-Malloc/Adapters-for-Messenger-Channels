@@ -500,6 +500,56 @@ mod tests {
         });
     }
 
+    #[test]
+    fn legacy_document_without_poll_offset_opens_at_zero_and_keeps_state() {
+        let root = std::env::temp_dir().join(format!(
+            "a4mc-tg-bind-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let path = root.join(STATE_FILE);
+        let legacy = serde_json::json!({
+            "schemaVersion": BINDING_SCHEMA,
+            "pairings": [],
+            "chats": {
+                "9": {
+                    "chatId": 9,
+                    "userId": 9,
+                    "username": null,
+                    "paired": true,
+                    "agentId": "codex",
+                    "sessionId": "sess-9",
+                    "updatedAt": 1
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+        let mut store = BindingStore::open(path.clone()).unwrap();
+        assert_eq!(
+            store.poll_offset(),
+            0,
+            "a pre-cursor document must resume at the platform start"
+        );
+        assert_eq!(
+            store.binding(9).and_then(|b| b.agent_id.as_deref()),
+            Some("codex")
+        );
+        store.set_poll_offset(12).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"pollOffset\": 12"),
+            "cursor not persisted: {raw}"
+        );
+        let reopened = BindingStore::open(path).unwrap();
+        assert_eq!(reopened.poll_offset(), 12);
+        assert_eq!(
+            reopened.binding(9).and_then(|b| b.session_id.as_deref()),
+            Some("sess-9"),
+            "cursor write clobbered the chat binding"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn stale_schema_file_is_refused_and_left_untouched() {

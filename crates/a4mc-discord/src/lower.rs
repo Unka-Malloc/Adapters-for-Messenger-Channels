@@ -472,7 +472,10 @@ pub fn parse_timestamp(value: &str) -> Option<u64> {
     let year: i64 = date_parts.next()?.parse().ok()?;
     let month: u32 = date_parts.next()?.parse().ok()?;
     let day: u32 = date_parts.next()?.parse().ok()?;
-    if date_parts.next().is_some() || !(1..=12).contains(&month) {
+    // Discord's `timestamp` is untrusted network text. A year outside the
+    // proleptic Gregorian range Discord can actually emit is rejected
+    // before any arithmetic, so a huge value cannot overflow.
+    if date_parts.next().is_some() || !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
         return None;
     }
     let max_day = days_in_month(year, month);
@@ -506,7 +509,7 @@ pub fn parse_timestamp(value: &str) -> Option<u64> {
     if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..60).contains(&second) {
         return None;
     }
-    let days = days_from_civil(year, month, day);
+    let days = days_from_civil(year, month, day)?;
     let seconds = days
         .checked_mul(86_400)?
         .checked_add(hour * 3600 + minute * 60 + second)?
@@ -526,15 +529,27 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard
 /// Hinnant's `days_from_civil`). Kept local so the dialect carries no
-/// date-time dependency.
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
+/// date-time dependency. Every step is checked: the parser accepts
+/// network-controlled text, so an out-of-range value returns `None`
+/// instead of panicking in debug or wrapping in release.
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    let year = year.checked_sub(i64::from(month <= 2))?;
+    let era = if year >= 0 {
+        year
+    } else {
+        year.checked_sub(399)?
+    } / 400;
+    let year_of_era = year.checked_sub(era.checked_mul(400)?)?;
     let month_prime = (month + 9) % 12;
     let day_of_year = (153 * i64::from(month_prime) + 2) / 5 + i64::from(day) - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    let day_of_era = year_of_era
+        .checked_mul(365)?
+        .checked_add(year_of_era / 4)?
+        .checked_sub(year_of_era / 100)?
+        .checked_add(day_of_year)?;
+    era.checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)
 }
 
 #[cfg(test)]
@@ -745,6 +760,23 @@ mod tests {
         assert_eq!(parse_timestamp("2023-02-29T00:00:00Z"), None);
         assert_eq!(parse_timestamp("not-a-time"), None);
         assert_eq!(parse_timestamp("2023-11-14T25:00:00Z"), None);
+    }
+
+    #[test]
+    fn out_of_range_years_are_rejected_instead_of_overflowing() {
+        // `999999999999999999999` does not fit i64; a four-digit but
+        // far-future year must be rejected before `days_from_civil`.
+        assert_eq!(
+            parse_timestamp("999999999999999999999-01-01T00:00:00Z"),
+            None
+        );
+        assert_eq!(parse_timestamp("10000-01-01T00:00:00Z"), None);
+        assert_eq!(parse_timestamp("0-01-01T00:00:00Z"), None);
+        // The largest accepted year still parses without overflow.
+        assert_eq!(
+            parse_timestamp("9999-12-31T23:59:59Z"),
+            Some(253_402_300_799)
+        );
     }
 
     #[test]

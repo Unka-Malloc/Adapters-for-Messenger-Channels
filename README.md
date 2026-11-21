@@ -10,7 +10,7 @@ every channel.
 
 | Crate | Responsibility |
 | --- | --- |
-| `a4mc` | Host-neutral channel contract: inbound updates (receipt, edit/delete, member and reaction events), outbound sends with idempotency keys, delivery receipts, external channel identity, receive-mechanism classification, `ChannelAdapter` descriptor, `LanePort` and `CustodyPort`. Serde types only — no network code, no custody. |
+| `a4mc` | Host-neutral channel contract: inbound updates (receipt, edit/delete, member and reaction events), outbound sends with idempotency keys, delivery receipts, external channel identity, receive-mechanism classification, `ChannelAdapter` descriptor, `LanePort` and `CustodyPort`, and the optional `OutboundHooks` send policy. Serde types and ports only — no network code, no custody, no business policy. |
 | `a4mc-telegram` | Telegram dialect: Bot API transport (long polling via `getUpdates`), update parsing and lowering onto `a4mc`, per-chat pairing/binding store, slash-command surface, bounded fair scheduler, normalized outbound send with adapter-side idempotency dedupe. |
 | `a4mc-slack` | Slack dialect: Socket Mode receive over a persistent websocket — no public callback or inbound ingress — event lowering onto `a4mc`, normalized `chat.postMessage` sends with adapter-side idempotency dedupe, and custody/lane port integration. |
 | `a4mc-discord` | Discord dialect: Gateway websocket receive (HELLO/IDENTIFY/RESUME, heartbeats, zombie detection, reconnect) — no public callback — event lowering onto `a4mc`, normalized REST message sends with a deterministic nonce plus adapter-side idempotency dedupe, and custody port integration. |
@@ -31,6 +31,15 @@ every channel.
   custody key with the app-level Socket Mode token and the `slack` key
   with the bot token. Discord asks custody for `discord`; the webhook
   verifier asks for `webhook` with its HMAC signing secret.
+- **Outbound policy is caller-mounted, never embedded.** A host may mount
+  one `OutboundHooks` policy per channel (`with_outbound_hooks`) or once
+  through `LanePort::outbound_hooks`. The policy supplies conditional
+  skip, window batching, throttle budget, dedupe-key derivation and a
+  delivery-receipt callback. Every send-capable dialect drives the same
+  ordered `OutboundPipeline` (`skip` → `batch` → `throttle` →
+  `dedupe_key` → deliver → `on_receipt`), and a channel with no policy
+  mounted is a byte-for-byte pass-through. The crate carries no
+  Quiet/Already-Told/Digest or other business rule of its own.
 - **Secrets never surface.** `SecretToken` has no `Serialize` and a
   redacted `Debug`; tokens travel only from the host's custody port to
   the transport that consumes them. A Socket Mode URL carries a
@@ -49,22 +58,23 @@ every channel.
   declared unsupported (not yet wired). Discord today: Gateway native
   while webhook and poll are unsupported; all six update kinds native
   (member events additionally require the privileged `GUILD_MEMBERS`
-  intent); send-side reply-to native, idempotency adapted (platform nonce
+  intent, which is opt-in rather than part of the default intent set); send-side reply-to native, idempotency adapted (platform nonce
   plus bounded adapter dedupe); edit and delete declared unsupported.
   Webhook today: webhook receive native while socket and poll are
   unsupported; every update kind native because the body is the contract
   JSON; every send feature unsupported — this dialect is receive-only and
   says so.
-- **Turn dispatch is not abandoned at a local cutoff.** A Slack lane
-  turn waits for the host's `LanePort` dispatch to return; the adapter
-  forwards `timeoutMs` for the lane to bound itself and refuses to start
-  a duplicate dispatch for the same turn while the original is still
-  running.
+- **Turn dispatch is not abandoned at a local cutoff.** A Slack or
+  Telegram lane turn waits for the host's `LanePort` dispatch to return;
+  the adapter forwards `timeoutMs` for the lane to bound itself and
+  refuses to start a duplicate dispatch for the same turn while the
+  original is still running.
 
 ## Verify
 
 ```sh
 scripts/verify.sh   # fmt + clippy + tests across the workspace
+scripts/package-check.sh   # every packaged dialect resolves a contract crate carrying the API it uses
 ```
 
 All tests are deterministic: synthetic or recorded JSON payloads, a

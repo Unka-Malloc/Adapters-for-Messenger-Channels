@@ -535,6 +535,7 @@ mod tests {
             conversation_list: conversations,
             open_or_resume: open,
             dispatch,
+            outbound_hooks: None,
         })
     }
 
