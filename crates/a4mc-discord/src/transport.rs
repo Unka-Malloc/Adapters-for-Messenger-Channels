@@ -532,39 +532,47 @@ mod tests {
         )
     }
 
+    /// Consume one full request — head plus the declared body — before
+    /// answering. Closing a socket that still holds unread bytes makes
+    /// the kernel reset the connection instead of finishing it, which
+    /// can destroy the already-sent reply on the client.
+    fn read_request(stream: &mut std::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(position) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let header = String::from_utf8_lossy(&request[..header_end]);
+        let body_len: usize = header
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + body_len {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+    }
+
     fn serve_once(status: u16, body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 2048];
-            let header_end = loop {
-                let read = stream.read(&mut chunk).unwrap_or(0);
-                if read == 0 {
-                    return;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(position) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break position + 4;
-                }
-            };
-            let header = String::from_utf8_lossy(&request[..header_end]);
-            let body_len: usize = header
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .and_then(|value| value.trim().parse().ok())
-                })
-                .unwrap_or(0);
-            while request.len() < header_end + body_len {
-                let read = stream.read(&mut chunk).unwrap_or(0);
-                if read == 0 {
-                    return;
-                }
-                request.extend_from_slice(&chunk[..read]);
-            }
+            read_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -581,18 +589,7 @@ mod tests {
         let location = location.to_owned();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 2048];
-            loop {
-                let read = stream.read(&mut chunk).unwrap_or(0);
-                if read == 0 {
-                    return;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
+            read_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
             );
