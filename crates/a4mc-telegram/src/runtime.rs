@@ -98,6 +98,11 @@ struct SchedulerState {
     queued: HashSet<i64>,
     inflight: HashSet<i64>,
     admitted: usize,
+    /// No further work will ever be enqueued. Workers exit only once
+    /// this is set *and* the ready queue is empty — `stop` alone never
+    /// releases them, because the drain may still be admitting the
+    /// fetched remainder after shutdown begins.
+    drained: bool,
 }
 
 impl SchedulerState {
@@ -108,6 +113,7 @@ impl SchedulerState {
             queued: HashSet::new(),
             inflight: HashSet::new(),
             admitted: 0,
+            drained: false,
         }
     }
 }
@@ -152,6 +158,17 @@ impl Scheduler {
     fn shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
         let _state = self.state.lock().unwrap();
+        self.wake.notify_all();
+    }
+
+    /// Mark the fetched queue fully admitted and wake every parked
+    /// worker under the state lock. Runs only after `drain_pending`:
+    /// marking earlier would let workers exit with the drain's
+    /// remainder still unqueued, stranding it behind the admission
+    /// bound forever.
+    fn mark_drained(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.drained = true;
         self.wake.notify_all();
     }
 
@@ -241,7 +258,7 @@ where
                     state.inflight.insert(chat_id);
                     break (chat_id, message);
                 }
-                if scheduler.stop.load(Ordering::SeqCst) {
+                if state.drained {
                     return;
                 }
                 state = scheduler.wake.wait(state).unwrap();
@@ -398,11 +415,15 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         &mut on_event,
     );
     // Fail-closed on every exit: raising stop before drain/join releases
-    // workers parked on `wake` — a fatal poll error that left stop unset
-    // would deadlock here instead of returning its error. Workers serve
-    // `ready` before re-checking stop, so admitted work still drains.
+    // the poller's capacity wait — a fatal poll error that left stop
+    // unset would park `drain_pending`'s producer side. Workers stay
+    // alive on `stop` alone: they serve `ready` first and leave only
+    // once `mark_drained` signals nothing more can arrive, so the
+    // fetched remainder cannot be stranded behind a full admission
+    // bound while the workers it needs are already gone.
     scheduler.shutdown();
     drain_pending(&scheduler, &mut pending);
+    scheduler.mark_drained();
     scheduler.join_workers(workers)?;
     poll_result?;
     Ok(identity)
@@ -1595,6 +1616,7 @@ mod tests {
             Duration::from_secs(5),
         );
         scheduler.shutdown();
+        scheduler.mark_drained();
         for handle in workers {
             handle.join().unwrap();
         }
@@ -1669,6 +1691,7 @@ mod tests {
         processed.sort_unstable();
         assert_eq!(processed, vec![1, 2, 3]);
         scheduler.shutdown();
+        scheduler.mark_drained();
         for handle in workers {
             handle.join().unwrap();
         }
@@ -2554,6 +2577,136 @@ mod tests {
             BindingStore::open_in(&root).unwrap().poll_offset(),
             22,
             "the refetched batch did not confirm"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shutdown_drain_empties_the_fetched_queue_before_workers_exit() {
+        let stop = Arc::new(AtomicBool::new(false));
+        // Admission one at a time: the drain has to wait for a worker
+        // between every enqueue, so workers leaving early parks it
+        // forever.
+        let scheduler = Arc::new(Scheduler::new(1, Arc::clone(&stop)));
+        let done = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let processor = {
+            let done = Arc::clone(&done);
+            move |_chat_id: i64, message: InboundMessage| -> Result<()> {
+                done.lock().unwrap().push(message.message_id);
+                Ok(())
+            }
+        };
+        let workers = scheduler.spawn_workers(1, processor).unwrap();
+        scheduler.enqueue(text_message(1, 1, None, "a", 1));
+        scheduler.shutdown();
+        // With `stop` already raised, workers could be gone before this
+        // drain admits the fetched remainder: the second message would
+        // sit behind a full admission bound with nobody left to free it.
+        let mut pending = VecDeque::from([
+            text_message(2, 2, None, "b", 2),
+            text_message(3, 3, None, "c", 3),
+        ]);
+        drain_pending(&scheduler, &mut pending);
+        scheduler.mark_drained();
+        for handle in workers {
+            handle.join().unwrap();
+        }
+        let mut processed = done.lock().unwrap().clone();
+        processed.sort_unstable();
+        assert_eq!(processed, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn an_observer_failure_mid_batch_leaves_every_ordinary_update_for_refetch() {
+        let root = temp_root();
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        // Two ordinary updates followed by an undispatchable one in the
+        // same fetched batch: the observer rejection must hold the
+        // cursor behind all three without stranding the ordinary work.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![
+                Update {
+                    update_id: 11,
+                    message: Some(text_message(42, 42, Some("alice"), "/whoami", 11)),
+                },
+                Update {
+                    update_id: 12,
+                    message: Some(text_message(43, 43, Some("bob"), "/whoami", 12)),
+                },
+                Update {
+                    update_id: 13,
+                    message: None,
+                },
+            ])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            on_event: Some(Box::new(|_: &a4mc::ChannelEvent| {
+                Err(anyhow!("fixture rejection"))
+            })),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        // Returning at all proves the shutdown path did not strand the
+        // batch's queue remainder behind workers that had already left.
+        let error = run_channel_loop(transport, store, config).unwrap_err();
+        assert!(
+            error.to_string().contains("a4mc_telegram_unhandled_event"),
+            "unexpected error: {error}"
+        );
+        let reopened = BindingStore::open_in(&root).unwrap();
+        assert_eq!(
+            reopened.poll_offset(),
+            0,
+            "the rejected batch was confirmed past"
+        );
+        assert!(reopened.pending_updates().is_empty());
+        drop(reopened);
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the rejected batch's ordinary updates must be refetched, not served"
+        );
+
+        // The next run refetches from behind the rejected update and
+        // serves both ordinary messages.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![
+                Update {
+                    update_id: 11,
+                    message: Some(text_message(42, 42, Some("alice"), "/whoami", 11)),
+                },
+                Update {
+                    update_id: 12,
+                    message: Some(text_message(43, 43, Some("bob"), "/whoami", 12)),
+                },
+                Update {
+                    update_id: 13,
+                    message: None,
+                },
+            ])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            on_event: Some(Box::new(|_: &a4mc::ChannelEvent| Ok(()))),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            14,
+            "the refetched batch did not confirm past its last update"
         );
         let _ = std::fs::remove_dir_all(root);
     }

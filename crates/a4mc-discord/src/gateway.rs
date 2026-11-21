@@ -773,6 +773,20 @@ fn session_loop(
                 }
             }
         }
+        // Both protocol deadlines are serviced on the monotonic clock
+        // itself, not on a read timing out: a steady stream of dispatch
+        // frames must not postpone a scheduled heartbeat or mask a
+        // missing acknowledgement.
+        let now = Instant::now();
+        if ack_due.is_some_and(|due| now >= due) {
+            return Ok(SessionOutcome::Reconnect);
+        }
+        if next_heartbeat.is_some_and(|at| now >= at) {
+            send_heartbeat(connection, last_received)?;
+            let now = Instant::now();
+            next_heartbeat = Some(now + heartbeat_interval);
+            ack_due = Some(now + heartbeat_interval);
+        }
         let now = Instant::now();
         let timeout = [next_heartbeat, ack_due]
             .into_iter()
@@ -1140,6 +1154,9 @@ mod tests {
     struct ScriptedConnection {
         frames: VecDeque<GatewayRead>,
         sent: Arc<Mutex<Vec<Value>>>,
+        /// Simulated per-read cost so real time can cross a protocol
+        /// deadline while frames keep arriving.
+        read_delay: Duration,
     }
 
     impl ScriptedConnection {
@@ -1150,12 +1167,16 @@ mod tests {
             Self {
                 frames: frames.into_iter().collect(),
                 sent,
+                read_delay: Duration::ZERO,
             }
         }
     }
 
     impl GatewayConnection for ScriptedConnection {
         fn read_frame(&mut self, _timeout: Duration) -> Result<GatewayRead, DiscordApiError> {
+            if !self.read_delay.is_zero() {
+                std::thread::sleep(self.read_delay);
+            }
             Ok(self.frames.pop_front().unwrap_or(GatewayRead::Closed(None)))
         }
 
@@ -1428,6 +1449,50 @@ mod tests {
                 .count(),
             1,
             "a zombie session must not keep sending heartbeats"
+        );
+    }
+
+    #[test]
+    fn a_busy_dispatch_stream_cannot_starve_the_heartbeat_schedule() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        // A tight interval under an unbroken run of dispatch frames:
+        // reads never idle long enough to time out, so the heartbeat
+        // deadline must be serviced on the clock, not on the read's
+        // result. One early ACK clears the first heartbeat's due date;
+        // the next scheduled send must still go out mid-stream.
+        let mut frames = vec![
+            GatewayRead::Text(json!({"op": 10, "d": {"heartbeat_interval": 30}}).to_string()),
+            GatewayRead::Text(json!({"op": OP_HEARTBEAT_ACK}).to_string()),
+        ];
+        frames.extend((2..40).map(message));
+        let mut connection = ScriptedConnection {
+            frames: frames.into_iter().collect(),
+            sent: Arc::clone(&sent),
+            read_delay: Duration::from_millis(5),
+        };
+        let mut handler = RecordingHandler::default();
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+        let outcome = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(outcome, SessionOutcome::Reconnect);
+        let heartbeats = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|payload| payload["op"] == json!(OP_HEARTBEAT))
+            .count();
+        assert!(
+            heartbeats >= 2,
+            "a steady dispatch stream starved the scheduled heartbeat"
         );
     }
 

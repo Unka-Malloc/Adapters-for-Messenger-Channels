@@ -764,7 +764,31 @@ pub fn run_socket_mode(
             return Ok(());
         }
         sessions += 1;
-        let url = api.open_socket()?;
+        let url = match api.open_socket() {
+            Ok(url) => url,
+            Err(error) => {
+                // Credential and scope rejections fail every retry
+                // identically — surface them. Anything else (a 429, a
+                // network outage, a server fault) is transient: it
+                // takes the same reconnect backoff a failed websocket
+                // connect would, honoring the platform's wait hint.
+                if open_socket_terminal(&error.code) {
+                    return Err(error);
+                }
+                if config.max_sessions != 0 && sessions >= config.max_sessions {
+                    return Err(error);
+                }
+                backoff = backoff.max(config.reconnect_delay);
+                let delay = error
+                    .retry_after
+                    .map_or(backoff, |hint| backoff.max(Duration::from_secs(hint)));
+                backoff = backoff.saturating_mul(2).min(config.max_reconnect_delay);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                continue;
+            }
+        };
         let mut connection = match connector.connect(&url) {
             Ok(connection) => connection,
             Err(error) => {
@@ -803,6 +827,27 @@ pub fn run_socket_mode(
             std::thread::sleep(delay);
         }
     }
+}
+
+/// `apps.connections.open` failures the reconnect backoff cannot fix:
+/// a rejected, missing or mis-scoped credential fails every call the
+/// same way, so the loop returns it instead of parking on a ticket it
+/// can never obtain. Everything else is transient and retries.
+fn open_socket_terminal(code: &str) -> bool {
+    matches!(
+        code,
+        "a4mc_slack_unauthorized"
+            | "a4mc_slack_token_invalid"
+            | "a4mc_slack_app_token_missing"
+            | "a4mc_slack_bot_token_missing"
+            | "a4mc_slack_custody_unavailable"
+            | "a4mc_slack_custody_failed"
+            | "a4mc_slack_missing_scope"
+            | "a4mc_slack_no_permission"
+            | "a4mc_slack_not_allowed_token_type"
+            | "a4mc_slack_account_inactive"
+            | "a4mc_slack_api_root_refused"
+    )
 }
 
 fn sleep_before_retry(backoff: Duration, max: Duration) -> Duration {
@@ -1403,5 +1448,104 @@ mod tests {
 
         assert_eq!(connector.attempts.load(Ordering::SeqCst), 2);
         assert!(handler.events.is_empty());
+    }
+
+    /// An `apps.connections.open` mock that returns each scripted error
+    /// once, then delegates to the inner mock — a transient ticket
+    /// outage followed by recovery.
+    struct FlakyTicketApi {
+        inner: crate::transport::MockSlackApi,
+        failures: Mutex<VecDeque<SlackApiError>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SlackApi for FlakyTicketApi {
+        fn auth_test(&self) -> Result<crate::transport::SlackIdentity, SlackApiError> {
+            self.inner.auth_test()
+        }
+
+        fn open_socket(&self) -> Result<SocketUrl, SlackApiError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.failures.lock().unwrap().pop_front() {
+                return Err(error);
+            }
+            self.inner.open_socket()
+        }
+
+        fn post_message(
+            &self,
+            request: &crate::transport::PostMessageRequest,
+        ) -> Result<crate::transport::PostedMessage, SlackApiError> {
+            self.inner.post_message(request)
+        }
+    }
+
+    #[test]
+    fn a_transient_ticket_failure_retries_through_the_reconnect_backoff() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let connection = ScriptedConnection::new(
+            vec![
+                json!({"type": "hello"}).to_string(),
+                json!({"type": "disconnect", "reason": "test_done"}).to_string(),
+            ],
+            Arc::clone(&sent),
+        );
+        let connector = ScriptedConnector {
+            connections: Mutex::new(VecDeque::from([
+                Box::new(connection) as Box<dyn SocketConnection>
+            ])),
+        };
+        let api = FlakyTicketApi {
+            inner: crate::transport::MockSlackApi::default(),
+            failures: Mutex::new(VecDeque::from([
+                SlackApiError::new("a4mc_slack_throttled", "fixture rate limit")
+                    .with_retry_after(Some(0)),
+                SlackApiError::new("a4mc_slack_network_failed", "fixture outage"),
+            ])),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut handler = RecordingHandler::default();
+        let config = SocketModeConfig {
+            max_sessions: 3,
+            reconnect_delay: Duration::ZERO,
+            ..SocketModeConfig::default()
+        };
+
+        run_socket_mode(&api, &connector, &mut handler, &config).unwrap();
+
+        // Two transient ticket failures inside the session bound, then
+        // the recovered call opened the session: before, the first
+        // error ended the receive loop entirely.
+        assert_eq!(api.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn credential_and_scope_ticket_failures_stay_terminal() {
+        for code in ["a4mc_slack_unauthorized", "a4mc_slack_missing_scope"] {
+            let api = FlakyTicketApi {
+                inner: crate::transport::MockSlackApi::default(),
+                failures: Mutex::new(VecDeque::from([SlackApiError::new(
+                    code,
+                    "fixture credential rejection",
+                )])),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let connector = ScriptedConnector {
+                connections: Mutex::new(VecDeque::new()),
+            };
+            let mut handler = RecordingHandler::default();
+            let config = SocketModeConfig {
+                reconnect_delay: Duration::ZERO,
+                ..SocketModeConfig::default()
+            };
+
+            let error = run_socket_mode(&api, &connector, &mut handler, &config).unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(
+                api.calls.load(Ordering::SeqCst),
+                1,
+                "a {code} ticket failure must not be retried"
+            );
+        }
     }
 }
