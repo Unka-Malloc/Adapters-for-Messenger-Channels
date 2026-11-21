@@ -83,6 +83,15 @@ pub struct ChatBinding {
     pub agent_id: Option<String>,
     pub session_id: Option<String>,
     pub updated_at: u64,
+    /// Revision this binding's routing was last changed at — drawn
+    /// from the document's monotone counter and advanced by every
+    /// write that changes how the chat routes. Recorded-work
+    /// preconditions compare it so a turn started under one routing
+    /// can never install its result onto a binding that moved and
+    /// came back: A→B→A leaves a different revision even though
+    /// user, agent and session values match.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 /// One fetched message update admitted for processing: persisted in the
@@ -166,13 +175,15 @@ struct BindingDocument {
     /// host-visible messages. Older readers ignore the field.
     #[serde(default)]
     dropped_updates: Vec<DroppedUpdate>,
-    /// Fetched updates the cursor already confirmed as host-callback
-    /// events but whose callback outcome is not yet durable. Settled
-    /// the moment the hook answers — a consumed event is released,
-    /// a rejected one keeps its marker while the cursor rolls back
-    /// before it for redelivery; only a marker the cursor has moved
-    /// past on restart is settled as dropped, since that lowered
-    /// event cannot be replayed.
+    /// Fetched updates awaiting their host callback — the durable
+    /// cursor reaches an event only after its callback accepted it,
+    /// so a marker always sits at or above the cursor and stays
+    /// refetchable until it settles. A consumed event's marker is
+    /// released in the same write that confirms its boundary; a
+    /// rejected one keeps its marker while the cursor stays before
+    /// it for redelivery; only a marker the cursor has moved past on
+    /// restart — one committed under an earlier scheme — is settled
+    /// as dropped, since that lowered event cannot be replayed.
     #[serde(default)]
     pending_events: Vec<DroppedUpdate>,
     /// Admitted-but-unfinished message updates: the durable inbox every
@@ -182,9 +193,16 @@ struct BindingDocument {
     /// Bounded tail of update ids whose task record was settled —
     /// completed or dropped. A cursor rollback for a rejected event
     /// refetches them, and the remembered id keeps confirmed work from
-    /// re-entering the scheduler.
+    /// re-entering the scheduler. The tail is scoped to the polling
+    /// sequence it was written under: when that sequence expires the
+    /// ids lose their meaning — a restarted sequence may lawfully
+    /// reuse them — and `retire_settled` clears it.
     #[serde(default)]
     settled_updates: Vec<i64>,
+    /// Monotone counter backing `ChatBinding::revision` — persisted so
+    /// revisions stay unique across restarts.
+    #[serde(default)]
+    revision_counter: u64,
 }
 
 /// A staged reply completion: one atomic record carrying the payload,
@@ -237,6 +255,13 @@ enum StagedEffect {
         /// before it existed, which applies unverifiable.
         #[serde(default)]
         prior_session: Option<Option<String>>,
+        /// The binding revision the task ran under: `Some` records the
+        /// precondition, `None` marks a record staged before it
+        /// existed, which applies unverifiable. User, agent and
+        /// session values alone cannot distinguish A→B→A — the
+        /// revision can.
+        #[serde(default)]
+        binding_revision: Option<u64>,
     },
     /// The chat's pairing/binding revocation lands with the reply —
     /// only against the binding it was recorded for, never a pairing
@@ -254,6 +279,11 @@ enum StagedEffect {
         agent_id: String,
         #[serde(default)]
         user_id: Option<i64>,
+        /// The binding revision observed when the command ran: `Some`
+        /// records the precondition, `None` marks a record staged
+        /// before it existed, which applies unverifiable.
+        #[serde(default)]
+        binding_revision: Option<u64>,
     },
     /// A new pairing record lands with the reply carrying its code —
     /// skipped once that user already holds a full pairing.
@@ -458,6 +488,7 @@ impl BindingStore {
                 agent_id: None,
                 session_id: None,
                 updated_at: now,
+                revision: next_revision(document),
             };
             document
                 .chats
@@ -497,6 +528,7 @@ impl BindingStore {
             }
             binding.agent_id = agent_id;
             binding.updated_at = now_secs();
+            binding.revision = next_revision(document);
             document.chats.insert(chat_id.to_string(), binding.clone());
             Ok(binding)
         })
@@ -513,6 +545,7 @@ impl BindingStore {
             ensure!(binding.agent_id.is_some(), "a4mc_telegram_agent_required");
             binding.session_id = session_id;
             binding.updated_at = now_secs();
+            binding.revision = next_revision(document);
             document.chats.insert(chat_id.to_string(), binding.clone());
             Ok(binding)
         })
@@ -655,6 +688,22 @@ impl BindingStore {
         })
     }
 
+    /// Settle an event the host callback consumed and confirm the batch
+    /// boundary its acceptance earned in the same write: the marker is
+    /// released and the cursor advances to `offset` — the first update
+    /// whose outcome is not yet durable — atomically, so a crash can
+    /// never leave a confirmed cursor on an unsettled marker.
+    pub fn settle_event_at_cursor(&mut self, update_id: i64, offset: i64) -> Result<()> {
+        self.mutate(|document| {
+            document
+                .pending_events
+                .retain(|item| item.update_id != update_id);
+            document.poll_offset = offset;
+            document.poll_offset_advanced_at = Some(now_secs());
+            Ok(())
+        })
+    }
+
     /// Settle the events a restart found still pending — but only the
     /// ones the stored cursor already confirmed: a marker at or above
     /// the cursor is still refetchable — the platform will redeliver
@@ -699,6 +748,20 @@ impl BindingStore {
         })
     }
 
+    /// Clear the settled-id tail: the remembered ids belong to the
+    /// polling sequence that just expired, and a restarted sequence may
+    /// lawfully reuse them — keeping the tail would suppress fresh work
+    /// as already-settled. An empty tail means nothing to write.
+    pub fn retire_settled(&mut self) -> Result<()> {
+        if self.document.settled_updates.is_empty() {
+            return Ok(());
+        }
+        self.mutate(|document| {
+            document.settled_updates.clear();
+            Ok(())
+        })
+    }
+
     /// The admitted-but-unfinished work, oldest update first.
     pub fn pending_updates(&self) -> Vec<PendingUpdate> {
         let mut tasks = self.document.pending_updates.clone();
@@ -737,24 +800,23 @@ impl BindingStore {
     /// and re-runs it — or reapplies a session a later committed write
     /// already replaced. `expected` is the binding the caller's turn
     /// ran under: the session lands only while the current binding
-    /// still matches it — user, agent and session — so a rebind that
-    /// raced an in-flight turn can never have the stale session
-    /// written over it. The reply record itself never depends on the
+    /// still matches it — user, agent, session and revision — so a
+    /// rebind that raced an in-flight turn can never have the stale
+    /// session written over it, even one that moved the binding and
+    /// moved it back. `text` receives whether the guarded session
+    /// change applied, so the confirmation reports what the mutation
+    /// actually did. The reply record itself never depends on the
     /// effect: a refused routing change still keeps its finished
-    /// reply.
+    /// reply. Returns the reply text.
     pub fn record_reply_and_session(
         &mut self,
         chat_id: i64,
         update_id: i64,
-        reply: &str,
         key: &str,
         session_id: Option<String>,
         expected: &ChatBinding,
-    ) -> Result<()> {
-        ensure!(
-            reply.len() <= MAX_REPLY_BYTES,
-            "a4mc_telegram_reply_too_large"
-        );
+        text: impl FnOnce(bool) -> String,
+    ) -> Result<String> {
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
             let effect = StagedEffect::ReplySession {
@@ -763,9 +825,16 @@ impl BindingStore {
                 user_id: Some(expected.user_id),
                 agent_id: expected.agent_id.clone(),
                 prior_session: Some(expected.session_id.clone()),
+                binding_revision: Some(expected.revision),
             };
-            apply_effect(document, &effect);
-            stage_reply(document, &dir, update_id, reply, key, effect)
+            let applied = apply_effect(document, &effect);
+            let reply = text(applied);
+            ensure!(
+                reply.len() <= MAX_REPLY_BYTES,
+                "a4mc_telegram_reply_too_large"
+            );
+            stage_reply(document, &dir, update_id, &reply, key, effect)?;
+            Ok(reply)
         })
     }
 
@@ -804,31 +873,39 @@ impl BindingStore {
     /// Commit a chat's agent rebind and the reply confirming it in one
     /// write — a changed agent clears the session exactly as
     /// `set_agent` does. The rebind is applied only while the chat is
-    /// still paired; the reply record never depends on it.
+    /// still paired for the user the command ran for and, when
+    /// `expected` carries the binding the command observed, while that
+    /// binding's revision still holds. `text` receives whether the
+    /// guarded rebind applied, so the confirmation reports what the
+    /// mutation actually did; the reply record never depends on it.
+    /// Returns the reply text.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_reply_and_agent(
         &mut self,
         chat_id: i64,
         update_id: i64,
         agent_id: String,
-        reply: &str,
         key: &str,
-    ) -> Result<()> {
-        ensure!(
-            reply.len() <= MAX_REPLY_BYTES,
-            "a4mc_telegram_reply_too_large"
-        );
+        user_id: i64,
+        expected: Option<&ChatBinding>,
+        text: impl FnOnce(bool) -> String,
+    ) -> Result<String> {
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
             let effect = StagedEffect::ReplyAgent {
                 chat_id,
                 agent_id,
-                user_id: document
-                    .chats
-                    .get(&chat_id.to_string())
-                    .map(|binding| binding.user_id),
+                user_id: Some(user_id),
+                binding_revision: expected.map(|binding| binding.revision),
             };
-            apply_effect(document, &effect);
-            stage_reply(document, &dir, update_id, reply, key, effect)
+            let applied = apply_effect(document, &effect);
+            let reply = text(applied);
+            ensure!(
+                reply.len() <= MAX_REPLY_BYTES,
+                "a4mc_telegram_reply_too_large"
+            );
+            stage_reply(document, &dir, update_id, &reply, key, effect)?;
+            Ok(reply)
         })
     }
 
@@ -1247,27 +1324,6 @@ fn staged_payload_name_ok(staged: &StagedCompletion, update_id: i64) -> bool {
     staged.payload == reply_file_name(update_id) || staged.payload == manifest_file_name(update_id)
 }
 
-/// The document bytes a staged record contributes once bound — the
-/// payload pointer and delivery key it writes on its task plus the
-/// binding fields its effect carries. When that contribution alone
-/// exceeds the document bound the record can never commit, however
-/// much slack the rest of the document frees.
-fn staged_doc_cost(staged: &StagedCompletion) -> usize {
-    let effect = match &staged.effect {
-        StagedEffect::Reply | StagedEffect::ReplyRevoke { .. } => 0,
-        StagedEffect::ReplySession {
-            session_id,
-            agent_id,
-            ..
-        } => session_id.as_deref().map_or(0, str::len) + agent_id.as_deref().map_or(0, str::len),
-        StagedEffect::ReplyAgent { agent_id, .. } => agent_id.len(),
-        StagedEffect::ReplyPairing { record } => {
-            record.code.len() + record.username.as_deref().map_or(0, str::len)
-        }
-    };
-    staged.payload.len() + staged.key.len() + effect
-}
-
 fn staged_update_ids(dir: &Path) -> Vec<i64> {
     let mut ids = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1308,6 +1364,14 @@ fn staged_manifests(dir: &Path) -> Vec<(i64, Option<StagedCompletion>)> {
     out
 }
 
+/// The document's serialized size — the bound every commit is checked
+/// against. `None` means serialization failed, treated as uncommittable.
+fn serialized_len(document: &BindingDocument) -> Option<usize> {
+    serde_json::to_string_pretty(document)
+        .ok()
+        .map(|raw| raw.len())
+}
+
 /// Bind every applicable staged completion on the candidate document:
 /// the declared effect re-applies exactly as the record's own commit
 /// performed it, and the task gains the payload pointer and delivery
@@ -1315,24 +1379,18 @@ fn staged_manifests(dir: &Path) -> Vec<(i64, Option<StagedCompletion>)> {
 /// being written by another mutation is either already durable here or
 /// still staging — never half-read.
 fn apply_staged(document: &mut BindingDocument, dir: &Path) {
-    for (id, staged) in staged_manifests(dir) {
-        let Some(staged) = staged else { continue };
-        // The record must be readable end to end: a self-contained
-        // record carries its payload; a pointer manifest is only
-        // recoverable while its payload file exists — a pointer whose
-        // payload never landed marks a stage that died mid-write,
-        // not finished work.
-        if staged.text.is_none() && !dir.join(&staged.payload).is_file() {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some((id, "json")) = entry.file_name().to_str().and_then(staged_file_name_id) else {
             continue;
-        }
-        // A record whose own document contribution can never fit the
-        // bound — an oversized session id is the reachable shape —
-        // stays unbound: it is retained on disk and reported by
-        // `stranded_staged` instead of letting every mutation that
-        // replays it fail on a document that can never commit.
-        if staged_doc_cost(&staged) > MAX_STATE_BYTES {
-            continue;
-        }
+        };
+        // A task already holding its bound reply can never re-apply
+        // this record — the manifest's only remaining job is the
+        // sweep, so its (potentially large) payload is not re-read and
+        // re-parsed on every mutation.
         let Some(index) = document
             .pending_updates
             .iter()
@@ -1343,6 +1401,30 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
         if document.pending_updates[index].has_reply() {
             continue;
         }
+        let staged = read_private_text_bounded(&path, MAX_STAGED_BYTES)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<StagedCompletion>(&raw).ok())
+            .filter(|staged: &StagedCompletion| {
+                staged.update_id == id && staged_payload_name_ok(staged, id)
+            });
+        let Some(staged) = staged else { continue };
+        // The record must be readable end to end: a self-contained
+        // record carries its payload; a pointer manifest is only
+        // recoverable while its payload file exists — a pointer whose
+        // payload never landed marks a stage that died mid-write,
+        // not finished work.
+        if staged.text.is_none() && !dir.join(&staged.payload).is_file() {
+            continue;
+        }
+        // Bind tentatively, then keep the record only while the whole
+        // serialized document still fits the read bound: an effect
+        // that fits in isolation can overflow against live bindings,
+        // and records that each fit can overflow together. A record
+        // that cannot land is reverted, retained on disk and reported
+        // by `stranded_staged` — instead of letting every mutation
+        // that replays it fail on a document it can never commit.
+        let before = document.clone();
         apply_effect(document, &staged.effect);
         let task = &mut document.pending_updates[index];
         task.reply = None;
@@ -1351,6 +1433,9 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) {
         task.reply_sent = 0;
         task.reply_progress = None;
         task.reply_retry_at_ms = None;
+        if serialized_len(document).is_none_or(|len| len > MAX_STATE_BYTES) {
+            *document = before;
+        }
     }
 }
 
@@ -1441,34 +1526,55 @@ fn stage_reply(
     Ok(())
 }
 
+/// The next binding revision from the document's monotone counter —
+/// every write that changes how a chat routes draws one, so a stale
+/// precondition can never match a binding that moved and came back.
+fn next_revision(document: &mut BindingDocument) -> u64 {
+    document.revision_counter += 1;
+    document.revision_counter
+}
+
 /// Apply one staged effect to the document — the same change the
 /// record's own commit performed, refused when the binding it was
-/// staged against no longer holds. Returns whether pairing or binding
-/// state was removed (only the revocation effect can remove).
+/// staged against no longer holds. Returns whether the effect's state
+/// change landed: for the revocation that is whether anything was
+/// removed; for the routing effects whether the guarded write applied.
 fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
     match effect {
-        StagedEffect::Reply => false,
+        StagedEffect::Reply => true,
         StagedEffect::ReplySession {
             chat_id,
             session_id,
             user_id,
             agent_id,
             prior_session,
+            binding_revision,
         } => {
-            if let Some(binding) = document.chats.get_mut(&chat_id.to_string())
-                && binding.agent_id.is_some()
-                && user_id.is_none_or(|held| binding.user_id == held)
-                && agent_id
-                    .as_ref()
-                    .is_none_or(|held| binding.agent_id.as_ref() == Some(held))
-                && prior_session
-                    .as_ref()
-                    .is_none_or(|held| binding.session_id == *held)
-            {
+            let applies = document
+                .chats
+                .get(&chat_id.to_string())
+                .is_some_and(|binding| {
+                    binding.agent_id.is_some()
+                        && user_id.is_none_or(|held| binding.user_id == held)
+                        && agent_id
+                            .as_ref()
+                            .is_none_or(|held| binding.agent_id.as_ref() == Some(held))
+                        && prior_session
+                            .as_ref()
+                            .is_none_or(|held| binding.session_id == *held)
+                        && binding_revision.is_none_or(|held| binding.revision == held)
+                });
+            if applies {
+                let revision = next_revision(document);
+                let binding = document
+                    .chats
+                    .get_mut(&chat_id.to_string())
+                    .expect("checked binding");
                 binding.session_id = session_id.clone();
+                binding.revision = revision;
                 binding.updated_at = now_secs();
             }
-            false
+            applies
         }
         StagedEffect::ReplyRevoke { chat_id, user_id } => {
             let removable = document
@@ -1489,18 +1595,30 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
             chat_id,
             agent_id,
             user_id,
+            binding_revision,
         } => {
-            if let Some(binding) = document.chats.get_mut(&chat_id.to_string())
-                && binding.paired
-                && user_id.is_none_or(|held| binding.user_id == held)
-            {
+            let applies = document
+                .chats
+                .get(&chat_id.to_string())
+                .is_some_and(|binding| {
+                    binding.paired
+                        && user_id.is_none_or(|held| binding.user_id == held)
+                        && binding_revision.is_none_or(|held| binding.revision == held)
+                });
+            if applies {
+                let revision = next_revision(document);
+                let binding = document
+                    .chats
+                    .get_mut(&chat_id.to_string())
+                    .expect("checked binding");
                 if binding.agent_id.as_deref() != Some(agent_id.as_str()) {
                     binding.session_id = None;
                 }
                 binding.agent_id = Some(agent_id.clone());
+                binding.revision = revision;
                 binding.updated_at = now_secs();
             }
-            false
+            applies
         }
         StagedEffect::ReplyPairing { record } => {
             if document
@@ -1516,7 +1634,7 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
                 .pairings
                 .retain(|held| held.chat_id != record.chat_id || held.user_id != record.user_id);
             document.pairings.push(record.clone());
-            false
+            true
         }
     }
 }
@@ -1620,6 +1738,7 @@ fn read_document(path: &Path) -> Result<BindingDocument> {
             pending_events: Vec::new(),
             pending_updates: Vec::new(),
             settled_updates: Vec::new(),
+            revision_counter: 0,
         }),
     }
 }
@@ -1900,24 +2019,31 @@ mod tests {
                 .record_reply_and_session(
                     9,
                     7,
-                    "Started a new conversation: s2",
                     "reply:7",
                     Some("s2".into()),
                     &expected,
+                    |applied| {
+                        assert!(applied);
+                        "Started a new conversation: s2".to_owned()
+                    },
                 )
                 .unwrap_err();
             assert_eq!(store.binding(9).unwrap().session_id, None);
             assert!(!store.pending_updates()[0].has_reply());
-            store
+            let reply = store
                 .record_reply_and_session(
                     9,
                     7,
-                    "Started a new conversation: s2",
                     "reply:7",
                     Some("s2".into()),
                     &expected,
+                    |applied| {
+                        assert!(applied);
+                        "Started a new conversation: s2".to_owned()
+                    },
                 )
                 .unwrap();
+            assert_eq!(reply, "Started a new conversation: s2");
             assert_eq!(store.binding(9).unwrap().session_id.as_deref(), Some("s2"));
             let task = &store.pending_updates()[0];
             assert_eq!(
@@ -2066,6 +2192,7 @@ mod tests {
                     user_id: None,
                     agent_id: None,
                     prior_session: None,
+                    binding_revision: None,
                 },
                 text: None,
             };
@@ -2406,6 +2533,7 @@ mod tests {
                     user_id: Some(42),
                     agent_id: None,
                     prior_session: None,
+                    binding_revision: None,
                 },
                 text: Some("self-contained reply".to_owned()),
             };
@@ -2513,6 +2641,7 @@ mod tests {
                     user_id: Some(42),
                     agent_id: Some("codex".to_owned()),
                     prior_session: None,
+                    binding_revision: None,
                 },
                 text: Some("reply body".to_owned()),
             };
@@ -2700,10 +2829,13 @@ mod tests {
                 .record_reply_and_session(
                     9,
                     7,
-                    "turn reply",
                     "reply:7",
                     Some("turn-session".into()),
                     &expected,
+                    |applied| {
+                        assert!(!applied, "the stale effect still applied");
+                        "turn reply".to_owned()
+                    },
                 )
                 .unwrap();
             let binding = store.binding(9).cloned().unwrap();
@@ -2754,10 +2886,10 @@ mod tests {
                 .record_reply_and_session(
                     9,
                     7,
-                    "reply body",
                     "reply:7",
                     Some("x".repeat(MAX_STATE_BYTES)),
                     &expected,
+                    |_| "reply body".to_owned(),
                 )
                 .unwrap_err();
             assert_eq!(error.to_string(), "a4mc_telegram_state_full");
@@ -2821,6 +2953,172 @@ mod tests {
             assert!(
                 legacy.join("reply-7.txt").exists(),
                 "the legacy payload was swept by the new store"
+            );
+        });
+    }
+
+    #[test]
+    fn a_stale_revision_cannot_reinstall_a_session_after_a_round_trip() {
+        temp_store(|mut store| {
+            let pending = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(9, Some("codex".into())).unwrap();
+            store.set_session(9, Some("s-old".into())).unwrap();
+            // The binding the turn ran under — captured before the host
+            // moved routing away and back.
+            let expected = store.binding(9).cloned().unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 7,
+                        message: inbound_message(7, 9),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            // A→B→A: user, agent and session values end up identical
+            // to the snapshot the turn ran under, so only the revision
+            // still tells the binding moved.
+            store.set_agent(9, Some("claude".into())).unwrap();
+            store.set_agent(9, Some("codex".into())).unwrap();
+            store.set_session(9, Some("s-old".into())).unwrap();
+            let binding = store.binding(9).unwrap();
+            assert_eq!(binding.agent_id.as_deref(), Some("codex"));
+            assert_eq!(binding.session_id.as_deref(), Some("s-old"));
+
+            let reply = store
+                .record_reply_and_session(
+                    9,
+                    7,
+                    "reply:7",
+                    Some("turn-session".into()),
+                    &expected,
+                    |applied| {
+                        if applied {
+                            "Bound session: turn-session".to_owned()
+                        } else {
+                            "The binding moved — the session was not applied.".to_owned()
+                        }
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                reply, "The binding moved — the session was not applied.",
+                "the stale turn's session was confirmed as applied"
+            );
+            assert_eq!(
+                store.binding(9).unwrap().session_id.as_deref(),
+                Some("s-old"),
+                "the stale turn's session overwrote the newer binding"
+            );
+            // The finished reply is retained regardless: its record
+            // never depends on the routing effect applying.
+            let task = store.pending_update(7).unwrap();
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some("The binding moved — the session was not applied.")
+            );
+        });
+    }
+
+    #[test]
+    fn a_staged_record_that_overflows_the_document_is_retained_until_it_fits() {
+        temp_store(|mut store| {
+            let pending = store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.approve(&pending.code).unwrap();
+            store.set_agent(9, Some("codex".into())).unwrap();
+            // One task fills most of the bounded document; a second
+            // small task carries the staged completion whose session
+            // effect cannot land beside the first — though it fits
+            // the bound alone once room frees.
+            let mut big = inbound_message(7, 9);
+            big.text = Some("x".repeat(MAX_STATE_BYTES - 20_000));
+            store
+                .admit_updates(
+                    &[
+                        PendingUpdate {
+                            update_id: 7,
+                            message: big,
+                            reply: None,
+                            reply_key: None,
+                            reply_sent: 0,
+                            reply_progress: None,
+                            reply_file: None,
+                            reply_retry_at_ms: None,
+                        },
+                        PendingUpdate {
+                            update_id: 8,
+                            message: inbound_message(8, 9),
+                            reply: None,
+                            reply_key: None,
+                            reply_sent: 0,
+                            reply_progress: None,
+                            reply_file: None,
+                            reply_retry_at_ms: None,
+                        },
+                    ],
+                    &[],
+                    &[],
+                    9,
+                )
+                .unwrap();
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let record = StagedCompletion {
+                update_id: 8,
+                payload: "reply-8.json".to_owned(),
+                key: "reply:8".to_owned(),
+                effect: StagedEffect::ReplySession {
+                    chat_id: 9,
+                    session_id: Some("y".repeat(30_000)),
+                    user_id: None,
+                    agent_id: None,
+                    prior_session: None,
+                    binding_revision: None,
+                },
+                text: Some("staged reply".to_owned()),
+            };
+            std::fs::write(
+                dir.join("reply-8.json"),
+                serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+
+            // The record does not fit beside the admitted work: every
+            // unrelated mutation still commits — the record is
+            // retained and reported instead of blocking the store.
+            store.set_poll_offset(9).unwrap();
+            let stranded = store.reconcile_staged().unwrap();
+            assert!(
+                stranded
+                    .iter()
+                    .any(|item| item.update_id == 8 && item.code == "a4mc_telegram_state_full"),
+                "the overflowing record was not reported: {stranded:?}"
+            );
+            assert!(store.pending_update(8).unwrap().reply_file.is_none());
+            assert_eq!(store.binding(9).unwrap().session_id, None);
+
+            // Once the document frees, the next mutation binds the
+            // same record — finished work is never discarded.
+            store.complete_update(7).unwrap();
+            store.set_poll_offset(10).unwrap();
+            let task = store.pending_update(8).unwrap();
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some("staged reply")
+            );
+            assert_eq!(
+                store.binding(9).unwrap().session_id.as_deref(),
+                Some("y".repeat(30_000).as_str()),
+                "the staged session did not commit once it fit"
             );
         });
     }

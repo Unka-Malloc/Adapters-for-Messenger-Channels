@@ -24,6 +24,8 @@ use crate::control::{
 use anyhow::{Result, anyhow};
 use rand_core::{OsRng, RngCore};
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -103,8 +105,25 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// One unit of scheduler work: a fetched message to process, or a
+/// durably-recorded reply owed a resend after restart. Both travel the
+/// per-chat FIFO so a resend keeps its chat's order — it delivers
+/// ahead of newer work for its own chat and never delays another's —
+/// while its deadline and policy waits run on a worker, off the
+/// startup path.
+enum Scheduled {
+    Message(Box<InboundMessage>),
+    /// A recorded reply restart recovery re-queues: the worker waits
+    /// its persisted deadline, resumes at the checkpoint and settles
+    /// the record on delivery.
+    Resend {
+        task: Box<crate::binding::PendingUpdate>,
+        reply: String,
+    },
+}
+
 struct SchedulerState {
-    per_chat: HashMap<i64, VecDeque<InboundMessage>>,
+    per_chat: HashMap<i64, VecDeque<Scheduled>>,
     ready: VecDeque<i64>,
     queued: HashSet<i64>,
     inflight: HashSet<i64>,
@@ -137,6 +156,11 @@ struct Scheduler {
     wake: Condvar,
     stop: Arc<AtomicBool>,
     max_admitted: usize,
+    /// Test-only: the worker index whose spawn must fail, so the
+    /// partial-startup cleanup can be exercised deterministically.
+    /// `usize::MAX` means every spawn runs normally.
+    #[cfg(test)]
+    fail_spawn_at: AtomicUsize,
 }
 
 impl Scheduler {
@@ -146,7 +170,14 @@ impl Scheduler {
             wake: Condvar::new(),
             stop,
             max_admitted,
+            #[cfg(test)]
+            fail_spawn_at: AtomicUsize::new(usize::MAX),
         }
+    }
+
+    #[cfg(test)]
+    fn fail_spawn_at_for_test(&self, index: usize) {
+        self.fail_spawn_at.store(index, Ordering::SeqCst);
     }
 
     /// Block until admission capacity is available or `stop` is raised.
@@ -198,14 +229,13 @@ impl Scheduler {
         self.state.lock().unwrap().admitted
     }
 
-    fn enqueue(&self, message: InboundMessage) {
+    fn enqueue(&self, job: Scheduled) {
         let mut state = self.state.lock().unwrap();
-        let chat_id = message.chat_id;
-        state
-            .per_chat
-            .entry(chat_id)
-            .or_default()
-            .push_back(message);
+        let chat_id = match &job {
+            Scheduled::Message(message) => message.chat_id,
+            Scheduled::Resend { task, .. } => task.message.chat_id,
+        };
+        state.per_chat.entry(chat_id).or_default().push_back(job);
         state.admitted += 1;
         if !state.queued.contains(&chat_id) && !state.inflight.contains(&chat_id) {
             state.ready.push_back(chat_id);
@@ -214,25 +244,49 @@ impl Scheduler {
         self.wake.notify_one();
     }
 
+    /// Spawn the worker pool, reporting processor failures through
+    /// `failures` — the first error a worker surfaces is the one the
+    /// supervising loop returns. If a later thread fails to spawn, the
+    /// workers already started are shut down, drained and joined
+    /// before the spawn error returns: returning bare would drop the
+    /// handles and leave those workers parked on a scheduler whose
+    /// queue is never marked drained.
     fn spawn_workers<F>(
         self: &Arc<Self>,
         worker_count: usize,
         processor: F,
+        failures: Arc<Mutex<Option<anyhow::Error>>>,
     ) -> Result<Vec<thread::JoinHandle<()>>>
     where
-        F: Fn(i64, InboundMessage) -> Result<()> + Send + Sync + 'static,
+        F: Fn(i64, Scheduled) -> Result<()> + Send + Sync + 'static,
     {
         let processor = Arc::new(processor);
         let mut handles = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let scheduler = Arc::clone(self);
             let processor = Arc::clone(&processor);
-            handles.push(
-                thread::Builder::new()
-                    .name(format!("a4mc-telegram-worker-{index}"))
-                    .spawn(move || worker_loop(scheduler, processor))
-                    .map_err(|_| anyhow!("a4mc_telegram_runtime_spawn_failed"))?,
-            );
+            let failures = Arc::clone(&failures);
+            let builder = thread::Builder::new().name(format!("a4mc-telegram-worker-{index}"));
+            #[cfg(test)]
+            let builder = if self.fail_spawn_at.load(Ordering::SeqCst) == index {
+                // An impossible stack reservation fails the spawn the
+                // same way an exhausted thread budget does.
+                builder.stack_size(usize::MAX)
+            } else {
+                builder
+            };
+            let spawned = builder.spawn(move || worker_loop(scheduler, processor, failures));
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(_) => {
+                    self.shutdown();
+                    self.mark_drained();
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    return Err(anyhow!("a4mc_telegram_runtime_spawn_failed"));
+                }
+            }
         }
         Ok(handles)
     }
@@ -247,17 +301,20 @@ impl Scheduler {
     }
 }
 
-fn worker_loop<F>(scheduler: Arc<Scheduler>, processor: Arc<F>)
-where
-    F: Fn(i64, InboundMessage) -> Result<()> + Send + Sync + 'static,
+fn worker_loop<F>(
+    scheduler: Arc<Scheduler>,
+    processor: Arc<F>,
+    failures: Arc<Mutex<Option<anyhow::Error>>>,
+) where
+    F: Fn(i64, Scheduled) -> Result<()> + Send + Sync + 'static,
 {
     loop {
-        let (chat_id, message) = {
+        let (chat_id, job) = {
             let mut state = scheduler.state.lock().unwrap();
             loop {
                 if let Some(chat_id) = state.ready.pop_front() {
                     state.queued.remove(&chat_id);
-                    let message = state
+                    let job = state
                         .per_chat
                         .get_mut(&chat_id)
                         .expect("ready chats have a queued job")
@@ -267,7 +324,7 @@ where
                         state.per_chat.remove(&chat_id);
                     }
                     state.inflight.insert(chat_id);
-                    break (chat_id, message);
+                    break (chat_id, job);
                 }
                 if state.drained {
                     return;
@@ -275,7 +332,14 @@ where
                 state = scheduler.wake.wait(state).unwrap();
             }
         };
-        let _ = processor(chat_id, message);
+        // A processor failure is a persistence failure the task's
+        // durable record survived: record the first one for the
+        // supervising loop and raise stop so the run drains and exits
+        // instead of continuing on a store that cannot take writes.
+        if let Err(error) = processor(chat_id, job) {
+            failures.lock().unwrap().get_or_insert(error);
+            scheduler.shutdown();
+        }
         let mut state = scheduler.state.lock().unwrap();
         state.inflight.remove(&chat_id);
         state.admitted -= 1;
@@ -293,7 +357,7 @@ where
 
 pub fn run_channel_loop<T: BotTransport + 'static>(
     transport: T,
-    store: BindingStore,
+    mut store: BindingStore,
     config: RuntimeConfig,
 ) -> Result<BotIdentity> {
     let transport = Arc::new(transport);
@@ -328,6 +392,10 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         offset: 0,
     };
     cursor.offset = if cursor.sequence_age.elapsed() >= config.poll_sequence_idle {
+        // The settled-id tail belongs to the dead sequence: a
+        // restarted one may lawfully reuse its ids, so it is retired
+        // before the new sequence's first poll.
+        store.retire_settled()?;
         0
     } else {
         store.poll_offset()
@@ -352,40 +420,102 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     // ordinary processing is surfaced exactly like one found at
     // restart.
     let on_stuck = Arc::new(Mutex::new(config.on_stuck.take()));
+    // The first persistence failure a worker surfaces — its durable
+    // task record is retained either way — is the error the
+    // supervising loop returns after the drain.
+    let worker_failure = Arc::new(Mutex::new(None::<anyhow::Error>));
     let processor_channel = Arc::clone(&channel);
     let processor_store = Arc::clone(&store);
     let processor_identity = identity.clone();
     let processor_stop = Arc::clone(&config.stop);
     let processor_stuck = Arc::clone(&on_stuck);
     let turn_deadline = config.turn_deadline;
-    let processor = move |chat_id: i64, message: InboundMessage| {
-        let update_id = message.update_id;
-        match handle_inbound(
-            &processor_channel,
-            &processor_store,
-            &processor_identity,
-            &message,
-            turn_deadline,
-            &processor_stop,
-        ) {
-            Ok(()) => {
-                let _ = processor_store.lock().unwrap().complete_update(update_id);
-                Ok(())
+    let processor = move |chat_id: i64, job: Scheduled| -> Result<()> {
+        match job {
+            Scheduled::Resend { task, reply } => {
+                // Reload the durable record: a queued wait may span
+                // another attempt's writes — retrying the stale
+                // snapshot would repost confirmed work or skip a
+                // deadline the platform just imposed.
+                let task = processor_store
+                    .lock()
+                    .unwrap()
+                    .pending_update(task.update_id)
+                    .unwrap_or(*task);
+                // One clock reading decides both whether a wait is owed
+                // and how long it lasts — a second read between them can
+                // never shorten the deadline's tail into a negative
+                // wait. Shutdown cutting the wait keeps the record and
+                // its deadline for the next restart.
+                let now = now_millis();
+                if let Some(deadline) = task.reply_retry_at_ms.filter(|at| *at > now)
+                    && !wait_or_stop(Duration::from_millis(deadline - now), &processor_stop)
+                {
+                    return Ok(());
+                }
+                let key = task
+                    .reply_key
+                    .clone()
+                    .unwrap_or_else(|| reply_key(task.update_id, "reply"));
+                match deliver_recorded_reply(
+                    &processor_channel,
+                    &processor_store,
+                    task.message.chat_id,
+                    task.message.message_id,
+                    task.update_id,
+                    &key,
+                    &reply,
+                    task.reply_sent,
+                    task.reply_progress.clone(),
+                    true,
+                    &processor_stop,
+                ) {
+                    Ok(()) => processor_store
+                        .lock()
+                        .unwrap()
+                        .complete_update(task.update_id),
+                    Err(error) if is_interrupted_send_wait(&error) => Ok(()),
+                    // A delivery failure keeps its record — and the
+                    // checkpoint it earned — for the next restart's
+                    // resend; the host is told. A persistence failure
+                    // is routed to the supervising loop.
+                    Err(error) => {
+                        notify_stuck(&processor_stuck, task.update_id, &failure_code(&error));
+                        if is_store_write_failure(&error) {
+                            Err(error)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
             }
-            // A reply the host's send policy was still holding when
-            // shutdown cut the wait short is not a handler failure: no
-            // error reply goes out around the policy, and the
-            // unfinished task record stays for the restart drain.
-            Err(error) if is_interrupted_send_wait(&error) => Ok(()),
-            Err(error) => handle_failed_inbound(
-                &processor_channel,
-                &processor_store,
-                &processor_stuck,
-                chat_id,
-                &message,
-                &error,
-                &processor_stop,
-            ),
+            Scheduled::Message(message) => {
+                let update_id = message.update_id;
+                match handle_inbound(
+                    &processor_channel,
+                    &processor_store,
+                    &processor_identity,
+                    &message,
+                    turn_deadline,
+                    &processor_stop,
+                ) {
+                    Ok(()) => processor_store.lock().unwrap().complete_update(update_id),
+                    // A reply the host's send policy was still holding when
+                    // shutdown cut the wait short is not a handler failure: no
+                    // error reply goes out around the policy, and the
+                    // unfinished task record stays for the restart drain.
+                    Err(error) if is_interrupted_send_wait(&error) => Ok(()),
+                    Err(error) => handle_failed_inbound(
+                        &processor_channel,
+                        &processor_store,
+                        &processor_stuck,
+                        chat_id,
+                        &message,
+                        &error,
+                        &processor_stop,
+                    ),
+                }
+            }
         }
     };
 
@@ -429,10 +559,10 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     // binding's session is already committed — a turn's session change
     // lands in the same store write as its reply record — so recovery
     // only re-delivers; it never re-applies a superseded routing
-    // change. A resend the host's policy is holding retries after the
-    // store lock drops — parking on its deferral window under the lock
-    // would stall every worker's store access.
-    let mut held: Vec<(crate::binding::PendingUpdate, String)> = Vec::new();
+    // change. A recorded reply owed a resend is queued as scheduler
+    // work itself — its deadline and policy waits run on a worker, so
+    // a reply the host keeps deferring holds only its own chat's FIFO
+    // and one admission slot, never all of ingress.
     let unfinished = store.lock().unwrap().pending_updates();
     for task in unfinished {
         if staged.contains(&task.update_id) {
@@ -455,94 +585,16 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 continue;
             }
         };
-        // The resend repeats the delivery key the first attempt
-        // carried and resumes at the persisted checkpoint — the
-        // confirmed prefix is never reposted and a part whose outcome
-        // is uncertain is refused rather than duplicated. Records
-        // that predate the fields derive the ordinary reply key and a
-        // cold start.
-        let key = task
-            .reply_key
-            .clone()
-            .unwrap_or_else(|| reply_key(task.update_id, "reply"));
-        // A persisted retry deadline survives the restart: hold the
-        // resend for the off-lock wait below instead of reposting a
-        // throttled send at once.
-        if task.reply_retry_at_ms.is_some_and(|at| at > now_millis()) {
-            held.push((task, reply));
-            continue;
-        }
-        match deliver_recorded_reply(
-            &channel,
-            &store,
-            task.message.chat_id,
-            task.message.message_id,
-            task.update_id,
-            &key,
-            &reply,
-            task.reply_sent,
-            task.reply_progress.clone(),
-            false,
-            &config.stop,
-        ) {
-            Ok(()) => {
-                let _ = store.lock().unwrap().complete_update(task.update_id);
-            }
-            // A policy hold parks the remainder for the off-lock wait
-            // below; a rejection surfaces to the host while the record
-            // — and the checkpoint it earned — stays for the next
-            // restart's resend.
-            Err(error) if is_interrupted_send_wait(&error) => held.push((task, reply)),
-            Err(error) => notify_stuck(&on_stuck, task.update_id, &failure_code(&error)),
-        }
-    }
-    for (task, reply) in held {
-        // Reload the durable record: a first-pass attempt may have
-        // confirmed more parts or left a later wait — retrying the
-        // stale snapshot would repost confirmed work or skip a
-        // deadline the platform just imposed.
-        let task = store
-            .lock()
-            .unwrap()
-            .pending_update(task.update_id)
-            .unwrap_or(task);
-        // One clock reading decides both whether a wait is owed and
-        // how long it lasts — a second read between them can never
-        // shorten the deadline's tail into a negative wait.
-        let now = now_millis();
-        if let Some(deadline) = task.reply_retry_at_ms.filter(|at| *at > now)
-            && !wait_or_stop(Duration::from_millis(deadline - now), &config.stop)
-        {
-            continue;
-        }
-        let key = task
-            .reply_key
-            .clone()
-            .unwrap_or_else(|| reply_key(task.update_id, "reply"));
-        match deliver_recorded_reply(
-            &channel,
-            &store,
-            task.message.chat_id,
-            task.message.message_id,
-            task.update_id,
-            &key,
-            &reply,
-            task.reply_sent,
-            task.reply_progress.clone(),
-            true,
-            &config.stop,
-        ) {
-            Ok(()) => {
-                let _ = store.lock().unwrap().complete_update(task.update_id);
-            }
-            Err(error) if is_interrupted_send_wait(&error) => {}
-            Err(error) => notify_stuck(&on_stuck, task.update_id, &failure_code(&error)),
-        }
+        scheduler.enqueue(Scheduled::Resend {
+            task: Box::new(task),
+            reply,
+        });
     }
     // Workers spawn only after every recovery write has run: a
     // recovery failure that returns early can never strand spawned
     // workers without shutdown and join.
-    let workers = scheduler.spawn_workers(config.worker_count, processor)?;
+    let workers =
+        scheduler.spawn_workers(config.worker_count, processor, Arc::clone(&worker_failure))?;
     let mut on_event = config.on_event.take();
     let poll_result = poll_updates(
         &*transport,
@@ -564,6 +616,9 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     drain_pending(&scheduler, &mut pending);
     scheduler.mark_drained();
     scheduler.join_workers(workers)?;
+    if let Some(error) = worker_failure.lock().unwrap().take() {
+        return Err(error);
+    }
     poll_result?;
     Ok(identity)
 }
@@ -755,6 +810,11 @@ fn poll_updates<T: BotTransport>(
             // while passing the stale offset would acknowledge the new
             // sequence's lower first ids unseen.
             if cursor.sequence_age.elapsed() >= config.poll_sequence_idle {
+                // The settled-id tail belongs to the dead sequence and
+                // is retired with it — a restarted one may lawfully
+                // reuse those ids, and keeping the tail would suppress
+                // fresh work as already-settled.
+                store.lock().unwrap().retire_settled()?;
                 cursor.offset = 0;
                 cursor.sequence_age.reset();
             }
@@ -867,25 +927,26 @@ fn poll_updates<T: BotTransport>(
                 // unadmitted update stays unconfirmed and is refetched
                 // once the backlog drains.
                 let mut committed = admit_batch_prefix(store, &updates, &records, next_offset)?;
-                // A worker can free store capacity and drain between
-                // the failed probe and the scheduler check below —
-                // retry the admit once after observing an empty
-                // backlog, so a stale capacity answer never spends the
-                // permanent-failure budget on an update that fits
-                // again.
-                if committed == 0 && scheduler.admitted() == 0 && pending.is_empty() {
-                    committed = admit_batch_prefix(store, &updates, &records, next_offset)?;
-                }
                 if committed == 0 {
-                    // Nothing of this batch fits the store right now.
-                    // While workers or the dispatch backlog still hold
-                    // records, their completion frees the capacity the
-                    // store lacks — temporary pressure waits for the
-                    // backlog to drain instead of spending the
-                    // permanent-failure budget, which is reserved for
-                    // an update that cannot fit once nothing is left
-                    // to drain.
-                    if scheduler.admitted() > 0 || !pending.is_empty() {
+                    // One drained observation controls both decisions:
+                    // a worker can free store capacity between the
+                    // failed probe and the backlog check — capture the
+                    // state once, retry the admit on it, and charge the
+                    // permanent-failure budget only when that same
+                    // drained store still refuses.
+                    let drained = scheduler.admitted() == 0 && pending.is_empty();
+                    if drained {
+                        committed = admit_batch_prefix(store, &updates, &records, next_offset)?;
+                    }
+                    if committed == 0 && !drained {
+                        // Nothing of this batch fits while workers or
+                        // the dispatch backlog still hold records —
+                        // their completion frees the capacity the store
+                        // lacks. Temporary pressure waits for the
+                        // backlog to drain instead of spending the
+                        // permanent-failure budget, which is reserved
+                        // for an update that cannot fit once nothing is
+                        // left to drain.
                         let waited = if scheduler.admitted() >= scheduler.max_admitted
                             || !pending.is_empty()
                         {
@@ -898,31 +959,36 @@ fn poll_updates<T: BotTransport>(
                         }
                         continue;
                     }
-                    // Not a transport failure — admission failures are
-                    // counted independently so a fetch succeeding does
-                    // not reset the budget an update that can never fit
-                    // burns through: the first unconfirmed id is
-                    // surfaced instead of polling it forever, while a
-                    // merely-full backlog still drains between polls.
-                    admission_failures += 1;
-                    if admission_failures >= config.max_poll_failures.max(1) {
-                        return Err(anyhow!(
-                            "a4mc_telegram_poll_failed: update {} never fits the bounded store (a4mc_telegram_state_full)",
-                            updates[0].update_id
-                        ));
+                    if committed == 0 {
+                        // The drained store still refuses the first
+                        // update — permanent accounting. Not a
+                        // transport failure: the budget is counted
+                        // independently so a fetch succeeding does not
+                        // reset what an update that can never fit burns
+                        // through — the first unconfirmed id is
+                        // surfaced instead of polling it forever.
+                        admission_failures += 1;
+                        if admission_failures >= config.max_poll_failures.max(1) {
+                            return Err(anyhow!(
+                                "a4mc_telegram_poll_failed: update {} never fits the bounded store (a4mc_telegram_state_full)",
+                                updates[0].update_id
+                            ));
+                        }
+                        if !wait_or_stop(retry_wait(admission_failures, None), &config.stop) {
+                            break;
+                        }
+                        continue;
                     }
-                    if !wait_or_stop(retry_wait(admission_failures, None), &config.stop) {
-                        break;
-                    }
-                    continue;
                 }
                 admission_failures = 0;
-                cursor.offset = if committed == records.len() {
+                // The batch boundary this commit earns: the whole
+                // batch, or the first update the prefix left
+                // unconfirmed.
+                let batch_offset = if committed == records.len() {
                     next_offset
                 } else {
                     updates[committed].update_id
                 };
-                cursor.sequence_age.reset();
                 pending.extend(
                     records[..committed]
                         .iter()
@@ -935,15 +1001,18 @@ fn poll_updates<T: BotTransport>(
                 // records the store just durably confirmed reach the
                 // hook, so routine capacity backpressure cannot replay
                 // a callback for an update still in the uncommitted
-                // suffix. A consumed event settles its pending marker.
-                // A rejection keeps the hook's contract — the cursor
-                // stays before the event, so a restart refetches and
-                // redelivers it instead of acknowledging it unseen:
-                // the durable cursor rolls back, the marker stays
-                // pending for the redelivery, and confirmed work the
+                // suffix. The durable cursor never passes an
+                // unhandled event before its callback accepts it —
+                // `admit_batch` capped the commit at the first event's
+                // id — so each consumed event settles its marker and
+                // earns the next boundary (the next event's id, or the
+                // batch edge) in one atomic write, and a rejection
+                // needs no rollback: the event was never confirmed, so
+                // a restart refetches and redelivers it instead of
+                // recording it dropped unseen. Confirmed work the
                 // refetch names is reclaimed by record — settled and
                 // still-pending ids are skipped, never re-run.
-                for record in &records[..committed] {
+                for (index, record) in records[..committed].iter().enumerate() {
                     let BatchRecord::Event {
                         update_id, event, ..
                     } = record
@@ -955,14 +1024,26 @@ fn poll_updates<T: BotTransport>(
                     };
                     match hook(event) {
                         Ok(()) => {
-                            store.lock().unwrap().settle_event(*update_id)?;
+                            let boundary = records[..committed]
+                                .iter()
+                                .skip(index + 1)
+                                .find_map(|record| match record {
+                                    BatchRecord::Event { update_id, .. } => Some(*update_id),
+                                    _ => None,
+                                })
+                                .unwrap_or(batch_offset);
+                            store
+                                .lock()
+                                .unwrap()
+                                .settle_event_at_cursor(*update_id, boundary)?;
                         }
                         Err(error) => {
-                            store.lock().unwrap().set_poll_offset(*update_id)?;
                             return Err(anyhow!("a4mc_telegram_unhandled_event: {error}"));
                         }
                     }
                 }
+                cursor.offset = batch_offset;
+                cursor.sequence_age.reset();
             }
         }
         admit_available(scheduler, pending);
@@ -1004,9 +1085,12 @@ fn is_store_capacity(error: &anyhow::Error) -> bool {
 /// One durable admit write for a batch prefix: the records of
 /// `updates[..records.len()]` commit with the cursor confirmed at
 /// `offset` — tasks, dropped-update records, and a pending record for
-/// each event whose host callback has not run yet, so a crash between
-/// cursor commit and callback leaves the event settled as dropped on
-/// restart rather than lost.
+/// each event whose host callback has not run yet. An event's marker
+/// commits with the cursor capped at its own id: the cursor must
+/// never confirm an event the callback has not accepted, so a crash —
+/// or a refused callback — leaves it refetchable instead of recorded
+/// dropped unseen. Each consumed event then advances the cursor to
+/// the next boundary in the same write that settles its marker.
 fn admit_batch(store: &Mutex<BindingStore>, records: &[BatchRecord], offset: i64) -> Result<()> {
     let mut tasks = Vec::new();
     let mut dropped = Vec::new();
@@ -1026,6 +1110,13 @@ fn admit_batch(store: &Mutex<BindingStore>, records: &[BatchRecord], offset: i64
             BatchRecord::Skip => {}
         }
     }
+    // The durable cursor stops at the first event awaiting its
+    // callback — it is confirmed only when the callback accepts it,
+    // settled and advanced in one write.
+    let offset = events
+        .first()
+        .map(|event| event.update_id)
+        .unwrap_or(offset);
     store
         .lock()
         .unwrap()
@@ -1125,7 +1216,7 @@ fn admit_available(scheduler: &Scheduler, pending: &mut VecDeque<InboundMessage>
         let Some(message) = pending.pop_front() else {
             break;
         };
-        scheduler.enqueue(message);
+        scheduler.enqueue(Scheduled::Message(Box::new(message)));
     }
 }
 
@@ -1244,6 +1335,28 @@ fn is_interrupted_send_wait(error: &anyhow::Error) -> bool {
             | Some("a4mc_outbound_throttled")
             | Some("a4mc_telegram_throttled")
             | Some("a4mc_telegram_connect_failed")
+    )
+}
+
+/// Whether a resend failure came out of the durable store rather than
+/// the delivery path: a persistence write failing means the store
+/// cannot take writes — the run drains and reports it instead of
+/// treating it like a refused send the record can simply wait out.
+fn is_store_write_failure(error: &anyhow::Error) -> bool {
+    matches!(
+        error.to_string().split(':').next().map(str::trim),
+        Some(
+            "a4mc_telegram_checkpoint_failed"
+                | "a4mc_telegram_state_write_failed"
+                | "a4mc_telegram_state_full"
+                | "a4mc_telegram_pending_updates_full"
+                | "a4mc_telegram_reply_lost"
+                | "a4mc_telegram_reply_too_large"
+                | "a4mc_telegram_staged_invalid"
+                | "a4mc_telegram_bindings_lock_failed"
+                | "a4mc_telegram_bindings_invalid"
+                | "a4mc_telegram_bindings_schema"
+        )
     )
 }
 
@@ -1563,16 +1676,28 @@ fn handle_command<T: BotTransport>(
             ensure_known_agent(&agent_id).map_err(|error| anyhow!(error.to_string()))?;
             // The rebind and its confirmation commit in one write, so
             // recovery only ever resumes delivery — it never re-runs
-            // the bind or re-sends a different confirmation.
-            let confirmation = format!(
-                "Bound agent: {agent_id}.\nSession cleared. Use /session or /new, then send a message."
-            );
-            store.lock().unwrap().record_reply_and_agent(
+            // the bind or re-sends a different confirmation. The
+            // confirmation reports what the guarded mutation actually
+            // did: a pairing or binding that moved while the command
+            // ran gets an honest reply, not a success claim.
+            let expected = store_binding(store, message.chat_id)?;
+            let confirmation = store.lock().unwrap().record_reply_and_agent(
                 message.chat_id,
                 message.update_id,
-                agent_id,
-                &confirmation,
+                agent_id.clone(),
                 &reply_key(message.update_id, "reply"),
+                message.user_id,
+                expected.as_ref(),
+                |applied| {
+                    if applied {
+                        format!(
+                            "Bound agent: {agent_id}.\nSession cleared. Use /session or /new, then send a message."
+                        )
+                    } else {
+                        "The chat's pairing moved while the command ran — the agent was not changed."
+                            .to_owned()
+                    }
+                },
             )?;
             deliver_recorded_reply(
                 channel,
@@ -1621,15 +1746,23 @@ fn handle_command<T: BotTransport>(
             // write — the same rule /new follows — so a restart only
             // ever resumes delivery, never re-opens the selector. The
             // session lands only while the binding the command ran
-            // under still holds.
-            let confirmation = format!("Bound session: {session_id}");
-            store_record_reply_and_session(
+            // under still holds, and the confirmation reports what the
+            // guarded mutation actually did — a binding that moved on
+            // gets an honest reply, not a success claim.
+            let confirmation = store_record_reply_and_session(
                 store,
                 message.chat_id,
                 message.update_id,
-                &confirmation,
-                Some(session_id),
+                Some(session_id.clone()),
                 &binding,
+                |applied| {
+                    if applied {
+                        format!("Bound session: {session_id}")
+                    } else {
+                        "The chat's binding moved while the command ran — the session was not changed."
+                            .to_owned()
+                    }
+                },
             )?;
             deliver_recorded_reply(
                 channel,
@@ -1665,18 +1798,27 @@ fn handle_command<T: BotTransport>(
             // them leave the committed session on an unfinished task,
             // so restart re-ran the command and opened a second
             // conversation — the single write means recovery only ever
-            // resumes delivery of this reply.
-            store_record_reply_and_session(
+            // resumes delivery of this reply. The confirmation reports
+            // what the guarded mutation actually did.
+            let session_id = if opened.is_empty() {
+                None
+            } else {
+                Some(opened.clone())
+            };
+            let confirmation = store_record_reply_and_session(
                 store,
                 message.chat_id,
                 message.update_id,
-                &confirmation,
-                if opened.is_empty() {
-                    None
-                } else {
-                    Some(opened.clone())
-                },
+                session_id,
                 &binding,
+                |applied| {
+                    if applied {
+                        confirmation.clone()
+                    } else {
+                        "The chat's binding moved while the command ran — the session was not changed."
+                            .to_owned()
+                    }
+                },
             )?;
             deliver_recorded_reply(
                 channel,
@@ -1830,13 +1972,16 @@ fn handle_ordinary<T: BotTransport>(
     if next_session.is_empty() || binding.session_id.as_deref() == Some(next_session.as_str()) {
         store_record_reply(store, message.update_id, &reply)?;
     } else {
+        // The reply is the turn's paid output — delivered verbatim
+        // whether or not the guarded session change still applies.
+        let reply_text = reply.clone();
         store_record_reply_and_session(
             store,
             message.chat_id,
             message.update_id,
-            &reply,
             Some(next_session),
             &binding,
+            move |_| reply_text,
         )?;
     }
     deliver_recorded_reply(
@@ -1905,22 +2050,23 @@ fn store_record_reply(store: &Mutex<BindingStore>, update_id: i64, reply: &str) 
 /// Commit a chat's session change and the finished reply record in one
 /// store mutation — see [`BindingStore::record_reply_and_session`].
 /// `expected` is the binding the caller ran under; the session lands
-/// only while it still matches.
+/// only while it still matches. `text` receives whether it did and
+/// produces the recorded reply; the recorded text is returned.
 fn store_record_reply_and_session(
     store: &Mutex<BindingStore>,
     chat_id: i64,
     update_id: i64,
-    reply: &str,
     session_id: Option<String>,
     expected: &ChatBinding,
-) -> Result<()> {
+    text: impl FnOnce(bool) -> String,
+) -> Result<String> {
     store.lock().unwrap().record_reply_and_session(
         chat_id,
         update_id,
-        reply,
         &reply_key(update_id, "reply"),
         session_id,
         expected,
+        text,
     )
 }
 
@@ -2592,7 +2738,10 @@ mod tests {
             let gate = Arc::clone(&gate);
             let chat_11_held = Arc::clone(&chat_11_held);
             let chat_11_blocked = Arc::clone(&chat_11_blocked);
-            move |chat_id: i64, message: InboundMessage| -> Result<()> {
+            move |chat_id: i64, job: Scheduled| -> Result<()> {
+                let Scheduled::Message(message) = job else {
+                    return Ok(());
+                };
                 records.lock().unwrap().push((
                     chat_id,
                     message.message_id,
@@ -2612,14 +2761,34 @@ mod tests {
                 Ok(())
             }
         };
-        let workers = scheduler.spawn_workers(4, processor).unwrap();
-        scheduler.enqueue(text_message(11, 1, Some("a"), "m1", 1));
-        scheduler.enqueue(text_message(11, 1, Some("a"), "m2", 2));
+        let workers = scheduler
+            .spawn_workers(4, processor, Arc::new(Mutex::new(None)))
+            .unwrap();
+        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
+            11,
+            1,
+            Some("a"),
+            "m1",
+            1,
+        ))));
+        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
+            11,
+            1,
+            Some("a"),
+            "m2",
+            2,
+        ))));
         wait_until(
             || chat_11_blocked.load(Ordering::SeqCst),
             Duration::from_secs(5),
         );
-        scheduler.enqueue(text_message(22, 2, Some("b"), "m3", 10));
+        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
+            22,
+            2,
+            Some("b"),
+            "m3",
+            10,
+        ))));
         wait_until(
             || {
                 records
@@ -2676,7 +2845,10 @@ mod tests {
         let processor = {
             let done = Arc::clone(&done);
             let gate = Arc::clone(&gate);
-            move |_chat_id: i64, message: InboundMessage| -> Result<()> {
+            move |_chat_id: i64, job: Scheduled| -> Result<()> {
+                let Scheduled::Message(message) = job else {
+                    return Ok(());
+                };
                 done.lock().unwrap().push(message.message_id);
                 let (mutex, condvar) = &*gate;
                 let mut released = mutex.lock().unwrap();
@@ -2686,9 +2858,15 @@ mod tests {
                 Ok(())
             }
         };
-        let workers = scheduler.spawn_workers(1, processor).unwrap();
-        scheduler.enqueue(text_message(1, 1, None, "a", 1));
-        scheduler.enqueue(text_message(2, 2, None, "b", 2));
+        let workers = scheduler
+            .spawn_workers(1, processor, Arc::new(Mutex::new(None)))
+            .unwrap();
+        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
+            1, 1, None, "a", 1,
+        ))));
+        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
+            2, 2, None, "b", 2,
+        ))));
         assert_eq!(scheduler.admitted(), 2);
 
         let returned = Arc::new(AtomicBool::new(false));
@@ -2714,7 +2892,9 @@ mod tests {
         waiter.join().unwrap();
         assert!(returned.load(Ordering::SeqCst));
 
-        scheduler.enqueue(text_message(3, 3, None, "c", 3));
+        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
+            3, 3, None, "c", 3,
+        ))));
         wait_until(|| done.lock().unwrap().len() == 3, Duration::from_secs(5));
         let mut processed = done.lock().unwrap().clone();
         processed.sort_unstable();
@@ -3685,7 +3865,9 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let scheduler = Arc::new(Scheduler::new(1, Arc::clone(&stop)));
         // Fill admission without workers so capacity never frees.
-        scheduler.enqueue(text_message(1, 1, None, "a", 1));
+        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
+            1, 1, None, "a", 1,
+        ))));
         let waiter = {
             let scheduler = Arc::clone(&scheduler);
             thread::spawn(move || scheduler.wait_for_capacity())
@@ -4115,13 +4297,20 @@ mod tests {
         let done = Arc::new(Mutex::new(Vec::<i64>::new()));
         let processor = {
             let done = Arc::clone(&done);
-            move |_chat_id: i64, message: InboundMessage| -> Result<()> {
+            move |_chat_id: i64, job: Scheduled| -> Result<()> {
+                let Scheduled::Message(message) = job else {
+                    return Ok(());
+                };
                 done.lock().unwrap().push(message.message_id);
                 Ok(())
             }
         };
-        let workers = scheduler.spawn_workers(1, processor).unwrap();
-        scheduler.enqueue(text_message(1, 1, None, "a", 1));
+        let workers = scheduler
+            .spawn_workers(1, processor, Arc::new(Mutex::new(None)))
+            .unwrap();
+        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
+            1, 1, None, "a", 1,
+        ))));
         scheduler.shutdown();
         // With `stop` already raised, workers could be gone before this
         // drain admits the fetched remainder: the second message would
@@ -4301,12 +4490,17 @@ mod tests {
             stop: Arc::clone(&stop),
             ..RuntimeConfig::default()
         };
-        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
         // Joining is the barrier: whether the worker processed the
         // update during the run or while the shutdown drain feeds it
         // queued work, the record write was attempted before exit.
         stop.store(true, Ordering::SeqCst);
-        handle.join().unwrap();
+        let error = handle.join().unwrap().unwrap_err();
+        assert_eq!(
+            error.to_string().split(':').next().map(str::trim),
+            Some("a4mc_telegram_state_write_failed"),
+            "the worker's persistence failure did not reach the caller: {error}"
+        );
 
         let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
         assert_eq!(
@@ -5775,5 +5969,203 @@ mod tests {
             "the refetched update was never admitted"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_expired_sequence_retires_the_settled_tail() {
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            // A task durably claimed and settled in the old sequence:
+            // its id joins the tail that suppresses refetches.
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 7,
+                        message: text_message(42, 42, Some("alice"), "/whoami", 7),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                    }],
+                    &[],
+                    &[],
+                    8,
+                )
+                .unwrap();
+            store.complete_update(7).unwrap();
+            store.age_poll_offset_for_test(8 * 24 * 60 * 60).unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        // The restarted sequence lawfully reuses id 7 for a fresh
+        // message: the dead sequence's settled tail must not suppress
+        // it as already-handled.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 7,
+                message: Some(text_message(88, 88, Some("zoe"), "/whoami", 7)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(|| !sent.lock().unwrap().is_empty(), Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+
+        let messages = sent.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].0, 88,
+            "the reused id was suppressed: {messages:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A host policy that holds sends under one idempotency key while
+    /// letting every other send through — a held resend can be proven
+    /// to block only its own lane.
+    struct HoldKeyHooks {
+        held_key: &'static str,
+        attempts: AtomicUsize,
+    }
+
+    impl a4mc::OutboundHooks for HoldKeyHooks {
+        fn throttle(
+            &self,
+            _: &a4mc::SendContext,
+            message: &a4mc::OutboundMessage,
+        ) -> a4mc::ThrottleDecision {
+            if message.idempotency_key == self.held_key {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                return a4mc::ThrottleDecision::defer(
+                    "fixture hold",
+                    Some(Duration::from_millis(50)),
+                );
+            }
+            a4mc::ThrottleDecision::Allow
+        }
+    }
+
+    #[test]
+    fn a_held_recovered_reply_holds_only_its_own_chat() {
+        let root = temp_root();
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            // A finished reply owed a resend: recovery schedules it as
+            // worker work rather than waiting it out inline.
+            store
+                .admit_updates(
+                    &[crate::binding::PendingUpdate {
+                        update_id: 2,
+                        message: text_message(42, 42, Some("alice"), "hello agent", 2),
+                        reply: Some("stuck reply".to_owned()),
+                        reply_key: Some("reply:2".to_owned()),
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                    }],
+                    &[],
+                    &[],
+                    3,
+                )
+                .unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        // The resend's key is held by host policy forever; an unrelated
+        // chat's /whoami still has to reach a worker and deliver.
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 9,
+                message: Some(text_message(88, 88, Some("zoe"), "/whoami", 9)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let hooks = Arc::new(HoldKeyHooks {
+            held_key: "reply:2",
+            attempts: AtomicUsize::new(0),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            outbound_hooks: Some(hooks.clone()),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(
+            || sent.lock().unwrap().iter().any(|(chat, _)| *chat == 88),
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+
+        assert!(
+            hooks.attempts.load(Ordering::SeqCst) > 0,
+            "the resend was never attempted"
+        );
+        assert!(
+            !sent.lock().unwrap().iter().any(|(chat, _)| *chat == 42),
+            "the held reply was delivered around the policy"
+        );
+        let tasks = BindingStore::open_in(&root).unwrap().pending_updates();
+        assert!(
+            tasks.iter().any(|task| task.update_id == 2),
+            "the held reply's durable record was dropped: {tasks:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_partial_worker_spawn_failure_shuts_down_and_joins_the_started_workers() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler = Arc::new(Scheduler::new(4, Arc::clone(&stop)));
+        // The third spawn fails; the two workers already started must
+        // be shut down and joined rather than dropped still parked.
+        scheduler.fail_spawn_at_for_test(2);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let processor = {
+            let ran = Arc::clone(&ran);
+            move |_chat_id: i64, _job: Scheduled| -> Result<()> {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let error = scheduler
+            .spawn_workers(4, processor, Arc::new(Mutex::new(None)))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "a4mc_telegram_runtime_spawn_failed",
+            "unexpected error: {error}"
+        );
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "the spawn failure did not raise shutdown"
+        );
+        // Work enqueued after the failure can never be picked up: the
+        // workers that survived the partial spawn are gone — had their
+        // handles been dropped parked, this job would still run.
+        scheduler.enqueue(Scheduled::Message(Box::new(text_message(
+            1, 1, None, "a", 1,
+        ))));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "a worker survived the failed spawn"
+        );
     }
 }

@@ -613,12 +613,19 @@ impl GatewaySession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayConfig {
     pub intents: u64,
+    /// How long a connection may stay silent before its first `HELLO`:
+    /// heartbeat deadlines do not exist until the server advertises an
+    /// interval, so the handshake carries its own — a peer that opens
+    /// the socket and never speaks is reconnected rather than looping
+    /// read timeouts on the same dead connection.
+    pub hello_deadline: Duration,
 }
 
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             intents: DEFAULT_INTENTS,
+            hello_deadline: Duration::from_secs(30),
         }
     }
 }
@@ -764,6 +771,11 @@ fn session_loop(
     let mut next_heartbeat: Option<Instant> = None;
     let mut ack_due: Option<Instant> = None;
     let mut hello_seen = false;
+    // `HELLO` is the first frame a healthy connection sends, but until
+    // it arrives neither heartbeat deadline exists to bound the read —
+    // the handshake carries its own monotonic deadline so a silent
+    // peer reconnects instead of looping timeouts forever.
+    let mut hello_due = Some(Instant::now() + config.hello_deadline);
     // Frames received advance this local cursor for heartbeats and
     // duplicate detection. `session.sequence` only advances after the
     // host handler accepts a dispatch.
@@ -805,6 +817,9 @@ fn session_loop(
         // frames must not postpone a scheduled heartbeat or mask a
         // missing acknowledgement.
         let now = Instant::now();
+        if hello_due.is_some_and(|due| now >= due) {
+            return Ok(SessionOutcome::Reconnect);
+        }
         if ack_due.is_some_and(|due| now >= due) {
             return Ok(SessionOutcome::Reconnect);
         }
@@ -815,7 +830,7 @@ fn session_loop(
             ack_due = Some(now + heartbeat_interval);
         }
         let now = Instant::now();
-        let timeout = [next_heartbeat, ack_due]
+        let timeout = [next_heartbeat, ack_due, hello_due]
             .into_iter()
             .flatten()
             .map(|at| {
@@ -847,6 +862,9 @@ fn session_loop(
                 // the server stopped acknowledging heartbeats: a
                 // zombie connection is reconnected, not fed more
                 // heartbeats.
+                if hello_due.is_some_and(|due| Instant::now() >= due) {
+                    return Ok(SessionOutcome::Reconnect);
+                }
                 let ack_fired =
                     ack_due.is_some_and(|due| next_heartbeat.is_none_or(|at| due <= at));
                 if ack_fired {
@@ -873,6 +891,7 @@ fn session_loop(
                             continue;
                         }
                         hello_seen = true;
+                        hello_due = None;
                         let millis = payload
                             .data
                             .get("heartbeat_interval")
@@ -1072,6 +1091,7 @@ pub fn run_gateway(
 ) -> Result<(), DiscordApiError> {
     let session_config = GatewayConfig {
         intents: config.intents,
+        ..GatewayConfig::default()
     };
     let mut session = GatewaySession::default();
     let mut sessions = 0usize;
@@ -1372,6 +1392,42 @@ mod tests {
         assert_eq!(sent[0]["d"]["intents"], json!(DEFAULT_INTENTS));
         assert_eq!(sent[1]["op"], json!(OP_HEARTBEAT));
         assert_eq!(sent[1]["d"], Value::Null);
+    }
+
+    #[test]
+    fn a_connection_silent_before_hello_reconnects_on_the_handshake_deadline() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        // The socket answers every read with a timeout and never sends
+        // HELLO — before it, no heartbeat deadline exists to trip, so
+        // only the handshake deadline can end the session.
+        let mut connection = ScriptedConnection::new(
+            std::iter::repeat_n(GatewayRead::Timeout, 1_000),
+            Arc::clone(&sent),
+        );
+        connection.read_delay = Duration::from_millis(5);
+        let mut handler = RecordingHandler::default();
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let outcome = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig {
+                hello_deadline: Duration::from_millis(30),
+                ..GatewayConfig::default()
+            },
+            &stop,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, SessionOutcome::Reconnect);
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a pre-HELLO connection sent protocol traffic"
+        );
     }
 
     #[test]
