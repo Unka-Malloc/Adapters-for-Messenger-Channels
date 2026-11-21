@@ -54,8 +54,8 @@ pub use channel::{CHANNEL, SlackChannel, client_msg_id, descriptor};
 pub use lower::{lower_event, lower_update};
 pub use socket::{
     LiveSocketConnector, SeenEnvelopes, SessionOutcome, SocketConnection, SocketConnector,
-    SocketEnvelope, SocketFrame, SocketHandler, SocketModeConfig, ack_frame, run_socket_mode,
-    run_socket_session,
+    SocketEnvelope, SocketFrame, SocketHandler, SocketModeConfig, SocketRead, ack_frame,
+    run_socket_mode, run_socket_session,
 };
 pub use transport::{
     LiveSlackApi, MockSlackApi, PostMessageRequest, PostedMessage, SlackApi, SlackApiError,

@@ -57,9 +57,21 @@ pub const INTENT_GUILD_MESSAGE_REACTIONS: u64 = 1 << 10;
 pub const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
 /// Direct message reaction add/remove events.
 pub const INTENT_DIRECT_MESSAGE_REACTIONS: u64 = 1 << 13;
+/// Access to the text, embeds, attachments and components of guild
+/// messages. Discord marks this a privileged intent: without the
+/// grant a `MESSAGE_CREATE` dispatch still arrives but its content
+/// fields are empty (direct messages, mentions of the bot and the
+/// bot's own messages keep their content), and enabling it without
+/// the grant makes the Gateway close with 4014. It is therefore
+/// **opt-in** — add it to [`GatewayConfig::intents`] only after
+/// Discord has granted the intent.
+pub const INTENT_MESSAGE_CONTENT: u64 = 1 << 15;
 
 /// The intents needed to receive every update kind this dialect lowers,
-/// excluding the privileged [`INTENT_GUILD_MEMBERS`] opt-in.
+/// excluding the privileged [`INTENT_GUILD_MEMBERS`] and
+/// [`INTENT_MESSAGE_CONTENT`] opt-ins. With this default, guild message
+/// events arrive with ids, authors and timestamps but empty content
+/// fields; direct messages carry their content without the grant.
 pub const DEFAULT_INTENTS: u64 = INTENT_GUILDS
     | INTENT_GUILD_MESSAGES
     | INTENT_GUILD_MESSAGE_REACTIONS
@@ -779,6 +791,13 @@ fn session_loop(
                         format!("Gateway closed with non-reconnectable code {code}"),
                     ));
                 }
+                // 4007 (invalid sequence) and 4009 (session timed out)
+                // are reconnectable, but the session Discord closed is
+                // dead: the next connection must IDENTIFY a fresh one
+                // from the initial URL, not RESUME the corpse.
+                if matches!(code, Some(4007 | 4009)) {
+                    session.clear();
+                }
                 return Ok(SessionOutcome::Reconnect);
             }
             GatewayRead::Timeout => {
@@ -1166,13 +1185,12 @@ mod tests {
 
     struct ScriptedConnector {
         connections: Mutex<VecDeque<Box<dyn GatewayConnection>>>,
+        urls: Mutex<Vec<String>>,
     }
 
     impl GatewayConnector for ScriptedConnector {
-        fn connect(
-            &self,
-            _url: &GatewayUrl,
-        ) -> Result<Box<dyn GatewayConnection>, DiscordApiError> {
+        fn connect(&self, url: &GatewayUrl) -> Result<Box<dyn GatewayConnection>, DiscordApiError> {
+            self.urls.lock().unwrap().push(url.expose().to_owned());
             self.connections.lock().unwrap().pop_front().ok_or_else(|| {
                 DiscordApiError::new(
                     "a4mc_discord_fixture_exhausted",
@@ -1496,6 +1514,7 @@ mod tests {
             connections: Mutex::new(VecDeque::from([
                 Box::new(connection) as Box<dyn GatewayConnection>
             ])),
+            urls: Mutex::new(Vec::new()),
         };
         let token =
             DiscordToken::new(SecretToken::try_from_string(fixture_token()).unwrap()).unwrap();
@@ -1560,9 +1579,100 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_session_close_reconnects_with_identify_at_the_initial_url() {
+        // 4007 (invalid sequence) and 4009 (session timed out) retire
+        // the session: the next connection must open at the initial
+        // URL and IDENTIFY, never RESUME the closed session.
+        for code in [4007u16, 4009] {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let first = ScriptedConnection::new(
+                [hello(), ready(), GatewayRead::Closed(Some(code))],
+                Arc::clone(&sent),
+            );
+            let second =
+                ScriptedConnection::new([hello(), GatewayRead::Closed(None)], Arc::clone(&sent));
+            let connector = ScriptedConnector {
+                connections: Mutex::new(VecDeque::from([
+                    Box::new(first) as Box<dyn GatewayConnection>,
+                    Box::new(second) as Box<dyn GatewayConnection>,
+                ])),
+                urls: Mutex::new(Vec::new()),
+            };
+            let token =
+                DiscordToken::new(SecretToken::try_from_string(fixture_token()).unwrap()).unwrap();
+            let mut handler = RecordingHandler::default();
+            let config = GatewayModeConfig {
+                gateway_url: GatewayUrl::new("wss://gateway.fixture/?v=10"),
+                max_sessions: 2,
+                reconnect_delay: Duration::ZERO,
+                ..GatewayModeConfig::default()
+            };
+
+            run_gateway(&connector, &token, &mut handler, &config).unwrap();
+
+            let urls = connector.urls.lock().unwrap();
+            assert_eq!(
+                urls.iter()
+                    .filter(|url| url.contains("resume.invalid"))
+                    .count(),
+                0,
+                "close code {code} dialed the dead session's resume URL: {urls:?}"
+            );
+            assert!(
+                urls.iter()
+                    .all(|url| url.starts_with("wss://gateway.fixture/")),
+                "close code {code} skipped the initial URL: {urls:?}"
+            );
+            drop(urls);
+            let sent = sent.lock().unwrap();
+            assert!(
+                sent.iter().all(|payload| payload["op"] != json!(OP_RESUME)),
+                "close code {code} still resumed the dead session: {sent:?}"
+            );
+            assert_eq!(
+                sent.iter()
+                    .filter(|payload| payload["op"] == json!(OP_IDENTIFY))
+                    .count(),
+                2,
+                "close code {code} did not identify fresh sessions: {sent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resumable_close_keeps_the_session_for_resume() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = ScriptedConnection::new(
+            [hello(), ready(), GatewayRead::Closed(Some(4000))],
+            Arc::clone(&sent),
+        );
+        let mut handler = RecordingHandler::default();
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+        let outcome = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(outcome, SessionOutcome::Reconnect);
+        assert!(session.can_resume());
+    }
+
+    #[test]
     fn default_intents_leave_privileged_member_events_opt_in() {
         assert_eq!(DEFAULT_INTENTS & INTENT_GUILD_MEMBERS, 0);
         assert_eq!(GatewayConfig::default().intents & INTENT_GUILD_MEMBERS, 0);
+        assert_eq!(DEFAULT_INTENTS & INTENT_MESSAGE_CONTENT, 0);
+        assert_eq!(
+            GatewayConfig::default().intents & INTENT_MESSAGE_CONTENT,
+            0,
+            "message content must stay opt-in until Discord grants it"
+        );
     }
 
     #[test]

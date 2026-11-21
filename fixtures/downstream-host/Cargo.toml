@@ -16,4 +16,8 @@ version = "0.0.0"
 a4mc.workspace = true
 
 [dev-dependencies]
+a4mc-discord.workspace = true
+a4mc-slack.workspace = true
+a4mc-telegram.workspace = true
+a4mc-webhook.workspace = true
 serde_json.workspace = true

@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct RuntimeConfig {
     pub poll_timeout_secs: u64,
@@ -42,6 +42,13 @@ pub struct RuntimeConfig {
     /// surfaces `a4mc_telegram_poll_failed` to the host — an outage or
     /// a permanently rejected request must not retry silently forever.
     pub max_poll_failures: u32,
+    /// How long the update stream may stay silent before the platform
+    /// is allowed to restart update identifiers at a random value —
+    /// Telegram documents a week. A stored cursor whose sequence is
+    /// older than this window is discarded on startup, and in the
+    /// running loop the stale high-water mark stops being confirmed so
+    /// the new sequence's first ids are not acknowledged unseen.
+    pub poll_sequence_idle: Duration,
     /// Invoked once after the Bot API handshake (`getMe`, webhook clear,
     /// command registration) succeeds — the host's readiness hook for
     /// status files, supervisors or UI. The adapter owns no such state.
@@ -77,6 +84,7 @@ impl Default for RuntimeConfig {
             max_admitted: 64,
             turn_deadline: Duration::from_secs(300),
             max_poll_failures: 8,
+            poll_sequence_idle: Duration::from_secs(7 * 24 * 60 * 60),
             on_started: None,
             on_event: None,
             outbound_hooks: None,
@@ -277,8 +285,25 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
 
     // Resume where the last process durably confirmed: updates below
     // the stored cursor were already acknowledged to the platform, so
-    // restarting from them would replay paid agent turns.
-    let mut offset: i64 = store.poll_offset();
+    // restarting from them would replay paid agent turns. The cursor
+    // is only trusted while its sequence is live, though — the
+    // platform may restart update identifiers at a random value after
+    // a long silence, and a stale high-water mark would acknowledge
+    // the new sequence's lower first ids before they are delivered.
+    let mut cursor = PollCursor {
+        sequence_age: SequenceAge::resumed(
+            store
+                .poll_offset_advanced_at()
+                .map(|advanced| Duration::from_secs(now_secs().saturating_sub(advanced)))
+                .unwrap_or(Duration::ZERO),
+        ),
+        offset: 0,
+    };
+    cursor.offset = if cursor.sequence_age.elapsed() >= config.poll_sequence_idle {
+        0
+    } else {
+        store.poll_offset()
+    };
     let store = Arc::new(Mutex::new(store));
     let scheduler = Arc::new(Scheduler::new(
         config.max_admitted,
@@ -368,7 +393,7 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         &scheduler,
         &store,
         &config,
-        &mut offset,
+        &mut cursor,
         &mut pending,
         &mut on_event,
     );
@@ -389,12 +414,56 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
 /// still inside its rate-limit window.
 const MAX_RETRY_WAIT_SECS: u64 = 120;
 
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
+/// How long the current confirmed update-id sequence has been silent:
+/// the age a resumed cursor carried in, plus the in-process wait since.
+/// Once the age reaches `poll_sequence_idle` the platform may have
+/// restarted identifiers, so the cursor stops being trusted or
+/// confirmed until new updates land.
+struct SequenceAge {
+    resumed: Duration,
+    marked: Instant,
+}
+
+impl SequenceAge {
+    fn resumed(age: Duration) -> Self {
+        Self {
+            resumed: age,
+            marked: Instant::now(),
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.resumed + self.marked.elapsed()
+    }
+
+    fn reset(&mut self) {
+        self.resumed = Duration::ZERO;
+        self.marked = Instant::now();
+    }
+}
+
+/// The polling cursor plus the freshness of the id sequence it
+/// confirms: silent past [`RuntimeConfig::poll_sequence_idle`], the
+/// stale high-water mark is dropped so a restarted sequence's lower
+/// first ids are seen.
+struct PollCursor {
+    offset: i64,
+    sequence_age: SequenceAge,
+}
+
 fn poll_updates<T: BotTransport>(
     transport: &T,
     scheduler: &Scheduler,
     store: &Mutex<BindingStore>,
     config: &RuntimeConfig,
-    offset: &mut i64,
+    cursor: &mut PollCursor,
     pending: &mut VecDeque<InboundMessage>,
     on_event: &mut Option<OnEvent>,
 ) -> Result<()> {
@@ -404,7 +473,17 @@ fn poll_updates<T: BotTransport>(
             break;
         }
         if pending.is_empty() {
-            let updates = match transport.get_updates(*offset, config.poll_timeout_secs) {
+            // A sequence silent past the documented idle window may
+            // have restarted its identifiers. Stop confirming the
+            // stale high-water mark: polling from zero can only
+            // redeliver updates the platform still holds unconfirmed,
+            // while passing the stale offset would acknowledge the new
+            // sequence's lower first ids unseen.
+            if cursor.sequence_age.elapsed() >= config.poll_sequence_idle {
+                cursor.offset = 0;
+                cursor.sequence_age.reset();
+            }
+            let updates = match transport.get_updates(cursor.offset, config.poll_timeout_secs) {
                 Ok(updates) => {
                     consecutive_failures = 0;
                     updates
@@ -432,14 +511,14 @@ fn poll_updates<T: BotTransport>(
             let mut tasks = Vec::new();
             let mut dropped = Vec::new();
             let mut admitted = Vec::new();
-            let mut next_offset = *offset;
+            let mut next_offset = cursor.offset;
             for update in updates {
                 // The cursor is monotonic: a transport that redelivers an
                 // update below the durable cursor must not drag the offset
                 // back and replay already-confirmed turns. Telegram sends
                 // ascending update ids, so a lower one is a stale replay.
                 let next = update.update_id.saturating_add(1);
-                if next <= *offset {
+                if next <= cursor.offset {
                     continue;
                 }
                 // An update with no dispatchable message body (a
@@ -479,7 +558,7 @@ fn poll_updates<T: BotTransport>(
                 }
                 next_offset = next;
             }
-            if next_offset != *offset {
+            if next_offset != cursor.offset {
                 // One write confirms the cursor together with the work
                 // records of the batch — confirmed updates are never
                 // left without their task record, and a write failure
@@ -489,7 +568,8 @@ fn poll_updates<T: BotTransport>(
                     .lock()
                     .unwrap()
                     .admit_updates(&tasks, &dropped, next_offset)?;
-                *offset = next_offset;
+                cursor.offset = next_offset;
+                cursor.sequence_age.reset();
                 pending.extend(admitted);
             }
         }
@@ -1838,13 +1918,13 @@ mod tests {
         let store = BindingStore::open_in(&root).unwrap();
         let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
         // Every admitted task finishing — replies suppressed — is the
-        // signal that all three reply paths ran under the policy.
+        // signal that all three reply paths ran under the policy. The
+        // pending set alone cannot say that: it is also empty before the
+        // first batch lands, which would stop the loop before any poll.
         wait_until(
             || {
-                BindingStore::open_in(&root)
-                    .unwrap()
-                    .pending_updates()
-                    .is_empty()
+                let store = BindingStore::open_in(&root).unwrap();
+                store.poll_offset() == 4 && store.pending_updates().is_empty()
             },
             Duration::from_secs(10),
         );
@@ -2285,5 +2365,196 @@ mod tests {
         assert!(sanitized.contains("a4mc_telegram_send_failed"));
         let long = anyhow!("a4mc_telegram_send_failed: {}", "x".repeat(5000));
         assert!(sanitize_error(&long).len() <= 200);
+    }
+
+    #[test]
+    fn an_expired_stored_sequence_accepts_a_lower_first_update_id() {
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store.set_poll_offset(50).unwrap();
+        // The cursor's sequence has been silent past the documented
+        // idle window: the platform may have restarted identifiers.
+        store.age_poll_offset_for_test(8 * 24 * 60 * 60).unwrap();
+        drop(store);
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![Update {
+                update_id: 3,
+                message: Some(text_message(42, 42, Some("alice"), "/whoami", 3)),
+            }])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(|| !sent.lock().unwrap().is_empty(), Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            4,
+            "the restarted sequence's first id was discarded as stale"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_idle_stream_stops_confirming_the_stale_high_water_mark() {
+        let root = temp_root();
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let observed_offsets = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let updates = Arc::new(Mutex::new(vec![Update {
+            update_id: 9,
+            message: Some(text_message(42, 42, Some("alice"), "/whoami", 9)),
+        }]));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            observed_offsets: Arc::clone(&observed_offsets),
+            updates: Arc::clone(&updates),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            // The platform's documented idle window, compressed for the
+            // fixture: past it, a lower id is the restarted sequence's
+            // first update, not a stale replay.
+            poll_sequence_idle: Duration::from_millis(60),
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        // The new sequence's first id sits below the stale high-water
+        // mark; it is only deliverable once the poller stops passing
+        // the old offset to the platform.
+        updates.lock().unwrap().push(Update {
+            update_id: 5,
+            message: Some(text_message(88, 88, Some("zoe"), "/whoami", 5)),
+        });
+        wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+
+        let offsets = observed_offsets.lock().unwrap();
+        assert!(
+            offsets.iter().skip(1).any(|offset| *offset == 0),
+            "the stale cursor kept being confirmed after the idle window: {offsets:?}"
+        );
+        drop(offsets);
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            6,
+            "the restarted sequence did not advance from its first id"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_rejected_event_holds_the_cursor_while_queued_work_settles() {
+        let root = temp_root();
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let updates = Arc::new(Mutex::new(vec![Update {
+            update_id: 8,
+            message: Some(text_message(42, 42, Some("alice"), "/whoami", 8)),
+        }]));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::clone(&updates),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            on_event: Some(Box::new(|_: &a4mc::ChannelEvent| {
+                Err(anyhow!("fixture rejection"))
+            })),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        // The earlier message settles before the mixed batch arrives:
+        // its durable record must complete, not replay.
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        updates.lock().unwrap().extend([
+            Update {
+                update_id: 20,
+                message: Some(text_message(88, 88, Some("zoe"), "/whoami", 20)),
+            },
+            Update {
+                update_id: 21,
+                message: None,
+            },
+        ]);
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("a4mc_telegram_unhandled_event"),
+            "unexpected error: {error}"
+        );
+
+        let reopened = BindingStore::open_in(&root).unwrap();
+        assert_eq!(
+            reopened.poll_offset(),
+            9,
+            "the rejected update was confirmed past"
+        );
+        assert!(
+            reopened.pending_updates().is_empty(),
+            "settled and unadmitted work must leave no record"
+        );
+        drop(reopened);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+
+        // The next run refetches from behind the rejected update: the
+        // batched message is admitted then, not lost with its batch.
+        let events = Arc::new(Mutex::new(Vec::<a4mc::ChannelEvent>::new()));
+        let observed = Arc::clone(&events);
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            updates: Arc::new(Mutex::new(vec![
+                Update {
+                    update_id: 20,
+                    message: Some(text_message(88, 88, Some("zoe"), "/whoami", 20)),
+                },
+                Update {
+                    update_id: 21,
+                    message: None,
+                },
+            ])),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            on_event: Some(Box::new(move |event: &a4mc::ChannelEvent| {
+                observed.lock().unwrap().push(event.clone());
+                Ok(())
+            })),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
+        wait_until(|| sent.lock().unwrap().len() == 2, Duration::from_secs(10));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert_eq!(
+            BindingStore::open_in(&root).unwrap().poll_offset(),
+            22,
+            "the refetched batch did not confirm"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

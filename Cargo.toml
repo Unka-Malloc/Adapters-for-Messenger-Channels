@@ -17,6 +17,10 @@ repository = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels"
 
 [workspace.dependencies]
 a4mc = { path = "crates/a4mc", version = "0.2.0" }
+a4mc-discord = { path = "crates/a4mc-discord", version = "0.1.0" }
+a4mc-slack = { path = "crates/a4mc-slack", version = "0.1.0" }
+a4mc-telegram = { path = "crates/a4mc-telegram", version = "0.2.0" }
+a4mc-webhook = { path = "crates/a4mc-webhook", version = "0.1.0" }
 anyhow = "1"
 base64 = "0.22"
 fs2 = "0.4"

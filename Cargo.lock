@@ -33,6 +33,10 @@ name = "a4mc-fixture-downstream-host"
 version = "0.0.0"
 dependencies = [
  "a4mc",
+ "a4mc-discord",
+ "a4mc-slack",
+ "a4mc-telegram",
+ "a4mc-webhook",
  "serde_json",
 ]
 

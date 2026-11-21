@@ -50,4 +50,53 @@ mod tests {
         };
         assert_eq!(prepared.dedupe_key, "key-1");
     }
+
+    struct FixtureCustody;
+
+    impl a4mc::CustodyPort for FixtureCustody {
+        fn channel_token(
+            &self,
+            channel: &a4mc::ChannelId,
+        ) -> Result<Option<a4mc::SecretToken>, a4mc::ChannelError> {
+            let _ = channel;
+            Ok(None)
+        }
+    }
+
+    /// The quickstart composition compiles end to end: the host installs
+    /// its ports (the lane test above owns `lane::install`; this test
+    /// installs custody) and constructs every documented dialect against
+    /// the published surfaces — `a4mc` 0.2 with `a4mc-telegram` 0.2 and
+    /// the 0.1 Slack, Discord and webhook dialects.
+    #[test]
+    fn the_documented_dialects_construct_after_port_installation() {
+        a4mc::custody::install(std::sync::Arc::new(FixtureCustody)).unwrap();
+        assert!(a4mc::custody::installed());
+
+        let telegram = a4mc_telegram::TelegramChannel::new(std::sync::Arc::new(
+            a4mc_telegram::MockBotTransport::default(),
+        ));
+        let runtime = a4mc_telegram::RuntimeConfig::default();
+        let slack =
+            a4mc_slack::SlackChannel::new(std::sync::Arc::new(a4mc_slack::MockSlackApi::default()));
+        let discord = a4mc_discord::DiscordChannel::new(std::sync::Arc::new(
+            a4mc_discord::MockDiscordApi::default(),
+        ));
+        let secret = a4mc_webhook::WebhookSecret::new(
+            a4mc::SecretToken::try_from_string(format!(
+                "a4mc-fixture-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0)
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let receiver =
+            a4mc_webhook::WebhookReceiver::new(a4mc_webhook::WebhookVerifier::new(secret, 300));
+
+        let _ = (telegram, runtime, slack, discord, receiver);
+    }
 }

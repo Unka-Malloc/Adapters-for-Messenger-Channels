@@ -25,8 +25,10 @@ use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::time::{Duration, Instant};
 
 /// One envelope delivered over Socket Mode.
 #[derive(Debug, Clone, PartialEq)]
@@ -118,14 +120,34 @@ pub fn ack_frame(envelope_id: &str) -> String {
     json!({ "envelope_id": envelope_id }).to_string()
 }
 
+/// The result of one bounded socket read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SocketRead {
+    /// One text frame.
+    Text(String),
+    /// The peer closed the socket.
+    Closed,
+    /// No frame arrived before the read's deadline; the session loop
+    /// uses the pause to service accepted-envelope reports.
+    Timeout,
+}
+
+impl From<String> for SocketRead {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
 /// A bidirectional websocket connection carrying Socket Mode frames.
 ///
 /// Implementations are synchronous and owned by one session thread. Live
 /// connection uses tungstenite; tests and host fixtures use an in-memory
 /// scripted connection.
 pub trait SocketConnection: Send {
-    /// Read one text frame, or `None` when the peer closed the socket.
-    fn read_text(&mut self) -> Result<Option<String>, SlackApiError>;
+    /// Read one text frame, bounded by `timeout`: an empty wait reports
+    /// [`SocketRead::Timeout`] so the session loop can keep servicing
+    /// acknowledgement work instead of parking inside a read.
+    fn read(&mut self, timeout: Duration) -> Result<SocketRead, SlackApiError>;
     fn send_text(&mut self, text: &str) -> Result<(), SlackApiError>;
     fn close(&mut self) {}
 }
@@ -338,9 +360,28 @@ fn connect_websocket(
 pub struct LiveSocketConnector;
 
 /// The byte stream under a live socket: TCP, or rustls over TCP.
-trait SocketStream: Read + Write + Send {}
-impl SocketStream for TcpStream {}
-impl SocketStream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {}
+trait SocketStream: Read + Write + Send {
+    /// Bound the next read on the underlying stream to `timeout`.
+    fn set_read_timeout(&self, timeout: Duration) -> Result<(), SlackApiError>;
+}
+
+fn socket_failed() -> SlackApiError {
+    SlackApiError::new("a4mc_slack_socket_failed", "Socket Mode socket failed")
+}
+
+impl SocketStream for TcpStream {
+    fn set_read_timeout(&self, timeout: Duration) -> Result<(), SlackApiError> {
+        TcpStream::set_read_timeout(self, Some(timeout)).map_err(|_| socket_failed())
+    }
+}
+
+impl SocketStream for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn set_read_timeout(&self, timeout: Duration) -> Result<(), SlackApiError> {
+        self.sock
+            .set_read_timeout(Some(timeout))
+            .map_err(|_| socket_failed())
+    }
+}
 
 impl SocketConnector for LiveSocketConnector {
     fn connect(&self, url: &SocketUrl) -> Result<Box<dyn SocketConnection>, SlackApiError> {
@@ -355,10 +396,18 @@ struct LiveSocketConnection {
 }
 
 impl SocketConnection for LiveSocketConnection {
-    fn read_text(&mut self) -> Result<Option<String>, SlackApiError> {
+    fn read(&mut self, timeout: Duration) -> Result<SocketRead, SlackApiError> {
+        let deadline = Instant::now() + timeout;
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(SocketRead::Timeout);
+            }
+            self.socket.get_mut().set_read_timeout(remaining)?;
             match self.socket.read() {
-                Ok(tungstenite::Message::Text(text)) => return Ok(Some(text.to_string())),
+                Ok(tungstenite::Message::Text(text)) => {
+                    return Ok(SocketRead::Text(text.to_string()));
+                }
                 Ok(tungstenite::Message::Binary(_)) | Ok(tungstenite::Message::Pong(_)) => {}
                 Ok(tungstenite::Message::Ping(payload)) => {
                     self.socket
@@ -371,9 +420,17 @@ impl SocketConnection for LiveSocketConnection {
                         })?;
                 }
                 Ok(tungstenite::Message::Frame(_)) => {}
-                Ok(tungstenite::Message::Close(_)) => return Ok(None),
+                Ok(tungstenite::Message::Close(_)) => return Ok(SocketRead::Closed),
                 Err(tungstenite::Error::ConnectionClosed)
-                | Err(tungstenite::Error::AlreadyClosed) => return Ok(None),
+                | Err(tungstenite::Error::AlreadyClosed) => return Ok(SocketRead::Closed),
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(SocketRead::Timeout);
+                }
                 Err(_) => {
                     return Err(SlackApiError::new(
                         "a4mc_slack_socket_failed",
@@ -439,8 +496,9 @@ impl SeenEnvelopes {
     }
 }
 
-/// The host's answer to one delivered envelope.
-pub trait SocketHandler {
+/// The host's answer to one delivered envelope. The handler runs on a
+/// worker off the socket's read path, so it must be safe to move there.
+pub trait SocketHandler: Send {
     /// An `events_api` payload lowered onto the normalized contract.
     /// The raw payload travels in `envelope` for host policy.
     fn on_event(
@@ -465,47 +523,183 @@ pub enum SessionOutcome {
     Stopped,
 }
 
+/// Bound on envelopes queued for the host worker. One further envelope
+/// can wait in the session's deferred slot; load beyond that ends the
+/// session — Slack retries the unacknowledged backlog on the next
+/// socket — instead of growing an unbounded queue inside the loop.
+const ENVELOPE_HANDOFF_BOUND: usize = 64;
+
+/// How long one socket read waits before the loop services worker
+/// reports again — far inside Slack's acknowledgement window, so a
+/// quiet socket never parks an earned ack behind a read.
+const READ_SERVICE_SLICE: Duration = Duration::from_millis(200);
+
+/// The worker's answer for one envelope: the host durably accepted it
+/// (ack it — possibly again, for a retry that overtook the mark), or
+/// the host failed it (end the session; the unmarked id is retried and
+/// re-dispatched).
+enum AcceptReport {
+    Ack(String),
+    Failed(SlackApiError),
+}
+
 /// Run one already-connected Socket Mode session until disconnect, close
-/// or stop. A first-seen envelope is handed to the host — its durable
-/// receive — before the acknowledgement goes out: if the ack write then
-/// fails, the socket is dropped, Slack retries, and the retry is
-/// answered with the missing ack and no second dispatch. A handler
-/// failure keeps the id unmarked so the retry re-dispatches the work
-/// the host never took.
+/// or stop.
+///
+/// A first-seen envelope is handed to the host — its durable receive —
+/// on a worker fed through a bounded channel, so a synchronous lane
+/// turn can never stall the socket's reads or the acks other envelopes
+/// already earned. The worker marks the id once the host accepts, then
+/// the loop writes the ack: if the ack write fails, the socket is
+/// dropped, Slack retries, and the retry is answered with the missing
+/// ack and no second dispatch. A handler failure keeps the id unmarked
+/// so the retry re-dispatches the work the host never took.
 pub fn run_socket_session(
     connection: &mut dyn SocketConnection,
     handler: &mut dyn SocketHandler,
     seen: &mut SeenEnvelopes,
     stop: &AtomicBool,
 ) -> Result<SessionOutcome, SlackApiError> {
+    let seen = Arc::new(Mutex::new(seen));
+    let (work_tx, work_rx) = sync_channel::<SocketEnvelope>(ENVELOPE_HANDOFF_BOUND);
+    let (ack_tx, ack_rx) = sync_channel::<AcceptReport>(ENVELOPE_HANDOFF_BOUND);
+    std::thread::scope(|scope| {
+        let worker_seen = Arc::clone(&seen);
+        let worker = scope.spawn(move || {
+            while let Ok(envelope) = work_rx.recv() {
+                let envelope_id = envelope.envelope_id.clone();
+                let report = {
+                    if worker_seen.lock().unwrap().contains(&envelope_id) {
+                        // A retry queued before the original's mark
+                        // landed: the work is already the host's, so
+                        // only the missing ack is owed.
+                        AcceptReport::Ack(envelope_id)
+                    } else {
+                        let result = if envelope.kind == "events_api" {
+                            let event = crate::lower::lower_event(&envelope.payload);
+                            handler.on_event(&event, &envelope)
+                        } else {
+                            handler.on_other(&envelope)
+                        };
+                        match result {
+                            Ok(()) => {
+                                // The host has the work; commit the
+                                // dedupe mark before the ack, so a lost
+                                // ack only ever re-acks.
+                                worker_seen.lock().unwrap().mark(&envelope_id);
+                                AcceptReport::Ack(envelope_id)
+                            }
+                            Err(error) => AcceptReport::Failed(handler_error(error)),
+                        }
+                    }
+                };
+                if ack_tx.send(report).is_err() {
+                    return;
+                }
+            }
+        });
+        let outcome = socket_loop(connection, &seen, stop, &work_tx, &ack_rx);
+        // Let the worker finish what it queued so a reconnect does not
+        // redeliver work the host actually accepted, then collect the
+        // late answers: acks go out best-effort (a miss only re-asks
+        // for the retry the mark already covers), a failure surfaces.
+        drop(work_tx);
+        let panicked = worker.join().is_err();
+        let mut first_failure = None;
+        while let Ok(report) = ack_rx.try_recv() {
+            match report {
+                AcceptReport::Ack(envelope_id) => {
+                    let _ = connection.send_text(&ack_frame(&envelope_id));
+                }
+                AcceptReport::Failed(error) => {
+                    first_failure.get_or_insert(error);
+                }
+            }
+        }
+        if panicked {
+            return Err(SlackApiError::new(
+                "a4mc_slack_handler_failed",
+                "Socket Mode handler worker panicked",
+            ));
+        }
+        if let Some(error) = first_failure {
+            return Err(error);
+        }
+        outcome
+    })
+}
+
+/// The socket side of one session: read frames bounded by
+/// [`READ_SERVICE_SLICE`], hand unseen envelopes to the handler worker,
+/// and write acks for the envelopes the host has accepted — all off the
+/// worker's critical path.
+fn socket_loop(
+    connection: &mut dyn SocketConnection,
+    seen: &Mutex<&mut SeenEnvelopes>,
+    stop: &AtomicBool,
+    work_tx: &SyncSender<SocketEnvelope>,
+    ack_rx: &Receiver<AcceptReport>,
+) -> Result<SessionOutcome, SlackApiError> {
+    // One envelope deferred because the bounded handoff was full; it
+    // is retried every iteration. A second deferral means the host
+    // cannot keep up — the session ends so Slack redelivers the
+    // unacknowledged backlog.
+    let mut deferred: Option<SocketEnvelope> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(SessionOutcome::Stopped);
         }
-        let Some(text) = connection.read_text()? else {
-            return Ok(SessionOutcome::Reconnect);
-        };
-        match SocketFrame::parse(&text)? {
-            SocketFrame::Hello { .. } | SocketFrame::Unknown { .. } => {}
-            SocketFrame::Disconnect { .. } => return Ok(SessionOutcome::Reconnect),
-            SocketFrame::Envelope(envelope) => {
-                if !seen.contains(&envelope.envelope_id) {
-                    // The host's durable receive happens before the ack:
-                    // an envelope Slack believes consumed must already
-                    // have a resumable home here.
-                    let result = if envelope.kind == "events_api" {
-                        let event = crate::lower::lower_event(&envelope.payload);
-                        handler.on_event(&event, &envelope)
-                    } else {
-                        handler.on_other(&envelope)
-                    };
-                    result.map_err(handler_error)?;
-                    seen.mark(&envelope.envelope_id);
+        while let Ok(report) = ack_rx.try_recv() {
+            match report {
+                AcceptReport::Ack(envelope_id) => {
+                    connection.send_text(&ack_frame(&envelope_id))?;
                 }
-                // First deliveries and ack-recovery retries both end
-                // here: one dispatch per envelope id at most.
-                connection.send_text(&ack_frame(&envelope.envelope_id))?;
+                AcceptReport::Failed(error) => return Err(error),
             }
+        }
+        if let Some(envelope) = deferred.take() {
+            match work_tx.try_send(envelope) {
+                Ok(()) => {}
+                Err(TrySendError::Full(envelope)) => deferred = Some(envelope),
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(SlackApiError::new(
+                        "a4mc_slack_handler_failed",
+                        "Socket Mode handler worker stopped",
+                    ));
+                }
+            }
+        }
+        match connection.read(READ_SERVICE_SLICE)? {
+            SocketRead::Closed => return Ok(SessionOutcome::Reconnect),
+            SocketRead::Timeout => {}
+            SocketRead::Text(text) => match SocketFrame::parse(&text)? {
+                SocketFrame::Hello { .. } | SocketFrame::Unknown { .. } => {}
+                SocketFrame::Disconnect { .. } => return Ok(SessionOutcome::Reconnect),
+                SocketFrame::Envelope(envelope) => {
+                    if seen.lock().unwrap().contains(&envelope.envelope_id) {
+                        // A retry of durably accepted work: answer the
+                        // missing ack, never a second dispatch.
+                        connection.send_text(&ack_frame(&envelope.envelope_id))?;
+                        continue;
+                    }
+                    if deferred.is_some() {
+                        return Err(SlackApiError::new(
+                            "a4mc_slack_handler_overloaded",
+                            "Socket Mode handler fell behind the envelope stream",
+                        ));
+                    }
+                    match work_tx.try_send(envelope) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(envelope)) => deferred = Some(envelope),
+                        Err(TrySendError::Disconnected(_)) => {
+                            return Err(SlackApiError::new(
+                                "a4mc_slack_handler_failed",
+                                "Socket Mode handler worker stopped",
+                            ));
+                        }
+                    }
+                }
+            },
         }
     }
 }
@@ -664,30 +858,72 @@ mod tests {
         }
     }
 
+    /// A handler whose calls park until the test releases them — a
+    /// stand-in for a synchronous lane turn.
+    struct BlockableHandler {
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl BlockableHandler {
+        fn wait_for_release(&self) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let (lock, condvar) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+        }
+    }
+
+    impl SocketHandler for BlockableHandler {
+        fn on_event(
+            &mut self,
+            _event: &ChannelEvent,
+            _envelope: &SocketEnvelope,
+        ) -> Result<(), SlackApiError> {
+            self.wait_for_release();
+            Ok(())
+        }
+
+        fn on_other(&mut self, _envelope: &SocketEnvelope) -> Result<(), SlackApiError> {
+            self.wait_for_release();
+            Ok(())
+        }
+    }
+
     struct ScriptedConnection {
-        incoming: VecDeque<String>,
+        incoming: VecDeque<SocketRead>,
         sent: Arc<Mutex<Vec<String>>>,
         fail_read: Option<SlackApiError>,
         fail_send: Option<SlackApiError>,
+        reads: Option<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     impl ScriptedConnection {
-        fn new(incoming: Vec<String>, sent: Arc<Mutex<Vec<String>>>) -> Self {
+        fn new(
+            incoming: impl IntoIterator<Item = impl Into<SocketRead>>,
+            sent: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
             Self {
-                incoming: incoming.into(),
+                incoming: incoming.into_iter().map(Into::into).collect(),
                 sent,
                 fail_read: None,
                 fail_send: None,
+                reads: None,
             }
         }
     }
 
     impl SocketConnection for ScriptedConnection {
-        fn read_text(&mut self) -> Result<Option<String>, SlackApiError> {
+        fn read(&mut self, _timeout: Duration) -> Result<SocketRead, SlackApiError> {
+            if let Some(counter) = &self.reads {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
             if let Some(error) = self.fail_read.clone() {
                 return Err(error);
             }
-            Ok(self.incoming.pop_front())
+            Ok(self.incoming.pop_front().unwrap_or(SocketRead::Closed))
         }
 
         fn send_text(&mut self, text: &str) -> Result<(), SlackApiError> {
@@ -776,6 +1012,65 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_handler_does_not_stall_reads_or_acks() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let mut connection = ScriptedConnection::new(
+            vec![
+                envelope("e1", "events_api", message_payload("1700000000.000001")),
+                envelope("e2", "events_api", message_payload("1700000000.000002")),
+                envelope("e3", "slash_commands", json!({"command": "/status"})),
+                json!({"type": "disconnect", "reason": "test_done"}).to_string(),
+            ],
+            Arc::clone(&sent),
+        );
+        connection.reads = Some(Arc::clone(&reads));
+        let mut handler = BlockableHandler {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let mut seen = SeenEnvelopes::new(16);
+        let stop = AtomicBool::new(false);
+
+        let outcome = std::thread::scope(|scope| {
+            let session =
+                scope.spawn(|| run_socket_session(&mut connection, &mut handler, &mut seen, &stop));
+            // While the first handler call is parked, the socket keeps
+            // draining: every later envelope and the disconnect frame
+            // are read instead of waiting behind it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while entered.load(Ordering::SeqCst) == 0 || reads.load(Ordering::SeqCst) < 4 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the read loop stalled behind a blocked handler"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (lock, condvar) = &*release;
+            *lock.lock().unwrap() = true;
+            condvar.notify_all();
+            session.join().unwrap()
+        });
+
+        assert_eq!(outcome.unwrap(), SessionOutcome::Reconnect);
+        let acks: Vec<Value> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|text| serde_json::from_str(text).unwrap())
+            .collect();
+        assert_eq!(acks.len(), 3);
+        for (index, id) in ["e1", "e2", "e3"].iter().enumerate() {
+            assert_eq!(acks[index]["envelope_id"], json!(id));
+        }
+        assert!(seen.contains("e1"));
+        assert!(seen.contains("e2"));
+        assert!(seen.contains("e3"));
+    }
+
+    #[test]
     fn handler_failure_happens_before_ack_and_is_reported() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut connection = ScriptedConnection::new(
@@ -819,9 +1114,11 @@ mod tests {
         let mut seen = SeenEnvelopes::new(4);
         let stop = AtomicBool::new(false);
 
-        // The envelope is durably received, then the ack write fails:
-        // the session ends so Slack redelivers.
-        assert!(run_socket_session(&mut first, &mut handler, &mut seen, &stop).is_err());
+        // The envelope is durably received; every ack write fails.
+        // Whether the session reports the write failure or the socket
+        // simply closes, Slack redelivers — the committed mark is what
+        // protects the retry from re-dispatching.
+        let _ = run_socket_session(&mut first, &mut handler, &mut seen, &stop);
         assert_eq!(handler.events.len(), 1);
         assert!(seen.contains("e1"));
 

@@ -100,6 +100,14 @@ struct BindingDocument {
     /// before the cursor existed; older readers ignore the field.
     #[serde(default)]
     poll_offset: i64,
+    /// Unix seconds when the cursor last advanced. The platform may
+    /// restart update identifiers at a random value after a long
+    /// silence, so the runtime expires a sequence older than its idle
+    /// window. `None` for documents written before the field existed;
+    /// an unknown-age cursor is honored, since expiring it could replay
+    /// confirmed turns.
+    #[serde(default)]
+    poll_offset_advanced_at: Option<u64>,
     /// Bounded record of fetched updates the runtime did not turn into
     /// host-visible messages. Older readers ignore the field.
     #[serde(default)]
@@ -319,6 +327,23 @@ impl BindingStore {
         self.document.poll_offset
     }
 
+    /// Unix seconds when the stored cursor last advanced — the input
+    /// for the runtime's sequence-expiry check. `None` predates the
+    /// field and is treated as a live sequence.
+    pub fn poll_offset_advanced_at(&self) -> Option<u64> {
+        self.document.poll_offset_advanced_at
+    }
+
+    /// Backdate the cursor's last-advance instant so sequence-expiry
+    /// paths run without waiting out the real idle window.
+    #[cfg(test)]
+    pub fn age_poll_offset_for_test(&mut self, secs: u64) -> Result<()> {
+        self.mutate(|document| {
+            document.poll_offset_advanced_at = Some(now_secs().saturating_sub(secs));
+            Ok(())
+        })
+    }
+
     /// Fail the next mutation, so a caller's error path can be exercised
     /// without relying on OS permissions that root can bypass.
     #[cfg(test)]
@@ -333,6 +358,7 @@ impl BindingStore {
     pub fn set_poll_offset(&mut self, offset: i64) -> Result<()> {
         self.mutate(|document| {
             document.poll_offset = offset;
+            document.poll_offset_advanced_at = Some(now_secs());
             Ok(())
         })
     }
@@ -377,6 +403,7 @@ impl BindingStore {
                 document.dropped_updates.drain(..excess);
             }
             document.poll_offset = offset;
+            document.poll_offset_advanced_at = Some(now_secs());
             Ok(())
         })
     }
@@ -513,6 +540,7 @@ fn read_document(path: &Path) -> Result<BindingDocument> {
             pairings: Vec::new(),
             chats: BTreeMap::new(),
             poll_offset: 0,
+            poll_offset_advanced_at: None,
             dropped_updates: Vec::new(),
             pending_updates: Vec::new(),
         }),

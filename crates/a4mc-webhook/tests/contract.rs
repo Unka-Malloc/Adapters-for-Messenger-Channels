@@ -95,6 +95,9 @@ fn signed_full_message_crosses_the_public_receiver_without_field_loss() {
     assert_eq!(delivery.event.channel.as_str(), CHANNEL);
     assert_eq!(delivery.event.update, update);
     assert_eq!(delivery.signed_at, timestamp);
+    // The host accepted the event durably; only then does the replay
+    // suppress as a duplicate.
+    receiver.commit(&delivery);
     assert_eq!(
         receiver.receive(&request, timestamp).unwrap(),
         DeliveryOutcome::Duplicate

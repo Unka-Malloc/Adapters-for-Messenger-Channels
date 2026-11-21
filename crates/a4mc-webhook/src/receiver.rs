@@ -1,11 +1,16 @@
 //! Bounded replay suppression on top of signature verification.
 //!
 //! A valid signature can still be replayed inside the timestamp window.
-//! [`WebhookReceiver`] remembers recent verified signatures in a bounded
-//! FIFO cache: the first delivery returns [`DeliveryOutcome::Event`], an
-//! exact replay returns [`DeliveryOutcome::Duplicate`] and the host
-//! answers success without running the update again. The cache holds
-//! digests only — never bodies, secrets or signatures of failed
+//! [`WebhookReceiver`] remembers verified signatures in a bounded FIFO
+//! cache — but only after the host commits them. A first delivery
+//! returns [`DeliveryOutcome::Event`]; once the host has accepted the
+//! event durably or finished handling it, [`WebhookReceiver::commit`]
+//! suppresses replays, which then return [`DeliveryOutcome::Duplicate`]
+//! and are answered success without running the update again. A
+//! delivery never committed stays retry-eligible: a handler that
+//! failed returns an HTTP error and the sender's retry verifies as a
+//! fresh event instead of being answered success unseen. The cache
+//! holds digests only — never bodies, secrets or signatures of failed
 //! verifications.
 
 use crate::error::WebhookError;
@@ -47,23 +52,38 @@ impl WebhookReceiver {
         &self.verifier
     }
 
-    /// Verify and classify one request at `now_unix`.
+    /// Verify and classify one request at `now_unix`. A signature is
+    /// only reported [`DeliveryOutcome::Duplicate`] after
+    /// [`Self::commit`] — nothing is suppressed merely for having
+    /// been delivered once.
     pub fn receive(
         &self,
         request: &WebhookRequest,
         now_unix: u64,
     ) -> Result<DeliveryOutcome, WebhookError> {
         let delivery = self.verifier.verify(request, now_unix)?;
-        let first = self
+        let committed = self
             .seen
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .first_seen(&delivery.signature);
-        if first {
-            Ok(DeliveryOutcome::Event(Box::new(delivery)))
-        } else {
+            .contains(&delivery.signature);
+        if committed {
             Ok(DeliveryOutcome::Duplicate)
+        } else {
+            Ok(DeliveryOutcome::Event(Box::new(delivery)))
         }
+    }
+
+    /// Commit replay suppression for one delivered event: call only
+    /// after the host has accepted it — stored durably for processing
+    /// or handled successfully. A failed first attempt is never
+    /// committed, so the sender's retry is classified
+    /// [`DeliveryOutcome::Event`] and runs again.
+    pub fn commit(&self, delivery: &WebhookDelivery) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mark(&delivery.signature);
     }
 }
 
@@ -83,21 +103,20 @@ impl SeenSignatures {
         }
     }
 
-    fn first_seen(&mut self, signature: &str) -> bool {
-        if signature.is_empty() {
-            return true;
+    fn contains(&self, signature: &str) -> bool {
+        !signature.is_empty() && self.seen.contains(signature)
+    }
+
+    fn mark(&mut self, signature: &str) {
+        if signature.is_empty() || !self.seen.insert(signature.to_owned()) {
+            return;
         }
-        if self.seen.contains(signature) {
-            return false;
-        }
-        self.seen.insert(signature.to_owned());
         self.order.push_back(signature.to_owned());
         while self.order.len() > self.capacity {
             if let Some(oldest) = self.order.pop_front() {
                 self.seen.remove(&oldest);
             }
         }
-        true
     }
 }
 
@@ -146,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_replay_is_a_duplicate_and_does_not_run_twice() {
+    fn committed_replay_is_a_duplicate_and_does_not_run_twice() {
         let receiver = receiver();
         let request = request(1_700_000_000, BODY);
         let DeliveryOutcome::Event(first) = receiver.receive(&request, 1_700_000_000).unwrap()
@@ -154,6 +173,31 @@ mod tests {
             panic!("first delivery should be an event");
         };
         assert_eq!(first.signed_at, 1_700_000_000);
+        receiver.commit(&first);
+        assert_eq!(
+            receiver.receive(&request, 1_700_000_000).unwrap(),
+            DeliveryOutcome::Duplicate
+        );
+    }
+
+    #[test]
+    fn an_uncommitted_delivery_stays_retryable() {
+        let receiver = receiver();
+        let request = request(1_700_000_000, BODY);
+        let DeliveryOutcome::Event(first) = receiver.receive(&request, 1_700_000_000).unwrap()
+        else {
+            panic!("first delivery should be an event");
+        };
+        // The host failed to handle the event and never committed it:
+        // the sender's retry must verify as a fresh event, not be
+        // suppressed as a duplicate.
+        let DeliveryOutcome::Event(retry) = receiver.receive(&request, 1_700_000_000).unwrap()
+        else {
+            panic!("a retry after host failure must re-deliver the event");
+        };
+        assert_eq!(retry.signature, first.signature);
+        // Once the retried delivery is accepted, suppression commits.
+        receiver.commit(&retry);
         assert_eq!(
             receiver.receive(&request, 1_700_000_000).unwrap(),
             DeliveryOutcome::Duplicate
@@ -193,11 +237,15 @@ mod tests {
     #[test]
     fn bounded_cache_evicts_oldest_signatures() {
         let mut seen = SeenSignatures::new(2);
-        assert!(seen.first_seen("a"));
-        assert!(seen.first_seen("b"));
-        assert!(!seen.first_seen("a"));
-        assert!(seen.first_seen("c"));
-        assert!(seen.first_seen("a"));
-        assert!(!seen.first_seen("c"));
+        seen.mark("a");
+        seen.mark("b");
+        assert!(seen.contains("a"));
+        assert!(!seen.contains("z"));
+        seen.mark("c");
+        assert!(!seen.contains("a"));
+        assert!(seen.contains("c"));
+        // A re-committed signature stays suppressed, not duplicated.
+        seen.mark("b");
+        assert!(seen.contains("b"));
     }
 }
