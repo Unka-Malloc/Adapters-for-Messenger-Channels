@@ -35,9 +35,13 @@
 //! before invoking the host's [`gateway::GatewayHandler`]. Resume state
 //! (`sequence`, session id, resume URL) is caller-owned: it survives
 //! reconnects inside the loop and a surfaced handler failure alike, so
-//! re-entering with the same [`gateway::GatewaySession`] resumes the
-//! session and replays the rejected dispatch instead of identifying
-//! fresh.
+//! re-entering with the same [`gateway::GatewaySession`] while
+//! [`gateway::GatewaySession::can_resume`] still holds replays the
+//! rejected dispatch instead of identifying fresh — provided Discord
+//! accepts the `RESUME`. When Discord expired the session the cursor
+//! is cleared with the failure: a fresh `IDENTIFY` cannot recover the
+//! rejected dispatch, so the host surfaces the handler error instead
+//! of retrying.
 
 pub mod channel;
 pub mod gateway;

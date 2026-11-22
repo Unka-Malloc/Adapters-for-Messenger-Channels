@@ -1182,12 +1182,18 @@ impl Default for GatewayModeConfig {
 /// `session` is caller-owned resume state: the sequence, session id
 /// and resume URL stay current across every session this call opens
 /// and — just as important — survive the call itself. A handler
-/// failure is returned to the host, but the caller's session still
-/// holds the cursor, so invoking `run_gateway` again with the same
+/// failure is returned to the host, but while
+/// [`GatewaySession::can_resume`] still holds the caller's session
+/// keeps the cursor, so invoking `run_gateway` again with the same
 /// session sends `RESUME` rather than a fresh `IDENTIFY` and the
 /// rejected dispatch (plus anything queued behind it) replays for the
-/// retry. Keep one session per logical Gateway run; start with
-/// [`GatewaySession::default`].
+/// retry — provided Discord accepts the resume. Gate such a retry on
+/// `can_resume()`: when Discord expires the session (close 4007/4009
+/// or a non-resumable `INVALID_SESSION`) the cursor is cleared with
+/// the failure, and re-entering then would `IDENTIFY` a fresh session
+/// and leave the rejected dispatch unrecoverable — surface the
+/// handler error instead. Keep one session per logical Gateway run;
+/// start with [`GatewaySession::default`].
 pub fn run_gateway(
     connector: &dyn GatewayConnector,
     token: &DiscordToken,
@@ -2618,6 +2624,33 @@ mod tests {
         }
     }
 
+    /// Parks like `PausableHandler`, then rejects on release: the
+    /// stand-in for a host turn still running when Discord expired the
+    /// session, so its rejection lands inside the teardown drain.
+    struct PausableFailingHandler {
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl GatewayHandler for PausableFailingHandler {
+        fn on_dispatch(
+            &mut self,
+            _event: &ChannelEvent,
+            _payload: &GatewayPayload,
+        ) -> Result<(), DiscordApiError> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let (mutex, condvar) = &*self.release;
+            let mut released = mutex.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+            Err(DiscordApiError::new(
+                "a4mc_discord_fixture_handler",
+                "fixture handler rejected the dispatch",
+            ))
+        }
+    }
+
     /// Rejects the first `failures` dispatches it sees, accepts the rest.
     struct FailFirstHandler {
         failures: usize,
@@ -2904,6 +2937,76 @@ mod tests {
             assert!(session.can_resume());
             let sent = sent.lock().unwrap();
             assert_eq!(sent[0]["op"], json!(OP_IDENTIFY));
+        }
+    }
+
+    #[test]
+    fn an_expired_session_surfaces_the_in_flight_rejection_without_a_cursor() {
+        // Discord expires the session while a dispatch is in flight and
+        // the handler rejects it during teardown: the failure returns
+        // with the resume cursor already cleared. A host retry that
+        // re-entered now would IDENTIFY a fresh session and the rejected
+        // dispatch could never replay, so the documented guard keys on
+        // `session.can_resume()` — this test pins the crate side of
+        // that contract: the handler error surfaces and the session
+        // reports it cannot resume.
+        for terminator in [
+            GatewayRead::Closed(Some(4007)),
+            GatewayRead::Closed(Some(4009)),
+            GatewayRead::Text(json!({"op": OP_INVALID_SESSION, "d": false}).to_string()),
+        ] {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let mut connection = ScriptedConnection::new(
+                [hello(), ready(), message(2), terminator],
+                Arc::clone(&sent),
+            );
+            let mut handler = PausableFailingHandler {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            };
+            let mut session = GatewaySession::default();
+            let runner = std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                let token = SecretToken::try_from_string(fixture_token()).unwrap();
+                let outcome = run_gateway_session(
+                    &mut connection,
+                    &token,
+                    &mut handler,
+                    &mut session,
+                    &GatewayConfig::default(),
+                    &stop,
+                );
+                (outcome, session)
+            });
+            // The dispatch parks the worker while the read loop
+            // consumes the expiry frame; releasing lets the rejection
+            // arrive inside the teardown drain.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while entered.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "dispatch never reached the handler"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            {
+                let (mutex, condvar) = &*release;
+                *mutex.lock().unwrap() = true;
+                condvar.notify_all();
+            }
+            let (outcome, session) = runner.join().unwrap();
+
+            let error = outcome.unwrap_err();
+            assert_eq!(error.code, HANDLER_FAILED_CODE);
+            assert!(session.expired);
+            assert!(
+                !session.can_resume(),
+                "the expired session still claims a resumable cursor: {session:?}"
+            );
+            assert!(session.sequence.is_none());
         }
     }
 }

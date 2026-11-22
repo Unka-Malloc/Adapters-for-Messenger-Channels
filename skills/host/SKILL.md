@@ -53,13 +53,17 @@ loop {
         Ok(()) => break,                         // stop flag or session bound
         Err(error)
             if error.code == a4mc_discord::HANDLER_FAILED_CODE
+                && session.can_resume()          // replay needs a live session
                 && handler_retries < 3 =>
         {
             // `session` still holds the cursor, so re-entering sends
-            // RESUME and the rejected dispatch replays for the retry.
+            // RESUME and the rejected dispatch replays for the retry —
+            // provided Discord accepts the RESUME.
             handler_retries += 1;
         }
-        Err(error) => return Err(error.into()),  // terminal close: give up
+        // Expired session or terminal close: a retry would IDENTIFY
+        // fresh and the rejected dispatch could never replay — give up.
+        Err(error) => return Err(error.into()),
     }
 }
 
@@ -95,7 +99,13 @@ and the same `stop` flag; resume state lives in the host-held
 `GatewaySession`, which the host passes to every `run_gateway`
 invocation — including the retries it drives itself after a handler
 failure returns — so the rejected dispatch replays under `RESUME`
-instead of a fresh `IDENTIFY`.
+instead of a fresh `IDENTIFY`. Gate such a retry on
+`session.can_resume()`: when Discord expires the session (close
+4007/4009 or a non-resumable `INVALID_SESSION`) the cursor is cleared
+with the failure, and re-entering would `IDENTIFY` fresh while the
+rejected dispatch stays unrecoverable — surface the handler error
+instead. The replay itself is conditional on Discord accepting the
+`RESUME`; a refused resume expires the session the same way.
 
 ## Rules that keep the contract
 

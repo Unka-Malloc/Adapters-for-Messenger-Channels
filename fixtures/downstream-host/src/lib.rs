@@ -103,10 +103,12 @@ mod tests {
     /// Pins the documented `run_gateway` call shape: the host retains
     /// the `GatewaySession`, passes it by mutable reference on every
     /// invocation, and re-enters with that same session when a handler
-    /// failure is returned so the retry resumes instead of dropping
-    /// the cursor. Never called — a compile-time probe that fails the
-    /// moment the documented example drifts from the signature a
-    /// composing host links against.
+    /// failure is returned — but only while `can_resume()` still
+    /// holds, since a retry against an expired session would open a
+    /// fresh `IDENTIFY` and leave the rejected dispatch unrecoverable.
+    /// Never called — a compile-time probe that fails the moment the
+    /// documented example drifts from the signature a composing host
+    /// links against.
     #[allow(dead_code)]
     fn the_documented_gateway_call_keeps_a_host_held_session(
         connector: &dyn a4mc_discord::GatewayConnector,
@@ -120,10 +122,18 @@ mod tests {
             match a4mc_discord::run_gateway(connector, token, handler, session, config) {
                 Ok(()) => return Ok(()),
                 Err(error)
-                    if error.code == a4mc_discord::HANDLER_FAILED_CODE && handler_retries < 3 =>
+                    if error.code == a4mc_discord::HANDLER_FAILED_CODE
+                        && session.can_resume()
+                        && handler_retries < 3 =>
                 {
+                    // The cursor survives the failure, so re-entering
+                    // sends RESUME and the rejected dispatch replays —
+                    // provided Discord accepts the resume.
                     handler_retries += 1;
                 }
+                // An expired session cleared the cursor with the
+                // failure: surface the handler error rather than
+                // IDENTIFY fresh and lose the rejected dispatch.
                 Err(error) => return Err(error),
             }
         }
