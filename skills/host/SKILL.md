@@ -43,11 +43,25 @@ let api = Arc::new(a4mc_discord::live_api(None)?);           // bot token via cu
 let channel = Arc::new(a4mc_discord::DiscordChannel::new(Arc::clone(&api)));
 let mut handler = MyDiscordHandler { channel };              // impl GatewayHandler
 let mut session = a4mc_discord::GatewaySession::default();   // host-held resume state
-a4mc_discord::run_gateway(
-    &a4mc_discord::LiveGatewayConnector, api.token(), &mut handler,
-    &mut session,
-    &a4mc_discord::GatewayModeConfig::default(),
-)?;
+let mut handler_retries = 0usize;
+loop {
+    match a4mc_discord::run_gateway(
+        &a4mc_discord::LiveGatewayConnector, api.token(), &mut handler,
+        &mut session,                            // same session on every retry
+        &a4mc_discord::GatewayModeConfig::default(),
+    ) {
+        Ok(()) => break,                         // stop flag or session bound
+        Err(error)
+            if error.code == a4mc_discord::HANDLER_FAILED_CODE
+                && handler_retries < 3 =>
+        {
+            // `session` still holds the cursor, so re-entering sends
+            // RESUME and the rejected dispatch replays for the retry.
+            handler_retries += 1;
+        }
+        Err(error) => return Err(error.into()),  // terminal close: give up
+    }
+}
 
 // A webhook host owns the HTTP server; the dialect verifies and lowers.
 // Build the receiver once at startup and share it across requests —
@@ -78,8 +92,10 @@ bounded session count, reconnect delay, envelope-dedupe capacity and
 the same shared `stop` flag. Discord's `GatewayModeConfig` carries the
 initial Gateway URL, intents, bounded session count, reconnect delays
 and the same `stop` flag; resume state lives in the host-held
-`GatewaySession` passed to every `run_gateway` invocation, so a
-handler failure retries with `RESUME` instead of a fresh `IDENTIFY`.
+`GatewaySession`, which the host passes to every `run_gateway`
+invocation — including the retries it drives itself after a handler
+failure returns — so the rejected dispatch replays under `RESUME`
+instead of a fresh `IDENTIFY`.
 
 ## Rules that keep the contract
 

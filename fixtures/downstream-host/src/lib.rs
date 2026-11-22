@@ -101,10 +101,12 @@ mod tests {
     }
 
     /// Pins the documented `run_gateway` call shape: the host retains
-    /// the `GatewaySession` and passes it by mutable reference on
-    /// every invocation. Never called — a compile-time probe that
-    /// fails the moment the documented example drifts from the
-    /// signature a composing host links against.
+    /// the `GatewaySession`, passes it by mutable reference on every
+    /// invocation, and re-enters with that same session when a handler
+    /// failure is returned so the retry resumes instead of dropping
+    /// the cursor. Never called — a compile-time probe that fails the
+    /// moment the documented example drifts from the signature a
+    /// composing host links against.
     #[allow(dead_code)]
     fn the_documented_gateway_call_keeps_a_host_held_session(
         connector: &dyn a4mc_discord::GatewayConnector,
@@ -113,6 +115,17 @@ mod tests {
         session: &mut a4mc_discord::GatewaySession,
         config: &a4mc_discord::GatewayModeConfig,
     ) -> Result<(), a4mc_discord::DiscordApiError> {
-        a4mc_discord::run_gateway(connector, token, handler, session, config)
+        let mut handler_retries = 0usize;
+        loop {
+            match a4mc_discord::run_gateway(connector, token, handler, session, config) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error.code == a4mc_discord::HANDLER_FAILED_CODE && handler_retries < 3 =>
+                {
+                    handler_retries += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
