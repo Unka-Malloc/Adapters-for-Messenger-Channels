@@ -228,6 +228,9 @@ pub struct ResolvedReply {
     pub sent: usize,
     /// The platform checkpoint of the send that stopped, if any.
     pub progress: Option<crate::transport::SendProgress>,
+    /// Unix milliseconds before which the reply must not be attempted
+    /// again — the durable deadline the same locked read observed.
+    pub retry_at_ms: Option<u64>,
 }
 
 /// The reply delivery state a conditional checkpoint clear leaves
@@ -754,11 +757,13 @@ impl BindingStore {
             // nor in need of a tombstone.
             let chat = chat_id.to_string();
             let guarded_at = document.revoked_chats.get(&chat).copied();
-            let staged = staged_pairing_offers(&dir).into_iter().any(|record| {
-                record.chat_id == chat_id
-                    && record.expires_at > now
-                    && guarded_at.is_none_or(|at| record.minted_revision > at)
-            });
+            let staged = staged_pairing_offers(document, &dir)
+                .into_iter()
+                .any(|record| {
+                    record.chat_id == chat_id
+                        && record.expires_at > now
+                        && guarded_at.is_none_or(|at| record.minted_revision > at)
+                });
             let revoked = removed || live || staged;
             if revoked {
                 // Tombstone the revocation at its own revision: a
@@ -1433,20 +1438,26 @@ impl BindingStore {
     }
 
     /// Clear a reply's durable platform checkpoint only while the
-    /// stored progress still equals `expected` — the checkpoint the
-    /// caller's resolve paired with the reply's variant. Progress a
-    /// store committed after that read belongs to the payload now
-    /// recorded and is adopted, never erased under a stale decision.
-    /// Returns the delivery state the same locked write leaves behind
-    /// — confirmed part count, remaining checkpoint and the retry
-    /// deadline it carries — so the resend continues from one coherent
-    /// record instead of mixing an older resolve's sent count with the
-    /// checkpoint a newer write earned. `None` means the durable
-    /// record no longer holds the task at all.
+    /// stored record still holds the whole delivery state the
+    /// caller's resolve decided on. A checkpoint comparison alone
+    /// cannot see a deferral another store recorded without touching
+    /// the checkpoint — including when both checkpoints are `None` —
+    /// and clearing under it would erase the newer deadline and let
+    /// the retry fire inside the wait it was owed. A record that has
+    /// advanced past `expected` in any field belongs to the payload
+    /// now recorded: the clear is skipped and the advanced state is
+    /// adopted, never erased under a stale decision. Returns the
+    /// delivery state the same locked write leaves behind — confirmed
+    /// part count, remaining checkpoint and the retry deadline it
+    /// carries — so the resend continues from one coherent record
+    /// instead of mixing an older resolve's count with the state a
+    /// newer write earned. `None` means the durable record no longer
+    /// holds the task at all — delivered and settled by another
+    /// runtime.
     pub fn clear_reply_progress(
         &mut self,
         key: impl Into<TaskKey>,
-        expected: Option<&crate::transport::SendProgress>,
+        expected: &ReplyResumeState,
     ) -> Result<Option<ReplyResumeState>> {
         let key = key.into();
         self.mutate(|document| {
@@ -1455,7 +1466,10 @@ impl BindingStore {
                 .iter_mut()
                 .find(|task| task.key() == key)
                 .map(|task| {
-                    if task.reply_progress.as_ref() == expected {
+                    if task.reply_sent == expected.sent
+                        && task.reply_progress.as_ref() == expected.progress.as_ref()
+                        && task.reply_retry_at_ms == expected.retry_at_ms
+                    {
                         task.reply_progress = None;
                         task.reply_retry_at_ms = None;
                     }
@@ -1695,7 +1709,7 @@ impl BindingStore {
         // resolve can never pair a freshly selected variant with a
         // checkpoint read from a different write, nor serve a variant
         // the document does not carry.
-        let (refused, sent, progress) =
+        let (refused, state) =
             self.resolve_reply_variant(task, staged.as_ref().map(|staged| &staged.effect))?;
         let text = if let Some(reply) = &task.reply {
             reply.clone()
@@ -1721,12 +1735,13 @@ impl BindingStore {
         };
         Ok(Some(ResolvedReply {
             text,
-            sent,
-            progress,
+            sent: state.sent,
+            progress: state.progress,
+            retry_at_ms: state.retry_at_ms,
         }))
     }
 
-    /// The variant and the delivery checkpoint a resolve answers with,
+    /// The variant and the delivery state a resolve answers with,
     /// decided from the task the document reloads under the lock. A
     /// live lapsed-offer substitution commits its refusal inside the
     /// same locked write that re-validates it; every other case answers
@@ -1738,7 +1753,7 @@ impl BindingStore {
         &mut self,
         task: &PendingUpdate,
         effect: Option<&StagedEffect>,
-    ) -> Result<(bool, usize, Option<crate::transport::SendProgress>)> {
+    ) -> Result<(bool, ReplyResumeState)> {
         self.refresh()?;
         let Some(held) = self
             .document
@@ -1749,9 +1764,17 @@ impl BindingStore {
         else {
             return Ok((
                 task.reply_refused,
-                task.reply_sent,
-                task.reply_progress.clone(),
+                ReplyResumeState {
+                    sent: task.reply_sent,
+                    progress: task.reply_progress.clone(),
+                    retry_at_ms: task.reply_retry_at_ms,
+                },
             ));
+        };
+        let held_state = || ReplyResumeState {
+            sent: held.reply_sent,
+            progress: held.reply_progress.clone(),
+            retry_at_ms: held.reply_retry_at_ms,
         };
         let substitutable = held.reply_sent == 0
             && held
@@ -1759,13 +1782,13 @@ impl BindingStore {
                 .as_ref()
                 .is_none_or(|progress| progress.confirmed.is_empty() && !progress.outcome_unknown);
         if held.reply_refused || !substitutable {
-            return Ok((held.reply_refused, held.reply_sent, held.reply_progress));
+            return Ok((held.reply_refused, held_state()));
         }
         let Some(effect) = effect else {
-            return Ok((held.reply_refused, held.reply_sent, held.reply_progress));
+            return Ok((held.reply_refused, held_state()));
         };
         if !pairing_offer_lapsed(&self.document, effect) {
-            return Ok((held.reply_refused, held.reply_sent, held.reply_progress));
+            return Ok((held.reply_refused, held_state()));
         }
         self.persist_refused_reply(task, effect)
     }
@@ -1774,21 +1797,24 @@ impl BindingStore {
     /// selection — re-validated against the reloaded document so a
     /// checkpoint another store instance earned between the resolve
     /// and this write keeps the text it was earned on instead of being
-    /// repointed under it. Returns the variant and the checkpoint the
-    /// committed document holds: progress landed in between leaves the
-    /// original offer selected, so the resolver answers with the
+    /// repointed under it. Returns the variant and the delivery state
+    /// the committed document holds: progress landed in between leaves
+    /// the original offer selected, so the resolver answers with the
     /// payload that checkpoint was earned on rather than the stale
     /// snapshot's refusal.
     fn persist_refused_reply(
         &mut self,
         task: &PendingUpdate,
         effect: &StagedEffect,
-    ) -> Result<(bool, usize, Option<crate::transport::SendProgress>)> {
+    ) -> Result<(bool, ReplyResumeState)> {
         let key = task.key();
         let stale = (
             task.reply_refused,
-            task.reply_sent,
-            task.reply_progress.clone(),
+            ReplyResumeState {
+                sent: task.reply_sent,
+                progress: task.reply_progress.clone(),
+                retry_at_ms: task.reply_retry_at_ms,
+            },
         );
         self.mutate(|document| {
             let lapsed = pairing_offer_lapsed(document, effect);
@@ -1811,8 +1837,11 @@ impl BindingStore {
                 .map(|task| {
                     (
                         task.reply_refused,
-                        task.reply_sent,
-                        task.reply_progress.clone(),
+                        ReplyResumeState {
+                            sent: task.reply_sent,
+                            progress: task.reply_progress.clone(),
+                            retry_at_ms: task.reply_retry_at_ms,
+                        },
                     )
                 }))
         })
@@ -2100,11 +2129,23 @@ fn serialized_len(document: &BindingDocument) -> Option<usize> {
 
 /// The pairing offers still living only in staged reply records —
 /// each returned as minted so a revocation can tombstone an offer the
-/// document itself cannot show.
-fn staged_pairing_offers(dir: &Path) -> Vec<PairingRecord> {
+/// document itself cannot show. An offer counts only while recovery
+/// can still bind it — the same gates `apply_staged` runs: a pending
+/// task still waiting to bind its reply, and a record whose payload
+/// is recoverable. An orphan manifest or a stage that died before its
+/// payload landed can never publish a code, so it is neither
+/// revocable nor owed a tombstone.
+fn staged_pairing_offers(document: &BindingDocument, dir: &Path) -> Vec<PairingRecord> {
     staged_update_keys(dir)
         .into_iter()
+        .filter(|key| {
+            document
+                .pending_updates
+                .iter()
+                .any(|task| task.key() == *key && !task.has_reply())
+        })
         .filter_map(|key| read_staged_manifest(dir, key))
+        .filter(|staged| staged.text.is_some() || dir.join(&staged.payload).is_file())
         .filter_map(|staged| match staged.effect {
             StagedEffect::ReplyPairing { record } => Some(record),
             _ => None,
@@ -2121,7 +2162,7 @@ fn staged_pairing_offers(dir: &Path) -> Vec<PairingRecord> {
 /// either already durable in the scan or lands after it.
 fn reclaim_revocations(document: &mut BindingDocument, dir: &Path) {
     let now = now_secs();
-    let guarded: Vec<(String, u64)> = staged_pairing_offers(dir)
+    let guarded: Vec<(String, u64)> = staged_pairing_offers(document, dir)
         .into_iter()
         .filter(|record| {
             record.expires_at > now
@@ -2399,12 +2440,14 @@ fn apply_effect(document: &mut BindingDocument, dir: &Path, effect: &StagedEffec
             // is neither revocable nor owed a tombstone.
             let chat = chat_id.to_string();
             let guarded_at = document.revoked_chats.get(&chat).copied();
-            let staged = staged_pairing_offers(dir).into_iter().any(|record| {
-                record.chat_id == *chat_id
-                    && user_id.is_none_or(|held| record.user_id == held)
-                    && record.expires_at > now
-                    && guarded_at.is_none_or(|at| record.minted_revision > at)
-            });
+            let staged = staged_pairing_offers(document, dir)
+                .into_iter()
+                .any(|record| {
+                    record.chat_id == *chat_id
+                        && user_id.is_none_or(|held| record.user_id == held)
+                        && record.expires_at > now
+                        && guarded_at.is_none_or(|at| record.minted_revision > at)
+                });
             let revoked = removed || live || staged;
             if revoked {
                 // Tombstone the revocation like `revoke` does: a staged
@@ -5052,8 +5095,10 @@ mod tests {
                 store.document.revoked_chats
             );
 
-            // A staged offer minted before the revocation keeps its
-            // tombstone while the record can still be replayed.
+            // A bound offer is owed no tombstone at all: it already
+            // applied its code to the pairings the revocation removes,
+            // and a bound record can never re-apply — nothing left to
+            // guard inside the same write.
             admit_filler(&mut store, 7);
             store
                 .record_pairing_and_reply(
@@ -5068,17 +5113,68 @@ mod tests {
                 .unwrap();
             assert!(store.revoke(9).unwrap());
             assert!(
-                store.document.revoked_chats.contains_key("9"),
-                "the guarded offer's tombstone was reclaimed early"
+                store.document.revoked_chats.is_empty(),
+                "a bound offer was owed a tombstone: {:?}",
+                store.document.revoked_chats
             );
-            // The task settles and its record is swept: the next
-            // mutation finds nothing left to guard and reclaims the
-            // tombstone — the freed admission space actually frees.
-            store.complete_update(7).unwrap();
-            store.prune_expired().unwrap();
+
+            // An offer that cannot land even its refused variant keeps
+            // its tombstone while the record could still publish the
+            // code on a freeing write — this one's oversized delivery
+            // key overflows the headroom the filler left, so the
+            // refused bind reverts and the offer stays unbound.
+            let minted_revision = store
+                .request_pairing(5, 5, Some("earlier".into()))
+                .unwrap()
+                .minted_revision;
+            admit_filler(&mut store, 8);
+            fill_document(&mut store, 6, 300);
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let pending_offer = StagedCompletion {
+                update_id: 8,
+                sequence: 0,
+                payload: manifest_file_name(TaskKey::new(0, 8)),
+                key: "k".repeat(4096),
+                effect: StagedEffect::ReplyPairing {
+                    record: PairingRecord {
+                        code: "PQRS-6789".to_owned(),
+                        chat_id: 9,
+                        user_id: 9,
+                        username: Some("alice".to_owned()),
+                        created_at: now_secs(),
+                        expires_at: now_secs() + PAIRING_TTL.as_secs(),
+                        minted_revision,
+                    },
+                },
+                text: Some("Pairing code: PQRS-6789".to_owned()),
+                refused_text: Some(
+                    "That pairing offer did not hold — send /start to request a fresh code."
+                        .to_owned(),
+                ),
+            };
+            std::fs::write(
+                dir.join(manifest_file_name(TaskKey::new(0, 8))),
+                serde_json::to_string(&pending_offer).unwrap(),
+            )
+            .unwrap();
+            assert!(store.staged_reply_unbound(8));
+            assert!(store.revoke(9).unwrap());
+            assert!(
+                store.document.revoked_chats.contains_key("9"),
+                "the unbound offer's tombstone was reclaimed early"
+            );
+            // Freeing the filler's space lets the refused variant
+            // bind: the offer can never publish again, so the same
+            // write reclaims the tombstone.
+            assert!(store.revoke(6).unwrap());
+            assert!(
+                store.pending_update(8).unwrap().reply_refused,
+                "the tombstoned offer bound its live variant once space freed"
+            );
             assert!(
                 store.document.revoked_chats.is_empty(),
-                "the settled offer's tombstone outlived its record"
+                "the bound refusal's tombstone was retained"
             );
         });
     }
@@ -5141,13 +5237,22 @@ mod tests {
             // tombstones it: before, this returned false and left the
             // code free to publish once any write freed space.
             assert!(store.revoke(9).unwrap());
+            // The tombstone does its whole job inside the same write:
+            // the offer binds its refused variant under it, and once
+            // bound the record can never re-publish — nothing left for
+            // the tombstone to guard, so it is reclaimed at once.
+            let task = store.pending_update(7).unwrap();
             assert!(
-                store.document.revoked_chats.contains_key("9"),
-                "a sidecar-only offer escaped the revocation's tombstone"
+                task.reply_refused,
+                "a revoked sidecar-only offer bound its live variant"
             );
-            // An unrelated freeing write reconciles the record: the
-            // tombstoned offer binds its refused variant instead of
-            // the pre-revocation code.
+            assert!(
+                store.document.revoked_chats.is_empty(),
+                "a bound refusal still needed a tombstone: {:?}",
+                store.document.revoked_chats
+            );
+            // An unrelated freeing write cannot resurrect the dead
+            // code: the bound record never re-applies.
             assert!(store.revoke(6).unwrap());
             let task = store.pending_update(7).unwrap();
             assert!(
@@ -5188,9 +5293,19 @@ mod tests {
                 reply, "revoked=true",
                 "a sidecar-only offer was not counted as revoked"
             );
+            // The same write binds the offer's refused variant under
+            // its tombstone — the refusal already certain, the
+            // tombstone is reclaimed at once rather than guarding a
+            // record that can never publish again.
+            let task = store.pending_update(7).unwrap();
             assert!(
-                store.document.revoked_chats.contains_key("9"),
-                "the staged revocation left no tombstone for the sidecar offer"
+                task.reply_refused,
+                "a sidecar-only offer outlived the staged revocation"
+            );
+            assert!(
+                store.document.revoked_chats.is_empty(),
+                "a bound refusal still needed a tombstone: {:?}",
+                store.document.revoked_chats
             );
             // The freeing write cannot publish the pre-revocation code.
             assert!(store.revoke(6).unwrap());
@@ -5241,6 +5356,88 @@ mod tests {
             assert!(
                 !store.document.revoked_chats.contains_key("9"),
                 "the staged revocation tombstoned a lapsed offer"
+            );
+        });
+    }
+
+    /// A staged offer reconciliation can never bind counts toward
+    /// neither revocation: an orphan manifest left by a settled task,
+    /// and a manifest whose payload can never be recovered, must not
+    /// report success or write a tombstone — the same gates the
+    /// staged-reconciliation scan applies.
+    #[test]
+    fn an_unbindable_staged_offer_reports_no_revocation() {
+        temp_store(|mut store| {
+            let dir = replies_dir(&store.path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let orphan = StagedCompletion {
+                update_id: 7,
+                sequence: 0,
+                payload: "reply-7.json".to_owned(),
+                key: "reply:7".to_owned(),
+                effect: StagedEffect::ReplyPairing {
+                    record: PairingRecord {
+                        code: "WXYZ-1234".to_owned(),
+                        chat_id: 9,
+                        user_id: 9,
+                        username: Some("alice".to_owned()),
+                        created_at: now_secs(),
+                        expires_at: now_secs() + PAIRING_TTL.as_secs(),
+                        minted_revision: 1,
+                    },
+                },
+                text: Some("Pairing code: WXYZ-1234".to_owned()),
+                refused_text: None,
+            };
+            std::fs::write(
+                dir.join("reply-7.json"),
+                serde_json::to_string(&orphan).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                !store.revoke(9).unwrap(),
+                "an orphan staged offer counted as revoked"
+            );
+            assert!(
+                !store.document.revoked_chats.contains_key("9"),
+                "an orphan staged offer earned a tombstone"
+            );
+
+            // The task still waits, unbound, but the payload the
+            // manifest names never landed: recovery has nothing to
+            // apply, so nothing is revoked.
+            admit_filler(&mut store, 8);
+            let dead = StagedCompletion {
+                update_id: 8,
+                sequence: 0,
+                payload: "reply-8.txt".to_owned(),
+                key: "reply:8".to_owned(),
+                effect: StagedEffect::ReplyPairing {
+                    record: PairingRecord {
+                        code: "ZXCV-9876".to_owned(),
+                        chat_id: 8,
+                        user_id: 8,
+                        username: Some("bob".to_owned()),
+                        created_at: now_secs(),
+                        expires_at: now_secs() + PAIRING_TTL.as_secs(),
+                        minted_revision: 1,
+                    },
+                },
+                text: None,
+                refused_text: None,
+            };
+            std::fs::write(
+                dir.join("reply-8.json"),
+                serde_json::to_string(&dead).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                !store.revoke(8).unwrap(),
+                "an unrecoverable staged offer counted as revoked"
+            );
+            assert!(
+                !store.document.revoked_chats.contains_key("8"),
+                "an unrecoverable staged offer earned a tombstone"
             );
         });
     }
@@ -5325,7 +5522,14 @@ mod tests {
                 .record_reply_checkpoint(7, None, Some(1_700_000_000))
                 .unwrap();
             let adopted = store
-                .clear_reply_progress(7, Some(&first))
+                .clear_reply_progress(
+                    7,
+                    &ReplyResumeState {
+                        sent: 0,
+                        progress: Some(first),
+                        retry_at_ms: None,
+                    },
+                )
                 .unwrap()
                 .expect("the task's resume state was lost");
             assert_eq!(
@@ -5349,7 +5553,14 @@ mod tests {
             // The checkpoint the resolve actually paired with the
             // variant clears — its owed deadline with it.
             let cleared = store
-                .clear_reply_progress(7, Some(&second))
+                .clear_reply_progress(
+                    7,
+                    &ReplyResumeState {
+                        sent: 1,
+                        progress: Some(second),
+                        retry_at_ms: Some(1_700_000_000),
+                    },
+                )
                 .unwrap()
                 .expect("the task's resume state was lost");
             assert!(cleared.progress.is_none());

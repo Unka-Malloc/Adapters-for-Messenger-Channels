@@ -779,13 +779,20 @@ pub fn run_gateway_session(
                         break;
                     }
                 }
-                if ack_tx
+                let rejected = result.is_err();
+                let reported = ack_tx
                     .send(DispatchAck {
                         sequence: work.payload.sequence,
                         result,
                     })
-                    .is_err()
-                {
+                    .is_ok();
+                // The session never commits past a rejection, so a
+                // dispatch still queued behind one must never run its
+                // callbacks: their sequences stay unconfirmed and the
+                // resumed session replays them — side effects that ran
+                // now would run twice. Report the rejection, then exit
+                // and leave the queue for the replay.
+                if !reported || rejected {
                     return;
                 }
             }
@@ -1346,6 +1353,33 @@ mod tests {
             _event: &ChannelEvent,
             _payload: &GatewayPayload,
         ) -> Result<(), DiscordApiError> {
+            Err(DiscordApiError::new(
+                "a4mc_discord_fixture_handler",
+                "fixture handler rejected the dispatch",
+            ))
+        }
+    }
+
+    /// Rejects every dispatch and counts how often the host turn ran.
+    /// The pause on the first call gives the session time to queue the
+    /// next dispatch behind the rejection, so a worker that kept
+    /// running would invoke a callback whose sequence was never
+    /// committed.
+    #[derive(Default)]
+    struct CountingFailingHandler {
+        calls: usize,
+    }
+
+    impl GatewayHandler for CountingFailingHandler {
+        fn on_dispatch(
+            &mut self,
+            _event: &ChannelEvent,
+            _payload: &GatewayPayload,
+        ) -> Result<(), DiscordApiError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             Err(DiscordApiError::new(
                 "a4mc_discord_fixture_handler",
                 "fixture handler rejected the dispatch",
@@ -1919,6 +1953,42 @@ mod tests {
         // (sequence 2) must remain replayable.
         assert_eq!(session.sequence, Some(1));
         assert_eq!(session.last_dispatched, Some(1));
+    }
+
+    #[test]
+    fn a_rejected_dispatch_leaves_queued_work_for_the_replay() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        // The worker parks inside the first rejection long enough for
+        // the session to hand off the next dispatch behind it. That
+        // queued work must never reach the handler: its sequence is
+        // never committed, a resumed session replays it, and side
+        // effects that ran now would run a second time.
+        let mut connection = ScriptedConnection::new(
+            [hello(), ready(), message(2), message(3)],
+            Arc::clone(&sent),
+        );
+        let mut handler = CountingFailingHandler::default();
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let error = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, HANDLER_FAILED_CODE);
+        assert_eq!(session.sequence, Some(1));
+        assert_eq!(session.last_dispatched, Some(1));
+        assert_eq!(
+            handler.calls, 1,
+            "a queued dispatch ran after the rejection"
+        );
     }
 
     #[test]
