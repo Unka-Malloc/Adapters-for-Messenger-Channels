@@ -497,14 +497,23 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                 // record whose payload cannot be resolved stays
                 // unfinished — settling over a paid result is never
                 // allowed — and the host is told it is stuck.
-                let reply = match processor_store.lock().unwrap().reply_text(&task) {
-                    Ok(Some(reply)) => reply,
+                let resolved = match processor_store.lock().unwrap().resolve_reply(&task) {
+                    Ok(Some(resolved)) => resolved,
                     Ok(None) => {
                         notify_stuck(&processor_stuck, task.key(), "a4mc_telegram_reply_lost");
                         return Ok(());
                     }
                     Err(error) => {
                         notify_stuck(&processor_stuck, task.key(), &failure_code(&error));
+                        // The resolve can commit durable state — a
+                        // lapsed offer's refusal — so its failures are
+                        // not all payload reads: a store write failure
+                        // reaches the supervising loop exactly like a
+                        // delivery persistence failure, instead of
+                        // parking the task until a restart.
+                        if is_resolve_write_failure(&error) {
+                            return Err(error);
+                        }
                         return Ok(());
                     }
                 };
@@ -519,9 +528,9 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
                     task.message.message_id,
                     task.key(),
                     &delivery_key,
-                    &reply,
-                    task.reply_sent,
-                    task.reply_progress.clone(),
+                    &resolved.text,
+                    resolved.sent,
+                    resolved.progress.clone(),
                     true,
                     &processor_stop,
                 ) {
@@ -654,19 +663,33 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         .iter()
         .map(|item| TaskKey::new(item.sequence, item.update_id))
         .collect();
-    for item in &stranded {
-        notify_stuck(
-            &on_stuck,
-            TaskKey::new(item.sequence, item.update_id),
-            &item.code,
-        );
-    }
     // Events the cursor confirmed past but whose callbacks never ran —
     // the lowered event cannot be replayed, so each becomes its
     // durable dropped record instead of vanishing on restart. A marker
     // at or above the cursor is still refetchable and stays for the
     // redelivered callback.
     store.lock().unwrap().settle_unconsumed_events()?;
+    // Alerts come out of the final recovery state, not the earlier
+    // snapshot: the settle's own write can free the room a stranded
+    // reply was waiting on and bind it — the resend queue below
+    // already carries it — so only a record still unbound reaches the
+    // host.
+    for item in &stranded {
+        let key = TaskKey::new(item.sequence, item.update_id);
+        // Only a record still stranded in the final durable state
+        // reaches the host: the settle's write can bind the record the
+        // earlier snapshot could not — its resend is queued below —
+        // and a task already carrying its finished reply is delivered
+        // work, not a stranded record.
+        let store = store.lock().unwrap();
+        if store.staged_reply_unbound(key)
+            && store
+                .pending_update(key)
+                .is_none_or(|task| !task.has_reply())
+        {
+            notify_stuck(&on_stuck, key, &item.code);
+        }
+    }
     // Resume admitted-but-unfinished work before polling — on the same
     // bounded admission path polled messages take: recovered replies
     // and unstarted messages enter the backlog in record order, so
@@ -1578,6 +1601,16 @@ fn is_persistence_failure(error: &anyhow::Error) -> bool {
             != Some("a4mc_telegram_reply_too_large")
 }
 
+/// Whether a reply-resolve failure came out of a durable write —
+/// the lapsed-offer refusal the resolve commits — rather than the
+/// payload read itself: a store that cannot take the write is a
+/// persistence failure for the supervising loop, while a reply that
+/// cannot be proven is a stranded record to report and retain.
+fn is_resolve_write_failure(error: &anyhow::Error) -> bool {
+    is_store_write_failure(error)
+        && error.to_string().split(':').next().map(str::trim) != Some("a4mc_telegram_reply_lost")
+}
+
 /// Whether a failed send is safe to retry from its checkpoint: the
 /// platform either never saw the request — a pre-connect failure — or
 /// definitively rejected it and said when to come back (429). An
@@ -1677,11 +1710,16 @@ fn deliver_recorded_reply<T: BotTransport>(
     let mut resume = progress;
     let mut transient_failures = 0u32;
     let mut index = sent;
-    // Whether a stale checkpoint was already dropped on this delivery —
-    // the mismatch recovery fires once, so a checkpoint that still does
-    // not apply after clearing surfaces as the error it is.
-    let mut checkpoint_cleared = false;
     while index < parts.len() {
+        // Each stale-checkpoint recovery re-arms per part: the reply's
+        // own durable checkpoint of THIS part and a foreign cached
+        // partial under THIS part's effective key are distinct
+        // positions the same retry can meet one after the other, and
+        // either that still refuses after its own clearing surfaces as
+        // the error it is. Clearing only ever drops the refused part's
+        // checkpoint — the confirmed prefix before it stays recorded.
+        let mut durable_cleared = false;
+        let mut cache_evicted = false;
         loop {
             // Before EVERY attempt it is still safe to reshape — the
             // leading send with no confirmed part and no uncertain
@@ -1703,12 +1741,12 @@ fn deliver_recorded_reply<T: BotTransport>(
                     let mut store = store.lock().unwrap();
                     store.refresh()?;
                     match store.pending_update(key) {
-                        Some(task) => store.reply_text(&task)?,
+                        Some(task) => store.resolve_reply(&task)?,
                         None => None,
                     }
                 };
-                if let Some(current) = current.filter(|current| *current != text) {
-                    text = current;
+                if let Some(current) = current.filter(|current| current.text != text) {
+                    text = current.text;
                     parts = reply_sends(chat_id, reply_to_message_id, delivery_key, &text);
                     // The attempt the checkpoint was earned on carried
                     // the replaced text — its position can never apply
@@ -1717,15 +1755,21 @@ fn deliver_recorded_reply<T: BotTransport>(
                     // key the checkpoint names, since a host dedupe
                     // hook may have moved it off the delivery key —
                     // and the durable checkpoint so the fresh text
-                    // starts its own send.
-                    checkpoint_cleared = true;
+                    // starts its own send. The durable clear is
+                    // guarded by the checkpoint this resolve paired
+                    // with the variant: progress another store
+                    // committed in between belongs to this payload and
+                    // is adopted for the retry, never erased.
+                    durable_cleared = true;
                     let effective = resume
                         .as_ref()
                         .and_then(|progress| progress.binding.as_ref())
                         .map(|binding| binding.dedupe_key.clone());
-                    resume = None;
                     channel.discard_partial(effective.as_deref().unwrap_or(delivery_key));
-                    store.lock().unwrap().record_reply_progress(key, 0, None)?;
+                    resume = store
+                        .lock()
+                        .unwrap()
+                        .clear_reply_progress(key, current.progress.as_ref())?;
                     continue;
                 }
             }
@@ -1751,40 +1795,70 @@ fn deliver_recorded_reply<T: BotTransport>(
                     break;
                 }
                 Err(tracked)
-                    if index == 0
-                        && !checkpoint_cleared
+                    if !cache_evicted
                         && tracked.error.code == "a4mc_telegram_resume_mismatch"
-                        && tracked.progress.as_deref().or(resume.as_ref()).is_some_and(
-                            |stale| stale.confirmed.is_empty() && !stale.outcome_unknown,
-                        ) =>
+                        && tracked.progress.as_deref().is_some_and(|stale| {
+                            stale.confirmed.is_empty() && !stale.outcome_unknown
+                        }) =>
                 {
-                    // The checkpoint this send resumed — the caller's
-                    // durable one, or the partial the channel cached
-                    // under the effective key the checkpoint's binding
-                    // names — was earned on a payload the prepared send
-                    // no longer matches: a lapsed pairing offer
-                    // substituted its refused variant, or a host hook
-                    // reshaped the send. Clearing is allowed only here,
-                    // where the refused checkpoint provably holds no
-                    // confirmed chunk and no uncertain outcome — a
-                    // mismatch alone never proves the platform saw
-                    // nothing, so a checkpoint with progress is kept
-                    // intact and surfaces as the error it is. The
-                    // cached entry is dropped under the checkpoint's
-                    // effective key: a host dedupe hook may have stored
+                    // The refused checkpoint came back for inspection —
+                    // the partial a foreign send parked under the
+                    // effective key this attempt resolved, never this
+                    // reply's progress. It provably holds no confirmed
+                    // chunk and no uncertain outcome, so it alone is
+                    // evicted: the reply's own durable checkpoint is
+                    // not the conflict and keeps its confirmed prefix
+                    // for the retry. The entry drops under the key its
+                    // binding names — a host dedupe hook may have filed
                     // it off the contract's delivery key, and clearing
-                    // only that key would leave the stale position to
-                    // refuse the next attempt forever.
+                    // only that key would leave the foreign position
+                    // to refuse the next attempt forever.
                     let effective = tracked
                         .progress
                         .as_deref()
-                        .or(resume.as_ref())
                         .and_then(|stale| stale.binding.as_ref())
                         .map(|binding| binding.dedupe_key.clone());
-                    checkpoint_cleared = true;
-                    resume = None;
+                    cache_evicted = true;
                     channel.discard_partial(effective.as_deref().unwrap_or(delivery_key));
-                    store.lock().unwrap().record_reply_progress(key, 0, None)?;
+                    continue;
+                }
+                Err(tracked)
+                    if !durable_cleared
+                        && tracked.error.code == "a4mc_telegram_resume_mismatch"
+                        && tracked.progress.is_none()
+                        && resume.as_ref().is_some_and(|stale| {
+                            stale.confirmed.is_empty() && !stale.outcome_unknown
+                        }) =>
+                {
+                    // The reply's own durable checkpoint no longer
+                    // applies to the prepared send — a lapsed pairing
+                    // offer substituted its refused variant, or a host
+                    // hook reshaped the send after earlier parts
+                    // already delivered. Clearing is allowed only
+                    // here, where the refused checkpoint provably
+                    // holds no confirmed chunk and no uncertain
+                    // outcome — a mismatch alone never proves the
+                    // platform saw nothing, so a checkpoint with
+                    // progress is kept intact and surfaces as the
+                    // error it is. The part at `index` sends fresh:
+                    // the confirmed prefix before it stays recorded,
+                    // and the cached position under the checkpoint's
+                    // effective key goes with it so the retry cannot
+                    // refuse on it again. The durable clear is guarded
+                    // by the checkpoint that just refused: progress
+                    // another store committed since is adopted for the
+                    // retry, never erased under a stale decision.
+                    let effective = resume
+                        .as_ref()
+                        .and_then(|stale| stale.binding.as_ref())
+                        .map(|binding| binding.dedupe_key.clone());
+                    durable_cleared = true;
+                    let expected = resume.take();
+                    channel.discard_partial(effective.as_deref().unwrap_or(delivery_key));
+                    resume = store
+                        .lock()
+                        .unwrap()
+                        .clear_reply_progress(key, expected.as_ref())?;
                     continue;
                 }
                 Err(tracked) => {
@@ -2525,6 +2599,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
         root
     }
@@ -4633,7 +4708,17 @@ mod tests {
         };
         let store = BindingStore::open_in(&root).unwrap();
         let handle = thread::spawn(move || run_channel_loop(transport, store, config));
-        thread::sleep(Duration::from_millis(400));
+        // Wait on the durable cursor, not a fixed window: the batch is
+        // fully settled — event redelivered, message sent — only once
+        // the offset moves past update 21.
+        wait_until(
+            || {
+                BindingStore::open_in(&root)
+                    .map(|store| store.poll_offset() == 22)
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(10),
+        );
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap().unwrap();
 
@@ -4814,7 +4899,17 @@ mod tests {
         };
         let store = BindingStore::open_in(&root).unwrap();
         let handle = thread::spawn(move || run_channel_loop(transport, store, config));
-        thread::sleep(Duration::from_millis(400));
+        // Wait on the durable cursor, not a fixed window: the refetched
+        // event reaches the hook and the batch commits before the
+        // offset moves to 14.
+        wait_until(
+            || {
+                BindingStore::open_in(&root)
+                    .map(|store| store.poll_offset() == 14)
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(10),
+        );
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap().unwrap();
         assert_eq!(
@@ -6273,6 +6368,7 @@ mod tests {
     #[test]
     fn a_restart_waits_out_a_sub_second_persisted_deadline() {
         let root = temp_root();
+        let staged = Instant::now();
         {
             let mut store = BindingStore::open_in(&root).unwrap();
             store
@@ -6312,12 +6408,14 @@ mod tests {
         };
         let store = BindingStore::open_in(&root).unwrap();
         let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
-        thread::sleep(Duration::from_millis(150));
+        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
+        // The reply's post only proves the deadline was honored if it
+        // lands after it — a fixed sleep cannot measure that under
+        // load, the elapsed clock can (millis truncation: 10ms leeway).
         assert!(
-            sent.lock().unwrap().is_empty(),
+            staged.elapsed() >= Duration::from_millis(390),
             "the persisted deadline was cut short on restart"
         );
-        wait_until(|| sent.lock().unwrap().len() == 1, Duration::from_secs(10));
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap();
         assert_eq!(sent.lock().unwrap()[0].1, "recorded reply");
@@ -7102,6 +7200,79 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_commit_failure_reaches_the_supervisor() {
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store
+            .admit_updates(
+                &[PendingUpdate {
+                    update_id: 7,
+                    sequence: 0,
+                    message: text_message(9, 9, Some("alice"), "/start", 7),
+                    reply: None,
+                    reply_key: None,
+                    reply_sent: 0,
+                    reply_progress: None,
+                    reply_file: None,
+                    reply_retry_at_ms: None,
+                    reply_refused: false,
+                }],
+                &[],
+                &[],
+                8,
+            )
+            .unwrap();
+        store
+            .record_pairing_and_reply(
+                9,
+                9,
+                Some("alice".into()),
+                7,
+                "reply:7",
+                |record| format!("Pairing code: {}", record.code),
+                "That pairing offer did not hold — send /start to request a fresh code.",
+            )
+            .unwrap();
+        // The exact offer the reply carries lapses: the resend's
+        // resolve must commit the refusal — a durable write, not a
+        // read. Its failure is a persistence failure for the
+        // supervising loop, never a resolved payload to report and
+        // park until a restart.
+        store.request_pairing(9, 9, Some("alice".into())).unwrap();
+        // Startup's own event-settle write stays healthy; the
+        // refusal's commit is the one that fails.
+        store.fail_next_write_after_for_test(1);
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(true));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            ..RuntimeConfig::default()
+        };
+        let error = run_channel_loop(transport, store, config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a4mc_telegram_state_write_failed"),
+            "the refusal commit failure never reached the supervisor: {error}"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a send posted while its refusal commit failed"
+        );
+        let task = BindingStore::open_in(&root)
+            .unwrap()
+            .pending_update(7)
+            .expect("the recorded reply was settled over");
+        assert!(task.has_reply());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn an_agent_command_refuses_after_its_authorized_pairing_vanishes() {
         let _lane_guard = crate::LANE_TEST_LOCK
             .lock()
@@ -7567,7 +7738,7 @@ mod tests {
         };
         let root_for_host = root.clone();
         let store = BindingStore::open_in(&root).unwrap();
-        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config));
         // A second store instance — the host revoking a binding — frees
         // the pinned space and binds task 2's record in the same write.
         // Its notification lives only in that instance's memory, so the
@@ -7593,7 +7764,19 @@ mod tests {
             Duration::from_secs(15),
         );
         stop.store(true, Ordering::SeqCst);
-        handle.join().unwrap();
+        // Either exit is lawful: the poller may still be waiting out the
+        // unadmittable update when stop lands, or — once the discovered
+        // bind has fully drained and the store still refuses — it may
+        // already have surfaced the permanent refusal the failure
+        // budget exists for. What this test pins is that the reply
+        // bound inside the refused admission delivered either way.
+        match handle.join().unwrap() {
+            Ok(_) => {}
+            Err(error) => assert!(
+                error.to_string().contains("a4mc_telegram_poll_failed"),
+                "unexpected loop error: {error}"
+            ),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8208,6 +8391,8 @@ mod tests {
             .unwrap();
         }
         let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let stranded = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let observed = Arc::clone(&stranded);
         let transport = MockBotTransport {
             sent: Arc::clone(&sent),
             ..MockBotTransport::default()
@@ -8216,6 +8401,12 @@ mod tests {
         let config = RuntimeConfig {
             poll_timeout_secs: 1,
             stop: Arc::clone(&stop),
+            on_stuck: Some(Box::new(move |item: &StrandedReply| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((item.update_id, item.code.clone()));
+            })),
             ..RuntimeConfig::default()
         };
         let store = BindingStore::open_in(&root).unwrap();
@@ -8241,6 +8432,11 @@ mod tests {
                 .pending_updates()
                 .is_empty(),
             "the reply event cleanup bound never settled"
+        );
+        assert!(
+            stranded.lock().unwrap().is_empty(),
+            "a reply the recovery settle bound was still reported stuck: {:?}",
+            *stranded.lock().unwrap()
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8350,6 +8546,205 @@ mod tests {
                 .is_empty(),
             "the externally bound reply never settled"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_foreign_cached_partial_yields_to_the_durable_checkpoint() {
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store
+            .admit_updates(
+                &[PendingUpdate {
+                    update_id: 7,
+                    sequence: 0,
+                    message: text_message(9, 9, Some("bob"), "waiting", 7),
+                    reply: None,
+                    reply_key: None,
+                    reply_sent: 0,
+                    reply_progress: None,
+                    reply_file: None,
+                    reply_retry_at_ms: None,
+                    reply_refused: false,
+                }],
+                &[],
+                &[],
+                8,
+            )
+            .unwrap();
+        // Two platform chunks inside one contract send: the first is
+        // confirmed, the second definitively rejected — the durable
+        // checkpoint that must survive the foreign collision.
+        let text = "x".repeat(9_000);
+        store.record_reply(7, &text, "reply:7").unwrap();
+        let store = Mutex::new(store);
+        let stop = AtomicBool::new(false);
+
+        // Earn the real checkpoint on a scratch channel so its binding
+        // carries this payload's genuine digest.
+        let earning = TelegramChannel::new(Arc::new(MockBotTransport {
+            fail_send_at_part: Some((
+                1,
+                TelegramApiError::new("a4mc_telegram_bad_request", "rejected"),
+                false,
+            )),
+            ..MockBotTransport::default()
+        }));
+        let mut outbound = a4mc::OutboundMessage::new("9", &text, "reply:7");
+        outbound.reply_to_message_id = Some(a4mc::ExternalMessageId::from("7"));
+        let checkpoint = earning
+            .send_tracked(&outbound, None, &mut |_| Ok(()))
+            .unwrap_err()
+            .progress
+            .map(|progress| *progress)
+            .expect("the stopped send carried no checkpoint");
+        assert_eq!(checkpoint.confirmed.len(), 1);
+        store
+            .lock()
+            .unwrap()
+            .record_reply_checkpoint(7, Some(checkpoint.clone()), None)
+            .unwrap();
+
+        // A foreign send parked its own safe-empty partial under the
+        // same effective key: it refuses this reply's resume, but it is
+        // not the reply's progress — evicting it must not cost the
+        // durable checkpoint its confirmed chunk.
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let channel = TelegramChannel::new(Arc::new(MockBotTransport {
+            sent: Arc::clone(&sent),
+            fail_send_at_part: Some((
+                0,
+                TelegramApiError::new("a4mc_telegram_bad_request", "rejected"),
+                false,
+            )),
+            ..MockBotTransport::default()
+        }));
+        assert!(
+            channel
+                .send_tracked(
+                    &a4mc::OutboundMessage::new("9", "a different payload", "reply:7"),
+                    None,
+                    &mut |_| Ok(()),
+                )
+                .is_err(),
+            "the foreign send must stop mid-flight to park its partial"
+        );
+
+        deliver_recorded_reply(
+            &channel,
+            &store,
+            9,
+            7,
+            TaskKey::new(0, 7),
+            "reply:7",
+            &text,
+            0,
+            Some(checkpoint),
+            true,
+            &stop,
+        )
+        .unwrap();
+
+        // The foreign entry was evicted alone: the resend continued
+        // from the durable checkpoint's next_part instead of reposting
+        // the confirmed leading chunk.
+        let posts = sent.lock().unwrap().clone();
+        assert_eq!(
+            posts
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<String>(),
+            text[4_096..],
+            "the durable confirmed chunk was reposted: {posts:?}"
+        );
+        let task = store.lock().unwrap().pending_update(7).unwrap();
+        assert_eq!(task.reply_sent, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_safe_mismatch_after_the_prefix_clears_only_that_part() {
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store
+            .admit_updates(
+                &[PendingUpdate {
+                    update_id: 7,
+                    sequence: 0,
+                    message: text_message(9, 9, Some("bob"), "waiting", 7),
+                    reply: None,
+                    reply_key: None,
+                    reply_sent: 0,
+                    reply_progress: None,
+                    reply_file: None,
+                    reply_retry_at_ms: None,
+                    reply_refused: false,
+                }],
+                &[],
+                &[],
+                8,
+            )
+            .unwrap();
+        // Two contract parts: the first is confirmed delivered, the
+        // second's durable checkpoint was earned before the host
+        // reshaped the send — zero confirmed chunks and a known
+        // rejection, safe to clear without touching the prefix.
+        let text = format!("{}{}", "a".repeat(32 * 1024), "tail");
+        store.record_reply(7, &text, "reply:7").unwrap();
+        store
+            .record_reply_progress(
+                7,
+                1,
+                Some(SendProgress {
+                    confirmed: vec![],
+                    next_part: 0,
+                    outcome_unknown: false,
+                    binding: Some(crate::transport::SendBinding {
+                        dedupe_key: "reply:7:1".to_owned(),
+                        chat_id: 9,
+                        payload_digest: "0".repeat(64),
+                    }),
+                }),
+            )
+            .unwrap();
+        let store = Mutex::new(store);
+        let stop = AtomicBool::new(false);
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let channel = TelegramChannel::new(Arc::new(MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        }));
+
+        let progress = store
+            .lock()
+            .unwrap()
+            .pending_update(7)
+            .and_then(|task| task.reply_progress);
+        deliver_recorded_reply(
+            &channel,
+            &store,
+            9,
+            7,
+            TaskKey::new(0, 7),
+            "reply:7",
+            &text,
+            1,
+            progress,
+            true,
+            &stop,
+        )
+        .unwrap();
+
+        // Only the mismatched part resent: the confirmed first part is
+        // never reposted and never lost.
+        let posts = sent.lock().unwrap().clone();
+        assert_eq!(
+            posts.as_slice(),
+            &[(9, "tail".to_owned())],
+            "the delivered prefix was reposted or the part never recovered: {posts:?}"
+        );
+        let task = store.lock().unwrap().pending_update(7).unwrap();
+        assert_eq!(task.reply_sent, 2);
         let _ = std::fs::remove_dir_all(root);
     }
 }

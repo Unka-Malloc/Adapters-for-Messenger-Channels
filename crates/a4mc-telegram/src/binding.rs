@@ -216,6 +216,20 @@ impl PendingUpdate {
     }
 }
 
+/// A resolved reply payload and the durable delivery checkpoint the
+/// same locked read observed — the pair is coherent only together, so
+/// a resend never drives a freshly committed variant off a checkpoint
+/// an older snapshot happened to hold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedReply {
+    /// The deliverable text — the live or committed refused variant.
+    pub text: String,
+    /// Contract-level sends confirmed so far — the resume prefix.
+    pub sent: usize,
+    /// The platform checkpoint of the send that stopped, if any.
+    pub progress: Option<crate::transport::SendProgress>,
+}
+
 impl DroppedUpdate {
     /// The record's full claim identity — sequence plus update id.
     fn key(&self) -> TaskKey {
@@ -566,6 +580,14 @@ impl BindingStore {
             // Binds landing here commit only with the candidate — the
             // fallback path below replays them on its own next write.
             let bound_after = apply_staged(&mut candidate, &dir);
+            // A revocation tombstone is owed only while a staged offer
+            // minted at or before it can still be replayed — reclaim
+            // each entry the replies directory no longer guards before
+            // the size check, so a drained history cannot strand the
+            // write on space its own dead entries hold.
+            if !candidate.revoked_chats.is_empty() {
+                reclaim_revocations(&mut candidate, &dir);
+            }
             // The file must stay readable under its own bound: a
             // mutation whose result would exceed the read limit is
             // refused before it replaces the document, so the store can
@@ -585,6 +607,9 @@ impl BindingStore {
             // but the reconciled document still commits on its own so
             // the staged record is never overtaken by a newer write.
             if staged != self.document {
+                if !staged.revoked_chats.is_empty() {
+                    reclaim_revocations(&mut staged, &dir);
+                }
                 let raw = serde_json::to_string_pretty(&staged)?;
                 if raw.len() <= MAX_STATE_BYTES {
                     atomic_write_private_text(&self.path, &raw)?;
@@ -684,17 +709,28 @@ impl BindingStore {
     }
 
     pub fn revoke(&mut self, chat_id: i64) -> Result<bool> {
+        let dir = replies_dir(&self.path);
         self.mutate(|document| {
             let removed = document.chats.remove(&chat_id.to_string()).is_some();
             let before = document.pairings.len();
             document.pairings.retain(|record| record.chat_id != chat_id);
-            let revoked = removed || document.pairings.len() != before;
+            // An offer whose record never fit the document lives only
+            // in its sidecar — nothing here names it, yet the next
+            // write that frees space would still bind and publish its
+            // code. The revocation recognizes and tombstones it like
+            // the offers the document can show.
+            let chat = chat_id.to_string();
+            let guarded_at = document.revoked_chats.get(&chat).copied();
+            let staged = staged_pairing_offers(&dir).into_iter().any(|record| {
+                record.chat_id == chat_id && guarded_at.is_none_or(|at| record.minted_revision > at)
+            });
+            let revoked = removed || document.pairings.len() != before || staged;
             if revoked {
                 // Tombstone the revocation at its own revision: a
                 // staged offer minted before it can never re-publish
                 // now that the binding that refused it is gone.
                 let revision = next_revision(document);
-                document.revoked_chats.insert(chat_id.to_string(), revision);
+                document.revoked_chats.insert(chat, revision);
             }
             Ok(revoked)
         })
@@ -1091,7 +1127,7 @@ impl BindingStore {
                 prior_session: Some(expected.session_id.clone()),
                 binding_revision: Some(expected.revision),
             };
-            let applied = apply_effect(document, &effect);
+            let applied = apply_effect(document, &dir, &effect);
             let (applied_text, refused_text) = (text(true), text(false));
             let reply = if applied {
                 applied_text.clone()
@@ -1140,7 +1176,7 @@ impl BindingStore {
                     .get(&chat_id.to_string())
                     .map(|binding| binding.user_id),
             };
-            let removed = apply_effect(document, &effect);
+            let removed = apply_effect(document, &dir, &effect);
             let (applied_text, refused_text) = (text(true), text(false));
             let reply = if removed {
                 applied_text.clone()
@@ -1195,7 +1231,7 @@ impl BindingStore {
                 user_id: Some(user_id),
                 binding_revision: Some(expected.revision),
             };
-            let applied = apply_effect(document, &effect);
+            let applied = apply_effect(document, &dir, &effect);
             let (applied_text, refused_text) = (text(true), text(false));
             let reply = if applied {
                 applied_text.clone()
@@ -1268,7 +1304,7 @@ impl BindingStore {
             let effect = StagedEffect::ReplyPairing {
                 record: record.clone(),
             };
-            apply_effect(document, &effect);
+            apply_effect(document, &dir, &effect);
             stage_reply(
                 document,
                 &dir,
@@ -1344,6 +1380,36 @@ impl BindingStore {
                 task.reply_retry_at_ms = None;
             }
             Ok(())
+        })
+    }
+
+    /// Clear a reply's durable platform checkpoint only while the
+    /// stored progress still equals `expected` — the checkpoint the
+    /// caller's resolve paired with the reply's variant. Progress a
+    /// store committed after that read belongs to the payload now
+    /// recorded and is adopted, never erased under a stale decision.
+    /// Returns the stored progress that remains: `None` when the
+    /// expected checkpoint was cleared or none is held.
+    pub fn clear_reply_progress(
+        &mut self,
+        key: impl Into<TaskKey>,
+        expected: Option<&crate::transport::SendProgress>,
+    ) -> Result<Option<crate::transport::SendProgress>> {
+        let key = key.into();
+        self.mutate(|document| {
+            Ok(document
+                .pending_updates
+                .iter_mut()
+                .find(|task| task.key() == key)
+                .and_then(|task| {
+                    if task.reply_progress.as_ref() == expected {
+                        task.reply_progress = None;
+                        task.reply_retry_at_ms = None;
+                        None
+                    } else {
+                        task.reply_progress.clone()
+                    }
+                }))
         })
     }
 
@@ -1546,51 +1612,129 @@ impl BindingStore {
     /// resume the refusal's progress against the recorded offer text
     /// and refuse the send forever.
     pub fn reply_text(&mut self, task: &PendingUpdate) -> Result<Option<String>> {
-        if let Some(reply) = &task.reply {
-            return Ok(Some(reply.clone()));
-        }
-        let Some(name) = &task.reply_file else {
+        Ok(self.resolve_reply(task)?.map(|resolved| resolved.text))
+    }
+
+    /// Resolve a recorded reply's deliverable payload together with the
+    /// durable delivery checkpoint the same document state holds: the
+    /// text and the progress governing it come out of one locked
+    /// read — and, for a refusal the resolve commits, one locked
+    /// write — so a caller can never pair a freshly selected variant
+    /// with a checkpoint read from a different write, nor erase
+    /// progress another store landed under it.
+    pub fn resolve_reply(&mut self, task: &PendingUpdate) -> Result<Option<ResolvedReply>> {
+        if task.reply.is_none() && task.reply_file.is_none() {
             return Ok(None);
+        }
+        let staged = match task.reply_file.as_deref() {
+            Some(name) if name.ends_with(".json") => Some(
+                read_staged_record(&self.path, name, task.key())?
+                    .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))?,
+            ),
+            _ => None,
         };
-        if name.ends_with(".json") {
-            let staged = read_staged_record(&self.path, name, task.key())?
-                .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))?;
-            let substitutable = task.reply_sent == 0
-                && task.reply_progress.as_ref().is_none_or(|progress| {
-                    progress.confirmed.is_empty() && !progress.outcome_unknown
-                });
-            let lapsed = !task.reply_refused
-                && substitutable
-                && pairing_offer_lapsed(&self.document, &staged.effect);
-            if lapsed {
-                self.persist_refused_reply(task.key(), &staged.effect)?;
-            }
-            let refused = task.reply_refused || lapsed;
-            return if refused {
+        // The variant and the checkpoint come out of the task the
+        // document reloads under the lock — never the caller's
+        // snapshot: a refusal or a progress record another store
+        // committed in between is answered by the durable state, so a
+        // resolve can never pair a freshly selected variant with a
+        // checkpoint read from a different write, nor serve a variant
+        // the document does not carry.
+        let (refused, sent, progress) =
+            self.resolve_reply_variant(task, staged.as_ref().map(|staged| &staged.effect))?;
+        let text = if let Some(reply) = &task.reply {
+            reply.clone()
+        } else if let Some(staged) = staged {
+            if refused {
                 staged.refused_text.or(staged.text)
             } else {
                 staged.text
             }
-            .map(Some)
-            .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"));
-        }
-        if task.reply_refused {
+            .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))?
+        } else if refused {
             let manifest = manifest_file_name(task.key());
-            return read_reply_payload(&self.path, &manifest, task.key(), true)?
-                .map(Some)
-                .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"));
+            read_reply_payload(&self.path, &manifest, task.key(), true)?
+                .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))?
+        } else {
+            read_reply_payload(
+                &self.path,
+                task.reply_file.as_deref().expect("reply is file-backed"),
+                task.key(),
+                false,
+            )?
+            .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))?
+        };
+        Ok(Some(ResolvedReply {
+            text,
+            sent,
+            progress,
+        }))
+    }
+
+    /// The variant and the delivery checkpoint a resolve answers with,
+    /// decided from the task the document reloads under the lock. A
+    /// live lapsed-offer substitution commits its refusal inside the
+    /// same locked write that re-validates it; every other case answers
+    /// the flag the durable record already carries, so a refusal is
+    /// served only while the document holds it. A task the durable
+    /// record no longer knows falls back to the caller's snapshot —
+    /// nothing durable governs it.
+    fn resolve_reply_variant(
+        &mut self,
+        task: &PendingUpdate,
+        effect: Option<&StagedEffect>,
+    ) -> Result<(bool, usize, Option<crate::transport::SendProgress>)> {
+        self.refresh()?;
+        let Some(held) = self
+            .document
+            .pending_updates
+            .iter()
+            .find(|held| held.key() == task.key())
+            .cloned()
+        else {
+            return Ok((
+                task.reply_refused,
+                task.reply_sent,
+                task.reply_progress.clone(),
+            ));
+        };
+        let substitutable = held.reply_sent == 0
+            && held
+                .reply_progress
+                .as_ref()
+                .is_none_or(|progress| progress.confirmed.is_empty() && !progress.outcome_unknown);
+        if held.reply_refused || !substitutable {
+            return Ok((held.reply_refused, held.reply_sent, held.reply_progress));
         }
-        read_reply_payload(&self.path, name, task.key(), false)?
-            .map(Some)
-            .ok_or_else(|| anyhow!("a4mc_telegram_reply_lost"))
+        let Some(effect) = effect else {
+            return Ok((held.reply_refused, held.reply_sent, held.reply_progress));
+        };
+        if !pairing_offer_lapsed(&self.document, effect) {
+            return Ok((held.reply_refused, held.reply_sent, held.reply_progress));
+        }
+        self.persist_refused_reply(task, effect)
     }
 
     /// Commit the durable form of a lapsed offer's refused-variant
     /// selection — re-validated against the reloaded document so a
     /// checkpoint another store instance earned between the resolve
     /// and this write keeps the text it was earned on instead of being
-    /// repointed under it.
-    fn persist_refused_reply(&mut self, key: TaskKey, effect: &StagedEffect) -> Result<()> {
+    /// repointed under it. Returns the variant and the checkpoint the
+    /// committed document holds: progress landed in between leaves the
+    /// original offer selected, so the resolver answers with the
+    /// payload that checkpoint was earned on rather than the stale
+    /// snapshot's refusal.
+    fn persist_refused_reply(
+        &mut self,
+        task: &PendingUpdate,
+        effect: &StagedEffect,
+    ) -> Result<(bool, usize, Option<crate::transport::SendProgress>)> {
+        let key = task.key();
+        let stale = (
+            task.reply_refused,
+            task.reply_sent,
+            task.reply_progress.clone(),
+        );
         self.mutate(|document| {
             let lapsed = pairing_offer_lapsed(document, effect);
             if let Some(task) = document
@@ -1605,8 +1749,19 @@ impl BindingStore {
             {
                 task.reply_refused = true;
             }
-            Ok(())
+            Ok(document
+                .pending_updates
+                .iter()
+                .find(|task| task.key() == key)
+                .map(|task| {
+                    (
+                        task.reply_refused,
+                        task.reply_sent,
+                        task.reply_progress.clone(),
+                    )
+                }))
         })
+        .map(|found| found.unwrap_or(stale))
     }
 
     /// Persist one update id the runtime could not hand to the host as a
@@ -1888,6 +2043,47 @@ fn serialized_len(document: &BindingDocument) -> Option<usize> {
         .map(|raw| raw.len())
 }
 
+/// The pairing offers still living only in staged reply records —
+/// each returned as minted so a revocation can tombstone an offer the
+/// document itself cannot show.
+fn staged_pairing_offers(dir: &Path) -> Vec<PairingRecord> {
+    staged_update_keys(dir)
+        .into_iter()
+        .filter_map(|key| read_staged_manifest(dir, key))
+        .filter_map(|staged| match staged.effect {
+            StagedEffect::ReplyPairing { record } => Some(record),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Reclaim revocation tombstones no staged offer can still need: a
+/// tombstone guards the replies directory's records minted at or
+/// before it, so once every such offer has expired or settled — its
+/// own refusal is already certain without the tombstone — the entry
+/// would only consume the bounded document forever. Runs inside the
+/// mutation's lock, so a record being written by another mutation is
+/// either already durable in the scan or lands after it.
+fn reclaim_revocations(document: &mut BindingDocument, dir: &Path) {
+    let now = now_secs();
+    let guarded: Vec<(String, u64)> = staged_pairing_offers(dir)
+        .into_iter()
+        .filter(|record| {
+            record.expires_at > now
+                && !document
+                    .chats
+                    .get(&record.chat_id.to_string())
+                    .is_some_and(|binding| binding.paired && binding.user_id == record.user_id)
+        })
+        .map(|record| (record.chat_id.to_string(), record.minted_revision))
+        .collect();
+    document.revoked_chats.retain(|chat_id, revoked_at| {
+        guarded
+            .iter()
+            .any(|(chat, minted)| chat == chat_id && minted <= revoked_at)
+    });
+}
+
 /// Bind every applicable staged completion on the candidate document:
 /// the declared effect re-applies exactly as the record's own commit
 /// performed it, and the task gains the payload pointer and delivery
@@ -1947,7 +2143,7 @@ fn apply_staged(document: &mut BindingDocument, dir: &Path) -> Vec<TaskKey> {
         // by `stranded_staged` — instead of letting every mutation
         // that replays it fail on a document it can never commit.
         let before = document.clone();
-        let applied = apply_effect(document, &staged.effect);
+        let applied = apply_effect(document, dir, &staged.effect);
         let task = &mut document.pending_updates[index];
         task.reply = None;
         task.reply_file = Some(staged.payload.clone());
@@ -2079,7 +2275,7 @@ fn next_revision(document: &mut BindingDocument) -> u64 {
 /// staged against no longer holds. Returns whether the effect's state
 /// change landed: for the revocation that is whether anything was
 /// removed; for the routing effects whether the guarded write applied.
-fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
+fn apply_effect(document: &mut BindingDocument, dir: &Path, effect: &StagedEffect) -> bool {
     match effect {
         StagedEffect::Reply => true,
         StagedEffect::ReplySession {
@@ -2129,13 +2325,25 @@ fn apply_effect(document: &mut BindingDocument, effect: &StagedEffect) -> bool {
             document.pairings.retain(|record| {
                 record.chat_id != *chat_id || user_id.is_some_and(|held| record.user_id != held)
             });
-            let revoked = removed || document.pairings.len() != before;
+            // A staged offer that never fit the document leaves no
+            // pairing to remove — recognize and tombstone it anyway,
+            // scoped to the revoking user exactly like the pairing
+            // records are, so reconciliation cannot publish the
+            // pre-revocation code once unrelated space frees.
+            let chat = chat_id.to_string();
+            let guarded_at = document.revoked_chats.get(&chat).copied();
+            let staged = staged_pairing_offers(dir).into_iter().any(|record| {
+                record.chat_id == *chat_id
+                    && user_id.is_none_or(|held| record.user_id == held)
+                    && guarded_at.is_none_or(|at| record.minted_revision > at)
+            });
+            let revoked = removed || document.pairings.len() != before || staged;
             if revoked {
                 // Tombstone the revocation like `revoke` does: a staged
                 // offer minted before it can never re-publish through
                 // the space the removal freed.
                 let revision = next_revision(document);
-                document.revoked_chats.insert(chat_id.to_string(), revision);
+                document.revoked_chats.insert(chat, revision);
             }
             revoked
         }
@@ -2328,6 +2536,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
         let store = BindingStore::open_in(&root).unwrap();
         body(store);
@@ -2427,6 +2636,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
         let path = root.join(STATE_FILE);
         let legacy = serde_json::json!({
@@ -2478,6 +2688,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
         let path = root.join(STATE_FILE);
         std::fs::write(
@@ -4316,6 +4527,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
         let mut first = BindingStore::open_in(&root).unwrap();
         admit_filler(&mut first, 2);
@@ -4699,6 +4911,282 @@ mod tests {
                     .any(|held| held.code == fresh.code),
                 "a post-revocation offer was refused with the old ones"
             );
+        });
+    }
+
+    #[test]
+    fn a_lapsed_resolve_returns_the_variant_the_committed_state_holds() {
+        temp_store(|mut store| {
+            let path = store.path.clone();
+            admit_filler(&mut store, 7);
+            let applied = store
+                .record_pairing_and_reply(
+                    9,
+                    9,
+                    Some("alice".into()),
+                    7,
+                    "reply:7",
+                    |record| format!("Pairing code: {}", record.code),
+                    "That pairing offer did not hold — send /start to request a fresh code.",
+                )
+                .unwrap();
+            // The exact offer the reply carries lapses on this same
+            // store, then the snapshot is read — still showing no send
+            // progress.
+            store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            let task = store.pending_update(7).unwrap();
+            // Another store instance commits the reply's first
+            // confirmed chunk between the snapshot read and the
+            // resolve's locked write: the refusal selection can no
+            // longer commit under it.
+            let mut other = BindingStore::open(path).unwrap();
+            other
+                .record_reply_checkpoint(
+                    7,
+                    Some(crate::transport::SendProgress {
+                        confirmed: vec![11],
+                        next_part: 1,
+                        outcome_unknown: false,
+                        binding: None,
+                    }),
+                    None,
+                )
+                .unwrap();
+            // The resolver answers with the payload that checkpoint
+            // was earned on — not the stale snapshot's refusal.
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some(applied.as_str()),
+                "a checkpointed send was repointed at the refusal"
+            );
+            let held = BindingStore::open(store.path.clone())
+                .unwrap()
+                .pending_update(7)
+                .unwrap();
+            assert!(
+                !held.reply_refused,
+                "the committed state selected the refusal under live progress"
+            );
+        });
+    }
+
+    #[test]
+    fn a_revocation_tombstone_is_reclaimed_once_no_guarded_offer_remains() {
+        temp_store(|mut store| {
+            // No staged offer exists for the chat: the tombstone the
+            // revocation writes is reclaimed inside the same write
+            // instead of spending document space forever.
+            store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            assert!(store.revoke(9).unwrap());
+            assert!(
+                store.document.revoked_chats.is_empty(),
+                "an unguarded tombstone was retained: {:?}",
+                store.document.revoked_chats
+            );
+
+            // A staged offer minted before the revocation keeps its
+            // tombstone while the record can still be replayed.
+            admit_filler(&mut store, 7);
+            store
+                .record_pairing_and_reply(
+                    9,
+                    9,
+                    Some("alice".into()),
+                    7,
+                    "reply:7",
+                    |record| format!("Pairing code: {}", record.code),
+                    "That pairing offer did not hold — send /start to request a fresh code.",
+                )
+                .unwrap();
+            assert!(store.revoke(9).unwrap());
+            assert!(
+                store.document.revoked_chats.contains_key("9"),
+                "the guarded offer's tombstone was reclaimed early"
+            );
+            // The task settles and its record is swept: the next
+            // mutation finds nothing left to guard and reclaims the
+            // tombstone — the freed admission space actually frees.
+            store.complete_update(7).unwrap();
+            store.prune_expired().unwrap();
+            assert!(
+                store.document.revoked_chats.is_empty(),
+                "the settled offer's tombstone outlived its record"
+            );
+        });
+    }
+
+    /// A sidecar-only pairing offer for the revocation tests: the
+    /// record is durable in the replies directory but deliberately
+    /// unbound — the oversized username keeps its pairings entry from
+    /// fitting the slack the filler leaves, so the document shows the
+    /// chat neither a binding nor a pairing.
+    fn stage_sidecar_only_offer(store: &mut BindingStore, chat_id: i64, update_id: i64) {
+        let minted_revision = store
+            .request_pairing(5, 5, Some("earlier".into()))
+            .unwrap()
+            .minted_revision;
+        admit_filler(store, update_id);
+        fill_document(store, 6, 300);
+        let dir = replies_dir(&store.path);
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = StagedCompletion {
+            update_id,
+            sequence: 0,
+            payload: manifest_file_name(TaskKey::new(0, update_id)),
+            key: format!("reply:{update_id}"),
+            effect: StagedEffect::ReplyPairing {
+                record: PairingRecord {
+                    code: "WXYZ-1234".to_owned(),
+                    chat_id,
+                    user_id: 9,
+                    username: Some("x".repeat(2048)),
+                    created_at: now_secs(),
+                    expires_at: now_secs() + PAIRING_TTL.as_secs(),
+                    minted_revision,
+                },
+            },
+            text: Some("Pairing code: WXYZ-1234".to_owned()),
+            refused_text: Some(
+                "That pairing offer did not hold — send /start to request a fresh code.".to_owned(),
+            ),
+        };
+        std::fs::write(
+            dir.join(manifest_file_name(TaskKey::new(0, update_id))),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_revocation_tombstones_an_offer_that_lives_only_in_its_sidecar() {
+        temp_store(|mut store| {
+            stage_sidecar_only_offer(&mut store, 9, 7);
+            assert!(store.staged_reply_unbound(7));
+            // The chat has no binding and no visible pairing — the
+            // revocation still recognizes the sidecar-only offer and
+            // tombstones it: before, this returned false and left the
+            // code free to publish once any write freed space.
+            assert!(store.revoke(9).unwrap());
+            assert!(
+                store.document.revoked_chats.contains_key("9"),
+                "a sidecar-only offer escaped the revocation's tombstone"
+            );
+            // An unrelated freeing write reconciles the record: the
+            // tombstoned offer binds its refused variant instead of
+            // the pre-revocation code.
+            assert!(store.revoke(6).unwrap());
+            let task = store.pending_update(7).unwrap();
+            assert!(
+                task.reply_refused,
+                "a revoked sidecar-only offer bound its live variant"
+            );
+            assert_eq!(
+                store.reply_text(&task).unwrap().as_deref(),
+                Some("That pairing offer did not hold — send /start to request a fresh code."),
+                "a revoked sidecar-only offer published its dead code"
+            );
+            assert!(
+                store
+                    .pending_pairings()
+                    .iter()
+                    .all(|held| held.chat_id != 9),
+                "a revoked sidecar-only offer reached the pairings list"
+            );
+        });
+    }
+
+    #[test]
+    fn a_staged_revocation_tombstones_the_sidecar_only_offer() {
+        temp_store(|mut store| {
+            // Task 8 is admitted before the document fills — the
+            // filler deliberately leaves no room for new entries.
+            admit_filler(&mut store, 8);
+            stage_sidecar_only_offer(&mut store, 9, 7);
+            // The confirmation commit's revocation effect meets the
+            // same gap: nothing in the document names chat 9, yet its
+            // sidecar-only offer is still invalidated and tombstoned.
+            let reply = store
+                .record_reply_and_revocation(9, 8, "reply:8", |removed| {
+                    format!("revoked={removed}")
+                })
+                .unwrap();
+            assert_eq!(
+                reply, "revoked=true",
+                "a sidecar-only offer was not counted as revoked"
+            );
+            assert!(
+                store.document.revoked_chats.contains_key("9"),
+                "the staged revocation left no tombstone for the sidecar offer"
+            );
+            // The freeing write cannot publish the pre-revocation code.
+            assert!(store.revoke(6).unwrap());
+            let task = store.pending_update(7).unwrap();
+            assert!(
+                task.reply_refused,
+                "a sidecar-only offer outlived the staged revocation"
+            );
+            assert!(
+                store
+                    .pending_pairings()
+                    .iter()
+                    .all(|held| held.chat_id != 9),
+                "a revoked sidecar-only offer reached the pairings list"
+            );
+        });
+    }
+
+    #[test]
+    fn a_checkpoint_clear_preserves_progress_committed_after_the_resolve() {
+        temp_store(|mut store| {
+            admit_filler(&mut store, 7);
+            store.record_reply(7, "done", "reply:7").unwrap();
+            let first = crate::transport::SendProgress {
+                confirmed: vec![],
+                next_part: 0,
+                outcome_unknown: false,
+                binding: None,
+            };
+            store
+                .record_reply_checkpoint(7, Some(first.clone()), None)
+                .unwrap();
+            // The checkpoint moved under the resolver: progress a
+            // write landed since the read decided to clear is adopted,
+            // not erased.
+            let second = crate::transport::SendProgress {
+                confirmed: vec![11],
+                next_part: 1,
+                outcome_unknown: false,
+                binding: None,
+            };
+            store
+                .record_reply_checkpoint(7, Some(second.clone()), None)
+                .unwrap();
+            assert_eq!(
+                store
+                    .clear_reply_progress(7, Some(&first))
+                    .unwrap()
+                    .as_ref(),
+                Some(&second),
+                "progress committed after the resolve was erased"
+            );
+            assert_eq!(
+                store.pending_update(7).unwrap().reply_progress,
+                Some(second.clone())
+            );
+            // The checkpoint the resolve actually paired with the
+            // variant clears — its owed deadline with it.
+            store
+                .record_reply_checkpoint(7, None, Some(1_700_000_000))
+                .unwrap();
+            assert!(
+                store
+                    .clear_reply_progress(7, Some(&second))
+                    .unwrap()
+                    .is_none()
+            );
+            let held = store.pending_update(7).unwrap();
+            assert!(held.reply_progress.is_none());
+            assert!(held.reply_retry_at_ms.is_none());
         });
     }
 }

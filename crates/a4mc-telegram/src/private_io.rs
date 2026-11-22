@@ -117,6 +117,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
+        let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
     }
