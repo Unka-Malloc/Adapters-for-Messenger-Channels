@@ -680,12 +680,14 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
         // reaches the host: the settle's write can bind the record the
         // earlier snapshot could not — its resend is queued below —
         // and a task already carrying its finished reply is delivered
-        // work, not a stranded record.
+        // work, not a stranded record. The task's own reply state is
+        // the gate — a manifest too corrupt to parse can never bind
+        // its payload, so gating on a readable record would suppress
+        // exactly the alert the stored code exists to carry.
         let store = store.lock().unwrap();
-        if store.staged_reply_unbound(key)
-            && store
-                .pending_update(key)
-                .is_none_or(|task| !task.has_reply())
+        if store
+            .pending_update(key)
+            .is_none_or(|task| !task.has_reply())
         {
             notify_stuck(&on_stuck, key, &item.code);
         }
@@ -1754,12 +1756,18 @@ fn deliver_recorded_reply<T: BotTransport>(
                     // channel's cached partial — under the effective
                     // key the checkpoint names, since a host dedupe
                     // hook may have moved it off the delivery key —
-                    // and the durable checkpoint so the fresh text
-                    // starts its own send. The durable clear is
-                    // guarded by the checkpoint this resolve paired
-                    // with the variant: progress another store
-                    // committed in between belongs to this payload and
-                    // is adopted for the retry, never erased.
+                    // and the durable checkpoint only while it still
+                    // equals the position this attempt was resolved
+                    // with: that equality is what ties a stored
+                    // checkpoint to the superseded payload, and the
+                    // resolve guard already proved it carries no
+                    // confirmed chunk and no uncertain outcome. What
+                    // the record committed on the variant now selected
+                    // — confirmed sends and the checkpoint they left —
+                    // is adopted instead: the delivery resumes from
+                    // the resolved reply's own sent count rather than
+                    // erasing earned progress and restarting at the
+                    // stale index.
                     durable_cleared = true;
                     let effective = resume
                         .as_ref()
@@ -1769,7 +1777,11 @@ fn deliver_recorded_reply<T: BotTransport>(
                     resume = store
                         .lock()
                         .unwrap()
-                        .clear_reply_progress(key, current.progress.as_ref())?;
+                        .clear_reply_progress(key, resume.as_ref())?;
+                    index = current.sent;
+                    if index >= parts.len() {
+                        return Ok(());
+                    }
                     continue;
                 }
             }
@@ -5866,6 +5878,84 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_staged_manifest_is_surfaced_to_the_host() {
+        let root = temp_root();
+        let replies = root.join("bindings.json.replies");
+        {
+            let mut store = BindingStore::open_in(&root).unwrap();
+            store
+                .admit_updates(
+                    &[PendingUpdate {
+                        update_id: 2,
+                        sequence: 0,
+                        message: text_message(42, 42, Some("alice"), "hello", 2),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    }],
+                    &[],
+                    &[],
+                    3,
+                )
+                .unwrap();
+            // A staged manifest that cannot be parsed can never bind
+            // its payload: startup recovery still owes the host the
+            // stored alert — the task stays parked, never silently.
+            std::fs::create_dir_all(&replies).unwrap();
+            std::fs::write(replies.join("reply-2.json"), "{ not json").unwrap();
+        }
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let stranded = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let observed = Arc::clone(&stranded);
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            on_stuck: Some(Box::new(move |item: &StrandedReply| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((item.update_id, item.code.clone()));
+            })),
+            ..RuntimeConfig::default()
+        };
+        let store = BindingStore::open_in(&root).unwrap();
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || !stranded.lock().unwrap().is_empty(),
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(
+            *stranded.lock().unwrap(),
+            vec![(2, "a4mc_telegram_staged_invalid".to_owned())],
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a task whose staged record cannot be parsed was dispatched"
+        );
+        assert_eq!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .len(),
+            1,
+            "the stranded record was dropped"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn an_ambiguous_checkpoint_is_surfaced_to_the_host() {
         let root = temp_root();
         {
@@ -8742,6 +8832,114 @@ mod tests {
             posts.as_slice(),
             &[(9, "tail".to_owned())],
             "the delivered prefix was reposted or the part never recovered: {posts:?}"
+        );
+        let task = store.lock().unwrap().pending_update(7).unwrap();
+        assert_eq!(task.reply_sent, 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_resend_resumes_the_refusals_own_delivery_progress() {
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store
+            .admit_updates(
+                &[PendingUpdate {
+                    update_id: 7,
+                    sequence: 0,
+                    message: text_message(9, 9, Some("alice"), "/start", 7),
+                    reply: None,
+                    reply_key: None,
+                    reply_sent: 0,
+                    reply_progress: None,
+                    reply_file: None,
+                    reply_retry_at_ms: None,
+                    reply_refused: false,
+                }],
+                &[],
+                &[],
+                8,
+            )
+            .unwrap();
+        // Two contract parts of refusal text: a resend that finds the
+        // refusal already committed must continue where its durable
+        // record stopped, not restart the payload.
+        let refused = format!("{}{}", "r".repeat(32 * 1024), "t".repeat(5_000));
+        store
+            .record_pairing_and_reply(
+                9,
+                9,
+                Some("alice".into()),
+                7,
+                "reply:7",
+                |record| format!("Pairing code: {}", record.code),
+                &refused,
+            )
+            .unwrap();
+        let task = store.pending_update(7).unwrap();
+        let live = store
+            .reply_text(&task)
+            .unwrap()
+            .expect("the offer's live text was not recorded");
+        // The offer lapsed while the resend waited: another store
+        // selected the refusal and its delivery already confirmed the
+        // first contract part plus one platform chunk of the second.
+        store.request_pairing(9, 9, Some("alice".into())).unwrap();
+        let task = store.pending_update(7).unwrap();
+        let resolved = store.resolve_reply(&task).unwrap().unwrap();
+        assert_eq!(resolved.text, refused, "the lapsed offer did not refuse");
+        store
+            .record_reply_progress(
+                7,
+                1,
+                Some(SendProgress {
+                    confirmed: vec![91],
+                    next_part: 1,
+                    outcome_unknown: false,
+                    binding: None,
+                }),
+            )
+            .unwrap();
+        let store = Mutex::new(store);
+        let stop = AtomicBool::new(false);
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let channel = TelegramChannel::new(Arc::new(MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        }));
+
+        // The resend still carries the stale offer text and the
+        // provably-safe checkpoint it was resolved with — the only
+        // position a clear may drop. The refusal's own confirmed
+        // progress is adopted, never erased.
+        deliver_recorded_reply(
+            &channel,
+            &store,
+            9,
+            7,
+            TaskKey::new(0, 7),
+            "reply:7",
+            &live,
+            0,
+            Some(SendProgress {
+                confirmed: vec![],
+                next_part: 0,
+                outcome_unknown: false,
+                binding: None,
+            }),
+            true,
+            &stop,
+        )
+        .unwrap();
+
+        // Resumed at contract part one from platform chunk one: only
+        // the unconfirmed tail posts — no confirmed chunk reposted and
+        // no earned checkpoint erased.
+        let posts = sent.lock().unwrap().clone();
+        assert_eq!(
+            posts.as_slice(),
+            &[(9, "t".repeat(904))],
+            "the resend erased confirmed progress or reposted it: {posts:?}"
         );
         let task = store.lock().unwrap().pending_update(7).unwrap();
         assert_eq!(task.reply_sent, 2);

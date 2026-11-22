@@ -718,11 +718,17 @@ impl BindingStore {
             // in its sidecar — nothing here names it, yet the next
             // write that frees space would still bind and publish its
             // code. The revocation recognizes and tombstones it like
-            // the offers the document can show.
+            // the offers the document can show — while the offer is
+            // still live. An offer whose TTL already ran out binds its
+            // own refusal on the next write, so it is neither revocable
+            // nor in need of a tombstone.
             let chat = chat_id.to_string();
             let guarded_at = document.revoked_chats.get(&chat).copied();
+            let now = now_secs();
             let staged = staged_pairing_offers(&dir).into_iter().any(|record| {
-                record.chat_id == chat_id && guarded_at.is_none_or(|at| record.minted_revision > at)
+                record.chat_id == chat_id
+                    && record.expires_at > now
+                    && guarded_at.is_none_or(|at| record.minted_revision > at)
             });
             let revoked = removed || document.pairings.len() != before || staged;
             if revoked {
@@ -2329,12 +2335,16 @@ fn apply_effect(document: &mut BindingDocument, dir: &Path, effect: &StagedEffec
             // pairing to remove — recognize and tombstone it anyway,
             // scoped to the revoking user exactly like the pairing
             // records are, so reconciliation cannot publish the
-            // pre-revocation code once unrelated space frees.
+            // pre-revocation code once unrelated space frees. An offer
+            // whose TTL already ran out binds its own refusal, so it
+            // is neither revocable nor owed a tombstone.
             let chat = chat_id.to_string();
             let guarded_at = document.revoked_chats.get(&chat).copied();
+            let now = now_secs();
             let staged = staged_pairing_offers(dir).into_iter().any(|record| {
                 record.chat_id == *chat_id
                     && user_id.is_none_or(|held| record.user_id == held)
+                    && record.expires_at > now
                     && guarded_at.is_none_or(|at| record.minted_revision > at)
             });
             let revoked = removed || document.pairings.len() != before || staged;
@@ -5019,8 +5029,14 @@ mod tests {
     /// record is durable in the replies directory but deliberately
     /// unbound — the oversized username keeps its pairings entry from
     /// fitting the slack the filler leaves, so the document shows the
-    /// chat neither a binding nor a pairing.
-    fn stage_sidecar_only_offer(store: &mut BindingStore, chat_id: i64, update_id: i64) {
+    /// chat neither a binding nor a pairing. `expires_at` controls
+    /// whether the offer is still live or has already lapsed.
+    fn stage_sidecar_only_offer(
+        store: &mut BindingStore,
+        chat_id: i64,
+        update_id: i64,
+        expires_at: u64,
+    ) {
         let minted_revision = store
             .request_pairing(5, 5, Some("earlier".into()))
             .unwrap()
@@ -5041,7 +5057,7 @@ mod tests {
                     user_id: 9,
                     username: Some("x".repeat(2048)),
                     created_at: now_secs(),
-                    expires_at: now_secs() + PAIRING_TTL.as_secs(),
+                    expires_at,
                     minted_revision,
                 },
             },
@@ -5060,7 +5076,7 @@ mod tests {
     #[test]
     fn a_revocation_tombstones_an_offer_that_lives_only_in_its_sidecar() {
         temp_store(|mut store| {
-            stage_sidecar_only_offer(&mut store, 9, 7);
+            stage_sidecar_only_offer(&mut store, 9, 7, now_secs() + PAIRING_TTL.as_secs());
             assert!(store.staged_reply_unbound(7));
             // The chat has no binding and no visible pairing — the
             // revocation still recognizes the sidecar-only offer and
@@ -5101,7 +5117,7 @@ mod tests {
             // Task 8 is admitted before the document fills — the
             // filler deliberately leaves no room for new entries.
             admit_filler(&mut store, 8);
-            stage_sidecar_only_offer(&mut store, 9, 7);
+            stage_sidecar_only_offer(&mut store, 9, 7, now_secs() + PAIRING_TTL.as_secs());
             // The confirmation commit's revocation effect meets the
             // same gap: nothing in the document names chat 9, yet its
             // sidecar-only offer is still invalidated and tombstoned.
@@ -5131,6 +5147,42 @@ mod tests {
                     .iter()
                     .all(|held| held.chat_id != 9),
                 "a revoked sidecar-only offer reached the pairings list"
+            );
+        });
+    }
+
+    #[test]
+    fn an_expired_sidecar_only_offer_reports_no_revocation() {
+        temp_store(|mut store| {
+            // Task 8 is admitted before the document fills — the
+            // filler deliberately leaves no room for new entries.
+            admit_filler(&mut store, 8);
+            // The sidecar-only offer's TTL already ran out: nothing it
+            // carries can still be revoked — the host revoke and the
+            // recorded /unpair path must both answer that there was
+            // nothing to revoke instead of reporting success over a
+            // lapsed offer.
+            stage_sidecar_only_offer(&mut store, 9, 7, 1);
+            assert!(
+                !store.revoke(9).unwrap(),
+                "an expired sidecar-only offer counted as revoked"
+            );
+            assert!(
+                !store.document.revoked_chats.contains_key("9"),
+                "a lapsed offer earned a tombstone"
+            );
+            let reply = store
+                .record_reply_and_revocation(9, 8, "reply:8", |removed| {
+                    format!("revoked={removed}")
+                })
+                .unwrap();
+            assert_eq!(
+                reply, "revoked=false",
+                "the recorded /unpair reported a revocation over a lapsed offer"
+            );
+            assert!(
+                !store.document.revoked_chats.contains_key("9"),
+                "the staged revocation tombstoned a lapsed offer"
             );
         });
     }
