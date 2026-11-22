@@ -65,10 +65,12 @@ in `GatewayModeConfig::intents` — and `GUILD_MEMBERS`
 let api = std::sync::Arc::new(a4mc_discord::live_api(None)?);
 let channel = std::sync::Arc::new(a4mc_discord::DiscordChannel::new(std::sync::Arc::clone(&api)));
 let mut handler = MyDiscordHandler { channel };            // GatewayHandler
+let mut session = a4mc_discord::GatewaySession::default(); // host-held resume state
 a4mc_discord::run_gateway(
     &a4mc_discord::LiveGatewayConnector,
     api.token(),
     &mut handler,
+    &mut session,
     &a4mc_discord::GatewayModeConfig::default(),
 )?;
 ```

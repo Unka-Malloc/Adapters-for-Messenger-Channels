@@ -33,7 +33,11 @@
 //! [`run_gateway`] connects to the Gateway, identifies (or resumes),
 //! heartbeats on the advertised interval, and lowers each dispatch
 //! before invoking the host's [`gateway::GatewayHandler`]. Resume state
-//! (`sequence`, session id, resume URL) survives a reconnect.
+//! (`sequence`, session id, resume URL) is caller-owned: it survives
+//! reconnects inside the loop and a surfaced handler failure alike, so
+//! re-entering with the same [`gateway::GatewaySession`] resumes the
+//! session and replays the rejected dispatch instead of identifying
+//! fresh.
 
 pub mod channel;
 pub mod gateway;
@@ -46,8 +50,8 @@ pub use gateway::{
     GatewayHandler, GatewayModeConfig, GatewayPayload, GatewayRead, GatewaySession, GatewayUrl,
     HANDLER_FAILED_CODE, INTENT_DIRECT_MESSAGE_REACTIONS, INTENT_DIRECT_MESSAGES,
     INTENT_GUILD_MEMBERS, INTENT_GUILD_MESSAGE_REACTIONS, INTENT_GUILD_MESSAGES, INTENT_GUILDS,
-    LiveGatewayConnector, SessionOutcome, TERMINAL_CLOSE_CODE, is_terminal_close_code, run_gateway,
-    run_gateway_session,
+    INTENT_MESSAGE_CONTENT, LiveGatewayConnector, SessionOutcome, TERMINAL_CLOSE_CODE,
+    is_terminal_close_code, run_gateway, run_gateway_session,
 };
 pub use lower::{lower_event, lower_events, lower_update, parse_timestamp};
 pub use transport::{

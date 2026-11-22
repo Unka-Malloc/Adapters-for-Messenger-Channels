@@ -834,14 +834,17 @@ pub fn run_socket_mode(
 }
 
 /// `apps.connections.open` failures the reconnect backoff cannot fix:
-/// a rejected, missing or mis-scoped credential fails every call the
-/// same way, so the loop returns it instead of parking on a ticket it
-/// can never obtain. Everything else is transient and retries.
+/// a rejected, missing, expired, revoked or mis-scoped credential
+/// fails every call the same way — retrying can never mint a fresh
+/// token, so the loop returns it instead of parking on a ticket the
+/// host must replace. Everything else is transient and retries.
 fn open_socket_terminal(code: &str) -> bool {
     matches!(
         code,
         "a4mc_slack_unauthorized"
             | "a4mc_slack_token_invalid"
+            | "a4mc_slack_token_expired"
+            | "a4mc_slack_token_revoked"
             | "a4mc_slack_app_token_missing"
             | "a4mc_slack_bot_token_missing"
             | "a4mc_slack_custody_unavailable"
@@ -1591,7 +1594,15 @@ mod tests {
 
     #[test]
     fn credential_and_scope_ticket_failures_stay_terminal() {
-        for code in ["a4mc_slack_unauthorized", "a4mc_slack_missing_scope"] {
+        // Expired and revoked app tokens fail every `connections.open`
+        // identically — the host must replace the credential, so the
+        // loop surfaces the error instead of retrying it forever.
+        for code in [
+            "a4mc_slack_unauthorized",
+            "a4mc_slack_missing_scope",
+            "a4mc_slack_token_expired",
+            "a4mc_slack_token_revoked",
+        ] {
             let api = FlakyTicketApi {
                 inner: crate::transport::MockSlackApi::default(),
                 failures: Mutex::new(VecDeque::from([SlackApiError::new(

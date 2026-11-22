@@ -25,6 +25,14 @@ pub struct OutboundMessage {
     pub text: String,
     /// The platform message this send replies to, when threaded.
     pub reply_to_message_id: Option<ExternalMessageId>,
+    /// The thread's anchor message when the platform threads under the
+    /// thread's parent rather than the message replied to — e.g.
+    /// Slack's `thread_ts`, which must be the parent's id and never a
+    /// reply's own. A host answering an inbound thread message copies
+    /// its [`crate::update::InboundMessage::thread_id`] here; dialects
+    /// that address the replied-to message directly ignore it.
+    #[serde(default)]
+    pub thread_id: Option<ExternalMessageId>,
     pub idempotency_key: String,
 }
 
@@ -38,6 +46,7 @@ impl OutboundMessage {
             chat_id: chat_id.into(),
             text: text.into(),
             reply_to_message_id: None,
+            thread_id: None,
             idempotency_key: idempotency_key.into(),
         }
     }

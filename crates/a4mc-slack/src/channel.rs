@@ -35,9 +35,14 @@ const IDEMPOTENCY_CACHE_CAP: usize = 1024;
 /// Socket Mode is native; the webhook and polling mechanisms are not
 /// implemented by this crate, so a firewall that permits no public
 /// callback loses nothing. Every update kind Slack's event API reports
-/// is lowered. Send-side reply-to is native (Slack threads); idempotency
-/// is adapted (adapter-side dedupe); edit and delete are not wired yet
-/// and are declared unsupported, never silently dropped.
+/// is lowered. Send-side reply-to is native — Slack threading anchors
+/// on the thread's parent: `thread_ts` must be the parent message's
+/// ts, never a reply's own, so a host answering an inbound thread
+/// message carries its `thread_id` (`OutboundMessage::thread_id`);
+/// `reply_to_message_id` alone anchors only a reply to the thread's
+/// root. Idempotency is adapted (adapter-side dedupe); edit and
+/// delete are not wired yet and are declared unsupported, never
+/// silently dropped.
 pub fn descriptor() -> ChannelDescriptor {
     ChannelDescriptor {
         channel: ChannelId::from(CHANNEL),
@@ -182,16 +187,26 @@ impl<A: SlackApi> SlackChannel<A> {
                 "Slack channel id contains whitespace",
             ));
         }
-        let thread_ts = match outbound.reply_to_message_id.as_ref() {
-            Some(reply) if reply.as_str().trim().is_empty() => {
+        // Slack anchors a thread on its parent's ts: `thread_id` is
+        // the declared parent (required when replying to an inbound
+        // thread message, whose own id is a child's); a bare
+        // `reply_to_message_id` anchors a reply to the thread's root.
+        for id in [&outbound.reply_to_message_id, &outbound.thread_id]
+            .into_iter()
+            .flatten()
+        {
+            if id.as_str().trim().is_empty() {
                 return Err(ChannelError::new(
                     "a4mc_slack_reply_target_invalid",
                     "Slack reply target is empty",
                 ));
             }
-            Some(reply) => Some(reply.as_str().to_owned()),
-            None => None,
-        };
+        }
+        let thread_ts = outbound
+            .thread_id
+            .as_ref()
+            .or(outbound.reply_to_message_id.as_ref())
+            .map(|id| id.as_str().to_owned());
         let key = &prepared.dedupe_key;
         {
             let mut cache = self.sent_keys.lock().unwrap();
@@ -346,6 +361,20 @@ mod tests {
         let (channel, api) = channel();
         let mut outbound = OutboundMessage::new("C1", "threaded", "send-2");
         outbound.reply_to_message_id = Some(ExternalMessageId::from("1700000000.000001"));
+        channel.send(&outbound).unwrap();
+        let posted = api.posted_requests();
+        assert_eq!(posted[0].thread_ts.as_deref(), Some("1700000000.000001"));
+    }
+
+    #[test]
+    fn a_thread_reply_anchors_on_the_parent_not_the_child() {
+        // Replying to an inbound thread message supplies its own
+        // (child) ts as the reply target; `thread_ts` must carry the
+        // parent's `thread_id` — a child's ts is not a valid anchor.
+        let (channel, api) = channel();
+        let mut outbound = OutboundMessage::new("C1", "threaded", "send-3");
+        outbound.reply_to_message_id = Some(ExternalMessageId::from("1700000000.000100"));
+        outbound.thread_id = Some(ExternalMessageId::from("1700000000.000001"));
         channel.send(&outbound).unwrap();
         let posted = api.posted_requests();
         assert_eq!(posted[0].thread_ts.as_deref(), Some("1700000000.000001"));

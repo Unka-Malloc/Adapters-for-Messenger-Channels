@@ -501,14 +501,19 @@ fn https_post(
     }
 }
 
-/// Read one close-delimited response in two phases: the head —
-/// status line plus the headers that matter (`Retry-After`,
-/// `Transfer-Encoding`) — is parsed as soon as its terminator
-/// arrives, then the body is read and decoded under the same bound.
-/// A throttle answer's classification lives entirely in the head, so
-/// a 429 whose body stalls, truncates or frames incompletely still
-/// returns as a throttle with its `Retry-After` instead of degrading
-/// into an ambiguous read failure.
+/// Read one framed response in two phases: the head — status line
+/// plus the headers that matter (`Retry-After`, `Transfer-Encoding`,
+/// `Content-Length`) — is parsed as soon as its terminator arrives,
+/// then the body is read under the same bound until its declared
+/// framing completes. A body framed by `Content-Length` or a chunked
+/// `Transfer-Encoding` ends the read the moment the frame is
+/// complete — no wait for the connection's close — and a close that
+/// arrives before the declared length or the terminal chunk is a
+/// truncation, not a body. Only a response that declares neither is
+/// close-delimited. A throttle answer's classification lives entirely
+/// in the head, so a 429 whose body stalls, truncates or frames
+/// incompletely still returns as a throttle with its `Retry-After`
+/// instead of degrading into an ambiguous read failure.
 fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError> {
     let failed =
         || TelegramApiError::new("a4mc_telegram_read_failed", "Bot API response read failed");
@@ -554,6 +559,7 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
         .ok_or_else(failed)?;
     let mut retry_after = None;
     let mut chunked = false;
+    let mut content_length: Option<usize> = None;
     for line in head.lines().skip(1) {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -562,6 +568,12 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
                 retry_after = value.parse::<u64>().ok();
             } else if name == "transfer-encoding" && value.eq_ignore_ascii_case("chunked") {
                 chunked = true;
+            } else if name == "content-length" {
+                let length = value.parse::<usize>().map_err(|_| failed())?;
+                if content_length.is_some_and(|seen| seen != length) {
+                    return Err(failed());
+                }
+                content_length = Some(length);
             }
         }
     }
@@ -578,6 +590,18 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
     };
     let mut body_raw = raw.split_off(head_end);
     loop {
+        // A declared frame ends the read as soon as it is complete:
+        // stopping before another read keeps a peer's unclean close
+        // (a TLS truncation alert behind the last body byte) from
+        // shadowing a response that already arrived whole.
+        let complete = if chunked {
+            matches!(chunked_state(&body_raw), ChunkedState::Complete)
+        } else {
+            content_length.is_some_and(|length| body_raw.len() >= length)
+        };
+        if complete {
+            break;
+        }
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => {
@@ -598,6 +622,14 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
                 return throttled_body_lost().map_or_else(|| Err(failed()), Ok);
             }
         }
+    } else if let Some(length) = content_length {
+        if body_raw.len() < length {
+            // A clean close before the declared length is truncation,
+            // never a shorter body.
+            return throttled_body_lost().map_or_else(|| Err(failed()), Ok);
+        }
+        body_raw.truncate(length);
+        body_raw
     } else {
         body_raw
     };
@@ -609,6 +641,65 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
         retry_after,
         body,
     })
+}
+
+/// How far a raw body buffer gets through chunked framing. The read
+/// loop uses this cheap header scan to stop as soon as the frame is
+/// complete; [`decode_chunked`] then performs the authoritative parse.
+enum ChunkedState {
+    /// The terminal `0` chunk and the trailer section's closing line
+    /// have all arrived.
+    Complete,
+    /// A clean prefix: more of the frame may still arrive.
+    Incomplete,
+    /// A chunk header or data boundary violates the framing.
+    Malformed,
+}
+
+fn chunked_state(raw: &[u8]) -> ChunkedState {
+    let mut rest = raw;
+    let mut decoded = 0usize;
+    loop {
+        let Some(end) = rest.windows(2).position(|window| window == b"\r\n") else {
+            return ChunkedState::Incomplete;
+        };
+        let Ok(header) = std::str::from_utf8(&rest[..end]) else {
+            return ChunkedState::Malformed;
+        };
+        let Ok(size) = usize::from_str_radix(header.trim().split(';').next().unwrap_or(""), 16)
+        else {
+            return ChunkedState::Malformed;
+        };
+        rest = &rest[end + 2..];
+        if size == 0 {
+            // The trailer section ends in a blank line: an immediate
+            // CRLF when empty, or header lines closed by one.
+            return if chunked_tail_complete(rest) {
+                ChunkedState::Complete
+            } else {
+                ChunkedState::Incomplete
+            };
+        }
+        if rest.len() < size + 2 {
+            return ChunkedState::Incomplete;
+        }
+        decoded += size;
+        if decoded > MAX_RESPONSE_BYTES {
+            return ChunkedState::Malformed;
+        }
+        rest = &rest[size..];
+        if !rest.starts_with(b"\r\n") {
+            return ChunkedState::Malformed;
+        }
+        rest = &rest[2..];
+    }
+}
+
+/// Whether the trailer section after a terminal `0` chunk has closed:
+/// an immediate CRLF when empty, or trailer header lines followed by
+/// the blank line.
+fn chunked_tail_complete(rest: &[u8]) -> bool {
+    rest.starts_with(b"\r\n") || rest.windows(4).any(|window| window == b"\r\n\r\n")
 }
 
 fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
@@ -627,7 +718,9 @@ fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
         .ok()?;
         rest = &rest[end + 2..];
         if size == 0 {
-            return Some(body);
+            // The frame is complete only once the trailer section's
+            // blank line arrived; anything still behind it is ignored.
+            return chunked_tail_complete(rest).then_some(body);
         }
         if rest.len() < size + 2 {
             return None;
@@ -1601,5 +1694,91 @@ mod tests {
         assert_eq!(parsed.status, 429);
         assert_eq!(parsed.retry_after, Some(6));
         assert_eq!(parsed.body, body.as_bytes());
+    }
+
+    /// A reader that serves its bytes, then fails every read — the
+    /// stand-in for a peer's unclean close (a TLS truncation alert)
+    /// behind the last response byte.
+    struct FailingTailReader {
+        data: Vec<u8>,
+        offset: usize,
+    }
+
+    impl Read for FailingTailReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let size = (self.data.len() - self.offset).min(buf.len());
+            if size == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "closed without close_notify",
+                ));
+            }
+            buf[..size].copy_from_slice(&self.data[self.offset..self.offset + size]);
+            self.offset += size;
+            Ok(size)
+        }
+    }
+
+    #[test]
+    fn a_complete_content_length_body_never_waits_for_the_close() {
+        // The declared frame ends the read: an unclean close behind
+        // the last body byte cannot shadow a response that arrived
+        // whole.
+        let body = "{\"ok\":true,\"result\":[]}";
+        let response = format!(
+            "HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = FailingTailReader {
+            data: response.into_bytes(),
+            offset: 0,
+        };
+        let parsed = read_response(&mut stream).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body, body.as_bytes());
+    }
+
+    #[test]
+    fn a_complete_chunked_body_never_waits_for_the_close() {
+        let body = "{\"ok\":true,\"result\":[]}";
+        let response = format!(
+            "HTTP/1.1 200 X\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        );
+        let mut stream = FailingTailReader {
+            data: response.into_bytes(),
+            offset: 0,
+        };
+        let parsed = read_response(&mut stream).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body, body.as_bytes());
+    }
+
+    #[test]
+    fn a_short_body_at_clean_eof_is_truncation_not_a_body() {
+        // Content-Length declares 40; the connection closes cleanly
+        // after 11. A successful send's answer must not read as the
+        // shorter slice — the outcome stays unknown rather than
+        // evaluated on a partial body.
+        let mut stream = ChunkedReader {
+            data: b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{\"ok\":true}".to_vec(),
+            reads: std::collections::VecDeque::new(),
+            offset: 0,
+        };
+        let error = read_response(&mut stream).err().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_read_failed");
+    }
+
+    #[test]
+    fn an_unterminated_chunked_body_at_eof_is_truncation() {
+        // The chunk data completed but the terminal 0-chunk never
+        // arrived: the frame is incomplete even at a clean close.
+        let mut stream = ChunkedReader {
+            data: b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n".to_vec(),
+            reads: std::collections::VecDeque::new(),
+            offset: 0,
+        };
+        let error = read_response(&mut stream).err().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_read_failed");
     }
 }

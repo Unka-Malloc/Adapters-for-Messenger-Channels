@@ -1178,17 +1178,27 @@ impl Default for GatewayModeConfig {
 
 /// Run the Gateway until the stop flag is set (or `max_sessions` is
 /// reached), resuming a live session when Discord lets it.
+///
+/// `session` is caller-owned resume state: the sequence, session id
+/// and resume URL stay current across every session this call opens
+/// and — just as important — survive the call itself. A handler
+/// failure is returned to the host, but the caller's session still
+/// holds the cursor, so invoking `run_gateway` again with the same
+/// session sends `RESUME` rather than a fresh `IDENTIFY` and the
+/// rejected dispatch (plus anything queued behind it) replays for the
+/// retry. Keep one session per logical Gateway run; start with
+/// [`GatewaySession::default`].
 pub fn run_gateway(
     connector: &dyn GatewayConnector,
     token: &DiscordToken,
     handler: &mut dyn GatewayHandler,
+    session: &mut GatewaySession,
     config: &GatewayModeConfig,
 ) -> Result<(), DiscordApiError> {
     let session_config = GatewayConfig {
         intents: config.intents,
         ..GatewayConfig::default()
     };
-    let mut session = GatewaySession::default();
     let mut sessions = 0usize;
     let mut backoff = config.reconnect_delay;
     loop {
@@ -1219,7 +1229,7 @@ pub fn run_gateway(
             &mut *connection,
             token.token(),
             handler,
-            &mut session,
+            session,
             &session_config,
             &config.stop,
         );
@@ -1432,6 +1442,33 @@ mod tests {
                 "a4mc_discord_fixture_handler",
                 "fixture handler rejected the dispatch",
             ))
+        }
+    }
+
+    /// Rejects the first dispatch it sees, then records every later
+    /// one — the stand-in for a host turn that failed once and
+    /// recovered on the replay.
+    #[derive(Default)]
+    struct FailThenRecordHandler {
+        calls: usize,
+        events: Vec<ChannelEvent>,
+    }
+
+    impl GatewayHandler for FailThenRecordHandler {
+        fn on_dispatch(
+            &mut self,
+            event: &ChannelEvent,
+            _payload: &GatewayPayload,
+        ) -> Result<(), DiscordApiError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Err(DiscordApiError::new(
+                    "a4mc_discord_fixture_handler",
+                    "fixture handler rejected the dispatch",
+                ));
+            }
+            self.events.push(event.clone());
+            Ok(())
         }
     }
 
@@ -2135,8 +2172,72 @@ mod tests {
             ..GatewayModeConfig::default()
         };
 
-        let error = run_gateway(&connector, &token, &mut handler, &config).unwrap_err();
+        let mut session = GatewaySession::default();
+        let error =
+            run_gateway(&connector, &token, &mut handler, &mut session, &config).unwrap_err();
         assert_eq!(error.code, HANDLER_FAILED_CODE);
+    }
+
+    #[test]
+    fn a_handler_failure_keeps_the_session_so_the_next_run_resumes() {
+        // The host sees the handler failure — but the caller-owned
+        // session still holds the cursor, so re-entering `run_gateway`
+        // with it RESUMEs at the resume URL instead of IDENTIFYing a
+        // fresh session, and the rejected dispatch replays.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let first = ScriptedConnection::new([hello(), ready(), message(2)], Arc::clone(&sent));
+        let second = ScriptedConnection::new(
+            [hello(), message(2), resumed(3), reconnect()],
+            Arc::clone(&sent),
+        );
+        let connector = ScriptedConnector {
+            connections: Mutex::new(VecDeque::from([
+                Box::new(first) as Box<dyn GatewayConnection>,
+                Box::new(second) as Box<dyn GatewayConnection>,
+            ])),
+            urls: Mutex::new(Vec::new()),
+        };
+        let token =
+            DiscordToken::new(SecretToken::try_from_string(fixture_token()).unwrap()).unwrap();
+        let mut handler = FailThenRecordHandler::default();
+        let config = GatewayModeConfig {
+            max_sessions: 1,
+            reconnect_delay: Duration::ZERO,
+            max_reconnect_delay: Duration::ZERO,
+            ..GatewayModeConfig::default()
+        };
+        let mut session = GatewaySession::default();
+
+        let error =
+            run_gateway(&connector, &token, &mut handler, &mut session, &config).unwrap_err();
+        assert_eq!(error.code, HANDLER_FAILED_CODE);
+        assert!(session.can_resume());
+        assert_eq!(session.sequence, Some(1));
+
+        run_gateway(&connector, &token, &mut handler, &mut session, &config).unwrap();
+
+        assert_eq!(handler.events.len(), 1, "the rejected dispatch replayed");
+        assert_eq!(
+            connector.urls.lock().unwrap().last().map(String::as_str),
+            Some("wss://resume.invalid/?v=10&encoding=json"),
+            "the retry must dial the preserved resume URL"
+        );
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter().any(|payload| {
+                payload["op"] == json!(OP_RESUME)
+                    && payload["d"]["session_id"] == json!("session-1")
+                    && payload["d"]["seq"] == json!(1)
+            }),
+            "the retry must RESUME the preserved session: {sent:?}"
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|payload| payload["op"] == json!(OP_IDENTIFY))
+                .count(),
+            1,
+            "only the first connection may identify: {sent:?}"
+        );
     }
 
     #[test]
@@ -2217,7 +2318,8 @@ mod tests {
                 ..GatewayModeConfig::default()
             };
 
-            run_gateway(&connector, &token, &mut handler, &config).unwrap();
+            let mut session = GatewaySession::default();
+            run_gateway(&connector, &token, &mut handler, &mut session, &config).unwrap();
 
             let urls = connector.urls.lock().unwrap();
             assert_eq!(
