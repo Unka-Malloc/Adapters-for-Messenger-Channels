@@ -1,11 +1,6 @@
 # Integration modes
 
-Two ways to consume this workspace, one contract. A composing host
-embeds `a4mc` plus one `a4mc-<channel>` dialect per platform, installs
-the `CustodyPort` and `LanePort` once per process and runs the channel;
-a new platform lands by implementing the dialect side of the same
-contract. There is no sidecar — the channel loops and the custody they
-draw on belong to the host process.
+Embed `a4mc` plus one `a4mc-<channel>` dialect per platform, install `CustodyPort` and `LanePort` once per process, and run each channel loop directly inside the host process; new platforms implement the same contract traits.
 
 ## Host — embed a channel dialect
 
@@ -26,7 +21,7 @@ a4mc::lane::install(lane_port)?;         // verified agents, sessions, turns
 
 let transport = a4mc_telegram::live_transport(None)?;      // token via the custody port
 let store = a4mc_telegram::BindingStore::open_in(&state_dir)?;
-a4mc_telegram::run_channel_loop(transport, store, RuntimeConfig::default())?;
+a4mc_telegram::run_channel_loop(transport, store, a4mc_telegram::RuntimeConfig::default())?;
 ```
 
 Slack runs the same composition over Socket Mode, so it needs no public
@@ -87,12 +82,7 @@ answers an error and the sender's retry verifies as a fresh event; once
 committed, exact replays inside the window are acknowledged without
 running the update again. Two bounds qualify that promise. The replay
 cache is a bounded FIFO of the newest 1,024 committed signatures: a
-burst of deliveries can evict a committed signature while it is still
-inside the timestamp window, and the evicted retry then verifies as a
-fresh event. And `receive`/`commit` is not atomic across requests —
-overlapping deliveries of the same payload can both be classified
-`Event` before either commits — so the host's durable acceptance must
-be idempotent for overlapping retries.
+burst of deliveries can evict a committed signature while it is still inside the timestamp window, and the evicted retry then verifies as a fresh event. Concurrent deliveries of the same payload can both classify as `Event` before either commits to the cache, so make host-side durable acceptance idempotent for overlapping retries.
 
 ```rust
 // Once, at server startup — the shared receiver owns the replay cache.
@@ -152,10 +142,9 @@ a retry hint; `dedupe_key` may derive the effective idempotency key; and
 returns. A deferred send surfaces `a4mc_outbound_batched` or
 `a4mc_outbound_throttled`; a skipped send returns an empty receipt and
 makes no transport call. With no hooks mounted the pipeline is a
-pass-through and the channel behaves exactly as before.
+pass-through and the channel behaves identically.
 
-The host mounts policy; the adapters still contain no Quiet,
-Already-Told, Digest or other business rule.
+All Quiet, Already-Told, Digest, and related send policies stay cleanly in host hooks rather than inside the adapters.
 
 ## Dialect — implement the contract
 
