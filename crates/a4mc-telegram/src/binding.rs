@@ -230,6 +230,27 @@ pub struct ResolvedReply {
     pub progress: Option<crate::transport::SendProgress>,
 }
 
+/// The reply delivery state a conditional checkpoint clear leaves
+/// behind — confirmed part count, the platform checkpoint still held
+/// and the retry deadline it carries — all read inside the same locked
+/// write that ran the clear. A resend adopts the triple whole:
+/// progress another store committed between the caller's resolve and
+/// this write governs the resume, so the next attempt neither reposts
+/// a part that store confirmed nor retries inside the deadline it was
+/// still owed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReplyResumeState {
+    /// Contract-level sends confirmed so far — the resume prefix.
+    pub sent: usize,
+    /// The platform checkpoint still governing the next attempt —
+    /// `None` when the expected checkpoint cleared or none is held.
+    pub progress: Option<crate::transport::SendProgress>,
+    /// Unix milliseconds before which the reply must not be attempted
+    /// again — surviving only with a checkpoint that was adopted, not
+    /// cleared.
+    pub retry_at_ms: Option<u64>,
+}
+
 impl DroppedUpdate {
     /// The record's full claim identity — sequence plus update id.
     fn key(&self) -> TaskKey {
@@ -711,8 +732,17 @@ impl BindingStore {
     pub fn revoke(&mut self, chat_id: i64) -> Result<bool> {
         let dir = replies_dir(&self.path);
         self.mutate(|document| {
+            let now = now_secs();
             let removed = document.chats.remove(&chat_id.to_string()).is_some();
-            let before = document.pairings.len();
+            // Only a live offer counts toward the result: an expired
+            // code still listed here is dead already — the next
+            // mutation touching the pairings prunes it — so removing
+            // its row is cleanup, never a revocation the host should
+            // confirm.
+            let live = document
+                .pairings
+                .iter()
+                .any(|record| record.chat_id == chat_id && record.expires_at > now);
             document.pairings.retain(|record| record.chat_id != chat_id);
             // An offer whose record never fit the document lives only
             // in its sidecar — nothing here names it, yet the next
@@ -724,13 +754,12 @@ impl BindingStore {
             // nor in need of a tombstone.
             let chat = chat_id.to_string();
             let guarded_at = document.revoked_chats.get(&chat).copied();
-            let now = now_secs();
             let staged = staged_pairing_offers(&dir).into_iter().any(|record| {
                 record.chat_id == chat_id
                     && record.expires_at > now
                     && guarded_at.is_none_or(|at| record.minted_revision > at)
             });
-            let revoked = removed || document.pairings.len() != before || staged;
+            let revoked = removed || live || staged;
             if revoked {
                 // Tombstone the revocation at its own revision: a
                 // staged offer minted before it can never re-publish
@@ -820,6 +849,20 @@ impl BindingStore {
     pub fn age_poll_offset_for_test(&mut self, secs: u64) -> Result<()> {
         self.mutate(|document| {
             document.poll_offset_advanced_at = Some(now_secs().saturating_sub(secs));
+            Ok(())
+        })
+    }
+
+    /// Expire every stored pairing offer's TTL in place — the shape a
+    /// code takes once it lapses while its row still sits in the
+    /// document, so revocation accounting can be checked against
+    /// dead-code cleanup without waiting out the real TTL.
+    #[cfg(test)]
+    pub fn expire_pairings_for_test(&mut self) -> Result<()> {
+        self.mutate(|document| {
+            for record in &mut document.pairings {
+                record.expires_at = 0;
+            }
             Ok(())
         })
     }
@@ -1394,26 +1437,32 @@ impl BindingStore {
     /// caller's resolve paired with the reply's variant. Progress a
     /// store committed after that read belongs to the payload now
     /// recorded and is adopted, never erased under a stale decision.
-    /// Returns the stored progress that remains: `None` when the
-    /// expected checkpoint was cleared or none is held.
+    /// Returns the delivery state the same locked write leaves behind
+    /// — confirmed part count, remaining checkpoint and the retry
+    /// deadline it carries — so the resend continues from one coherent
+    /// record instead of mixing an older resolve's sent count with the
+    /// checkpoint a newer write earned. `None` means the durable
+    /// record no longer holds the task at all.
     pub fn clear_reply_progress(
         &mut self,
         key: impl Into<TaskKey>,
         expected: Option<&crate::transport::SendProgress>,
-    ) -> Result<Option<crate::transport::SendProgress>> {
+    ) -> Result<Option<ReplyResumeState>> {
         let key = key.into();
         self.mutate(|document| {
             Ok(document
                 .pending_updates
                 .iter_mut()
                 .find(|task| task.key() == key)
-                .and_then(|task| {
+                .map(|task| {
                     if task.reply_progress.as_ref() == expected {
                         task.reply_progress = None;
                         task.reply_retry_at_ms = None;
-                        None
-                    } else {
-                        task.reply_progress.clone()
+                    }
+                    ReplyResumeState {
+                        sent: task.reply_sent,
+                        progress: task.reply_progress.clone(),
+                        retry_at_ms: task.reply_retry_at_ms,
                     }
                 }))
         })
@@ -2326,8 +2375,18 @@ fn apply_effect(document: &mut BindingDocument, dir: &Path, effect: &StagedEffec
             if !removable {
                 return false;
             }
+            let now = now_secs();
             let removed = document.chats.remove(&chat_id.to_string()).is_some();
-            let before = document.pairings.len();
+            // The same live-only accounting `revoke` applies: an
+            // expired code's row still sitting in the document is dead
+            // already, so dropping it here is cleanup and must not turn
+            // the recorded /unpair reply into a revocation that never
+            // happened.
+            let live = document.pairings.iter().any(|record| {
+                record.chat_id == *chat_id
+                    && user_id.is_none_or(|held| record.user_id == held)
+                    && record.expires_at > now
+            });
             document.pairings.retain(|record| {
                 record.chat_id != *chat_id || user_id.is_some_and(|held| record.user_id != held)
             });
@@ -2340,14 +2399,13 @@ fn apply_effect(document: &mut BindingDocument, dir: &Path, effect: &StagedEffec
             // is neither revocable nor owed a tombstone.
             let chat = chat_id.to_string();
             let guarded_at = document.revoked_chats.get(&chat).copied();
-            let now = now_secs();
             let staged = staged_pairing_offers(dir).into_iter().any(|record| {
                 record.chat_id == *chat_id
                     && user_id.is_none_or(|held| record.user_id == held)
                     && record.expires_at > now
                     && guarded_at.is_none_or(|at| record.minted_revision > at)
             });
-            let revoked = removed || document.pairings.len() != before || staged;
+            let revoked = removed || live || staged;
             if revoked {
                 // Tombstone the revocation like `revoke` does: a staged
                 // offer minted before it can never re-publish through
@@ -5188,6 +5246,54 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_stored_code_reports_no_revocation() {
+        temp_store(|mut store| {
+            // A pairing offer whose reply already delivered can leave
+            // its code in `document.pairings` past the TTL — nothing
+            // prunes it until the next pairing write. Removing that
+            // dead row is cleanup: the host revoke and the recorded
+            // /unpair must both answer there was nothing to revoke
+            // instead of confirming a lapsed code's removal.
+            store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.expire_pairings_for_test().unwrap();
+            admit_filler(&mut store, 8);
+            assert!(
+                !store.revoke(9).unwrap(),
+                "an expired stored code counted as revoked"
+            );
+            assert!(
+                !store.document.revoked_chats.contains_key("9"),
+                "a lapsed stored code earned a tombstone"
+            );
+            assert!(
+                store
+                    .pending_pairings()
+                    .iter()
+                    .all(|held| held.chat_id != 9),
+                "the expired row survived the cleanup"
+            );
+            // The recorded /unpair meets the same shape: a fresh code
+            // lapses while its row is still listed — the confirmation
+            // it binds must report nothing revoked, not success.
+            store.request_pairing(9, 9, Some("alice".into())).unwrap();
+            store.expire_pairings_for_test().unwrap();
+            let reply = store
+                .record_reply_and_revocation(9, 8, "reply:8", |removed| {
+                    format!("revoked={removed}")
+                })
+                .unwrap();
+            assert_eq!(
+                reply, "revoked=false",
+                "the recorded /unpair reported a revocation over a lapsed code"
+            );
+            assert!(
+                !store.document.revoked_chats.contains_key("9"),
+                "the staged revocation tombstoned a lapsed code"
+            );
+        });
+    }
+
+    #[test]
     fn a_checkpoint_clear_preserves_progress_committed_after_the_resolve() {
         temp_store(|mut store| {
             admit_filler(&mut store, 7);
@@ -5203,7 +5309,9 @@ mod tests {
                 .unwrap();
             // The checkpoint moved under the resolver: progress a
             // write landed since the read decided to clear is adopted,
-            // not erased.
+            // not erased — and the confirmed count, checkpoint and
+            // deadline the resume needs come back as one coherent
+            // state, never mixed from separate reads.
             let second = crate::transport::SendProgress {
                 confirmed: vec![11],
                 next_part: 1,
@@ -5211,15 +5319,28 @@ mod tests {
                 binding: None,
             };
             store
-                .record_reply_checkpoint(7, Some(second.clone()), None)
+                .record_reply_progress(7, 1, Some(second.clone()))
                 .unwrap();
+            store
+                .record_reply_checkpoint(7, None, Some(1_700_000_000))
+                .unwrap();
+            let adopted = store
+                .clear_reply_progress(7, Some(&first))
+                .unwrap()
+                .expect("the task's resume state was lost");
             assert_eq!(
-                store
-                    .clear_reply_progress(7, Some(&first))
-                    .unwrap()
-                    .as_ref(),
+                adopted.progress.as_ref(),
                 Some(&second),
                 "progress committed after the resolve was erased"
+            );
+            assert_eq!(
+                adopted.sent, 1,
+                "a part confirmed after the resolve was not adopted"
+            );
+            assert_eq!(
+                adopted.retry_at_ms,
+                Some(1_700_000_000),
+                "the adopted checkpoint's deadline was dropped"
             );
             assert_eq!(
                 store.pending_update(7).unwrap().reply_progress,
@@ -5227,15 +5348,13 @@ mod tests {
             );
             // The checkpoint the resolve actually paired with the
             // variant clears — its owed deadline with it.
-            store
-                .record_reply_checkpoint(7, None, Some(1_700_000_000))
-                .unwrap();
-            assert!(
-                store
-                    .clear_reply_progress(7, Some(&second))
-                    .unwrap()
-                    .is_none()
-            );
+            let cleared = store
+                .clear_reply_progress(7, Some(&second))
+                .unwrap()
+                .expect("the task's resume state was lost");
+            assert!(cleared.progress.is_none());
+            assert_eq!(cleared.sent, 1);
+            assert!(cleared.retry_at_ms.is_none());
             let held = store.pending_update(7).unwrap();
             assert!(held.reply_progress.is_none());
             assert!(held.reply_retry_at_ms.is_none());

@@ -17,7 +17,9 @@ use super::bridge::{
 };
 use super::channel::TelegramChannel;
 use super::transport::{BotIdentity, BotTransport, InboundMessage, SendProgress, bot_commands};
-use crate::binding::{BindingStore, ChatBinding, DroppedUpdate, StrandedReply, TaskKey};
+use crate::binding::{
+    BindingStore, ChatBinding, DroppedUpdate, ReplyResumeState, StrandedReply, TaskKey,
+};
 use crate::control::{
     ControlCommand, ControlOutcome, commands_text, help_text, parse_control_command,
 };
@@ -647,17 +649,30 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     let reconciled = store.lock().unwrap().reconcile_staged();
     let stranded: Vec<StrandedReply> = match reconciled {
         Ok(stranded) => stranded,
-        Err(_) => store
-            .lock()
-            .unwrap()
-            .staged_update_keys()
-            .into_iter()
-            .map(|key| StrandedReply {
-                update_id: key.update_id,
-                sequence: key.sequence,
-                code: "a4mc_telegram_state_full".to_owned(),
-            })
-            .collect(),
+        // Reconciliation could not run, so the filename list reports
+        // in its place — but still only for records a pending task is
+        // waiting to bind. An orphan a completed task left in the
+        // directory is the sweep's work on the next write, never the
+        // stranded reply the host is told about; a task already
+        // carrying its bound reply is delivered work, not stranded
+        // work.
+        Err(_) => {
+            let store = store.lock().unwrap();
+            store
+                .staged_update_keys()
+                .into_iter()
+                .filter(|key| {
+                    store
+                        .pending_update(*key)
+                        .is_some_and(|task| !task.has_reply())
+                })
+                .map(|key| StrandedReply {
+                    update_id: key.update_id,
+                    sequence: key.sequence,
+                    code: "a4mc_telegram_state_full".to_owned(),
+                })
+                .collect()
+        }
     };
     let staged: HashSet<TaskKey> = stranded
         .iter()
@@ -677,17 +692,19 @@ pub fn run_channel_loop<T: BotTransport + 'static>(
     for item in &stranded {
         let key = TaskKey::new(item.sequence, item.update_id);
         // Only a record still stranded in the final durable state
-        // reaches the host: the settle's write can bind the record the
-        // earlier snapshot could not — its resend is queued below —
-        // and a task already carrying its finished reply is delivered
-        // work, not a stranded record. The task's own reply state is
+        // reaches the host — an existing pending task still waiting to
+        // bind its reply: the settle's write can bind the record the
+        // earlier snapshot could not — its resend is queued below — a
+        // task already carrying its finished reply is delivered work,
+        // and an orphan a settled task left in the directory is the
+        // sweep's work, never an alert. The task's own reply state is
         // the gate — a manifest too corrupt to parse can never bind
         // its payload, so gating on a readable record would suppress
         // exactly the alert the stored code exists to carry.
         let store = store.lock().unwrap();
         if store
             .pending_update(key)
-            .is_none_or(|task| !task.has_reply())
+            .is_some_and(|task| !task.has_reply())
         {
             notify_stuck(&on_stuck, key, &item.code);
         }
@@ -1677,6 +1694,26 @@ fn deliver_sends<T: BotTransport>(
     Ok(())
 }
 
+/// Honor the retry deadline an adopted durable checkpoint still
+/// carries: the wait another attempt recorded before this one resumed
+/// its state is observed here rather than retried inside the
+/// platform's hint. An interrupted wait surfaces as a throttled send —
+/// the same contract an in-flight deferral wait escapes with, so the
+/// record and its deadline survive for the next restart.
+fn wait_adopted_deadline(retry_at_ms: Option<u64>, wait: bool, stop: &AtomicBool) -> Result<()> {
+    let now = now_millis();
+    let Some(remaining) = retry_at_ms.filter(|at| *at > now).map(|at| at - now) else {
+        return Ok(());
+    };
+    if wait && wait_or_stop(Duration::from_millis(remaining), stop) {
+        return Ok(());
+    }
+    Err(channel_err(a4mc::ChannelError::new(
+        "a4mc_telegram_throttled",
+        "adopted reply retry deadline interrupted",
+    )))
+}
+
 /// Deliver one durably-recorded reply's sends, part after part, from
 /// its persisted checkpoint: `sent` counts the contract-level sends
 /// already confirmed (skipped, never reposted), and the send at `sent`
@@ -1774,14 +1811,36 @@ fn deliver_recorded_reply<T: BotTransport>(
                         .and_then(|progress| progress.binding.as_ref())
                         .map(|binding| binding.dedupe_key.clone());
                     channel.discard_partial(effective.as_deref().unwrap_or(delivery_key));
-                    resume = store
+                    // The confirmed count, the checkpoint still held
+                    // and the deadline it is owed come out of the same
+                    // locked write that ran the clear: progress
+                    // another store committed between the resolve and
+                    // this write governs the resume whole — mixing the
+                    // earlier snapshot's count with the newer
+                    // checkpoint could repost a part that store
+                    // confirmed or resume it under the next part's
+                    // position. A task the record no longer holds
+                    // resumes from the resolve's own count — the same
+                    // fallback the snapshot it replaces offered.
+                    let state = store
                         .lock()
                         .unwrap()
-                        .clear_reply_progress(key, resume.as_ref())?;
-                    index = current.sent;
+                        .clear_reply_progress(key, resume.as_ref())?
+                        .unwrap_or(ReplyResumeState {
+                            sent: current.sent,
+                            progress: None,
+                            retry_at_ms: None,
+                        });
+                    if index != state.sent {
+                        index = state.sent;
+                        durable_cleared = false;
+                        cache_evicted = false;
+                    }
+                    resume = state.progress;
                     if index >= parts.len() {
                         return Ok(());
                     }
+                    wait_adopted_deadline(state.retry_at_ms, wait, stop)?;
                     continue;
                 }
             }
@@ -1867,10 +1926,32 @@ fn deliver_recorded_reply<T: BotTransport>(
                     durable_cleared = true;
                     let expected = resume.take();
                     channel.discard_partial(effective.as_deref().unwrap_or(delivery_key));
-                    resume = store
+                    // The retry resumes from the whole state the same
+                    // locked write leaves behind — confirmed count,
+                    // remaining checkpoint and the deadline it is owed
+                    // — so progress another store committed between
+                    // the refusal and this clear is adopted rather
+                    // than reposted under the stale part index this
+                    // attempt carried.
+                    let state = store
                         .lock()
                         .unwrap()
-                        .clear_reply_progress(key, expected.as_ref())?;
+                        .clear_reply_progress(key, expected.as_ref())?
+                        .unwrap_or(ReplyResumeState {
+                            sent: index,
+                            progress: None,
+                            retry_at_ms: None,
+                        });
+                    if index != state.sent {
+                        index = state.sent;
+                        durable_cleared = false;
+                        cache_evicted = false;
+                    }
+                    resume = state.progress;
+                    if index >= parts.len() {
+                        return Ok(());
+                    }
+                    wait_adopted_deadline(state.retry_at_ms, wait, stop)?;
                     continue;
                 }
                 Err(tracked) => {
@@ -5956,6 +6037,102 @@ mod tests {
     }
 
     #[test]
+    fn an_orphan_manifest_is_not_reported_as_stranded() {
+        let root = temp_root();
+        let replies = root.join("bindings.json.replies");
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store
+            .admit_updates(
+                &[
+                    PendingUpdate {
+                        update_id: 2,
+                        sequence: 0,
+                        message: text_message(42, 42, Some("alice"), "hello", 2),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    },
+                    PendingUpdate {
+                        update_id: 3,
+                        sequence: 0,
+                        message: text_message(42, 42, Some("alice"), "done", 3),
+                        reply: None,
+                        reply_key: None,
+                        reply_sent: 0,
+                        reply_progress: None,
+                        reply_file: None,
+                        reply_retry_at_ms: None,
+                        reply_refused: false,
+                    },
+                ],
+                &[],
+                &[],
+                4,
+            )
+            .unwrap();
+        // Task 3's work settled; the manifest it left in the replies
+        // directory is an orphan the next committed write sweeps —
+        // never stranded work the host should be told about.
+        store.complete_update(3).unwrap();
+        std::fs::create_dir_all(&replies).unwrap();
+        std::fs::write(replies.join("reply-2.json"), "{ not json").unwrap();
+        std::fs::write(replies.join("reply-3.json"), "{ not json").unwrap();
+        // Reconciliation itself cannot run, so the filename fallback
+        // is what reports — it still owes the pending task's alert
+        // and nothing more.
+        store.fail_next_write_for_test();
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let stranded = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let observed = Arc::clone(&stranded);
+        let transport = MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = RuntimeConfig {
+            poll_timeout_secs: 1,
+            stop: Arc::clone(&stop),
+            on_stuck: Some(Box::new(move |item: &StrandedReply| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((item.update_id, item.code.clone()));
+            })),
+            ..RuntimeConfig::default()
+        };
+        let handle = thread::spawn(move || run_channel_loop(transport, store, config).unwrap());
+        wait_until(
+            || !stranded.lock().unwrap().is_empty(),
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert_eq!(
+            *stranded.lock().unwrap(),
+            vec![(2, "a4mc_telegram_state_full".to_owned())],
+            "the settled task's orphan was reported as stranded work"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a task whose staged record cannot be parsed was dispatched"
+        );
+        assert_eq!(
+            BindingStore::open_in(&root)
+                .unwrap()
+                .pending_updates()
+                .len(),
+            1,
+            "the pending task was dropped"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn an_ambiguous_checkpoint_is_surfaced_to_the_host() {
         let root = temp_root();
         {
@@ -8943,6 +9120,119 @@ mod tests {
         );
         let task = store.lock().unwrap().pending_update(7).unwrap();
         assert_eq!(task.reply_sent, 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_resend_honors_the_adopted_checkpoints_deadline() {
+        let root = temp_root();
+        let mut store = BindingStore::open_in(&root).unwrap();
+        store
+            .admit_updates(
+                &[PendingUpdate {
+                    update_id: 7,
+                    sequence: 0,
+                    message: text_message(9, 9, Some("alice"), "/start", 7),
+                    reply: None,
+                    reply_key: None,
+                    reply_sent: 0,
+                    reply_progress: None,
+                    reply_file: None,
+                    reply_retry_at_ms: None,
+                    reply_refused: false,
+                }],
+                &[],
+                &[],
+                8,
+            )
+            .unwrap();
+        let refused = format!("{}{}", "r".repeat(32 * 1024), "t".repeat(5_000));
+        store
+            .record_pairing_and_reply(
+                9,
+                9,
+                Some("alice".into()),
+                7,
+                "reply:7",
+                |record| format!("Pairing code: {}", record.code),
+                &refused,
+            )
+            .unwrap();
+        let task = store.pending_update(7).unwrap();
+        let live = store
+            .reply_text(&task)
+            .unwrap()
+            .expect("the offer's live text was not recorded");
+        // The offer lapsed and another attempt already committed the
+        // refusal's first part plus a platform checkpoint still owed a
+        // retry deadline far in the future — the resolve that selects
+        // the refusal commits while the record is still substitutable.
+        store.request_pairing(9, 9, Some("alice".into())).unwrap();
+        let task = store.pending_update(7).unwrap();
+        let resolved = store.resolve_reply(&task).unwrap().unwrap();
+        assert_eq!(resolved.text, refused, "the lapsed offer did not refuse");
+        store
+            .record_reply_progress(
+                7,
+                1,
+                Some(SendProgress {
+                    confirmed: vec![91],
+                    next_part: 1,
+                    outcome_unknown: false,
+                    binding: None,
+                }),
+            )
+            .unwrap();
+        store
+            .record_reply_checkpoint(7, None, Some(now_millis() + 3_600_000))
+            .unwrap();
+        let store = Mutex::new(store);
+        let stop = AtomicBool::new(false);
+        let sent = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let channel = TelegramChannel::new(Arc::new(MockBotTransport {
+            sent: Arc::clone(&sent),
+            ..MockBotTransport::default()
+        }));
+
+        // The resend still carries the stale offer text: substitution
+        // adopts the refusal's checkpoint AND the deadline it is owed —
+        // the retry must hold instead of posting inside the platform's
+        // hint, and refusing the wait surfaces like an interrupted
+        // throttle so the record and its deadline survive.
+        let error = deliver_recorded_reply(
+            &channel,
+            &store,
+            9,
+            7,
+            TaskKey::new(0, 7),
+            "reply:7",
+            &live,
+            0,
+            Some(SendProgress {
+                confirmed: vec![],
+                next_part: 0,
+                outcome_unknown: false,
+                binding: None,
+            }),
+            false,
+            &stop,
+        )
+        .unwrap_err();
+        assert_eq!(failure_code(&error), "a4mc_telegram_throttled");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a part posted inside the adopted deadline"
+        );
+        let task = store.lock().unwrap().pending_update(7).unwrap();
+        assert_eq!(task.reply_sent, 1);
+        assert!(
+            task.reply_retry_at_ms.is_some(),
+            "the adopted checkpoint's deadline was dropped"
+        );
+        assert!(
+            task.reply_progress.is_some(),
+            "the adopted checkpoint was erased"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
