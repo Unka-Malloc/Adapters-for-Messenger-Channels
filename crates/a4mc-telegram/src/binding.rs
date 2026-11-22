@@ -249,8 +249,9 @@ pub struct ReplyResumeState {
     /// `None` when the expected checkpoint cleared or none is held.
     pub progress: Option<crate::transport::SendProgress>,
     /// Unix milliseconds before which the reply must not be attempted
-    /// again — surviving only with a checkpoint that was adopted, not
-    /// cleared.
+    /// again. A deadline owed to the platform survives a checkpoint
+    /// clear — dropping an obsolete position never cancels a wait the
+    /// record was still owed.
     pub retry_at_ms: Option<u64>,
 }
 
@@ -1438,22 +1439,26 @@ impl BindingStore {
     }
 
     /// Clear a reply's durable platform checkpoint only while the
-    /// stored record still holds the whole delivery state the
-    /// caller's resolve decided on. A checkpoint comparison alone
-    /// cannot see a deferral another store recorded without touching
-    /// the checkpoint — including when both checkpoints are `None` —
-    /// and clearing under it would erase the newer deadline and let
-    /// the retry fire inside the wait it was owed. A record that has
-    /// advanced past `expected` in any field belongs to the payload
-    /// now recorded: the clear is skipped and the advanced state is
-    /// adopted, never erased under a stale decision. Returns the
-    /// delivery state the same locked write leaves behind — confirmed
-    /// part count, remaining checkpoint and the retry deadline it
-    /// carries — so the resend continues from one coherent record
-    /// instead of mixing an older resolve's count with the state a
-    /// newer write earned. `None` means the durable record no longer
-    /// holds the task at all — delivered and settled by another
-    /// runtime.
+    /// stored record still holds exactly the position the caller's
+    /// resolve decided on — same confirmed count and same checkpoint:
+    /// an equal stored checkpoint provably belongs to the payload the
+    /// caller superseded, so dropping it is safe. The retry deadline
+    /// is a different dimension of the record and never gates the
+    /// clear: a deferral another store recorded since the resolve —
+    /// including when both checkpoints are `None` — stays owed
+    /// whether the checkpoint drops or not, so it is preserved and
+    /// adopted rather than erased under a stale comparison or used to
+    /// strand a verified-obsolete checkpoint on the record. A record
+    /// that moved past `expected` in confirmed count or checkpoint
+    /// belongs to the payload now recorded: the clear is skipped and
+    /// the advanced state is adopted, never erased under a stale
+    /// decision. Returns the delivery state the same locked write
+    /// leaves behind — confirmed part count, remaining checkpoint and
+    /// the retry deadline it carries — so the resend continues from
+    /// one coherent record instead of mixing an older resolve's count
+    /// with the state a newer write earned. `None` means the durable
+    /// record no longer holds the task at all — delivered and settled
+    /// by another runtime.
     pub fn clear_reply_progress(
         &mut self,
         key: impl Into<TaskKey>,
@@ -1468,10 +1473,16 @@ impl BindingStore {
                 .map(|task| {
                     if task.reply_sent == expected.sent
                         && task.reply_progress.as_ref() == expected.progress.as_ref()
-                        && task.reply_retry_at_ms == expected.retry_at_ms
                     {
                         task.reply_progress = None;
-                        task.reply_retry_at_ms = None;
+                        // The deadline drops only with the checkpoint
+                        // it was observed under: one recorded since —
+                        // a deferral another store landed between the
+                        // resolve and this write — stays owed and is
+                        // adopted by the caller, never erased.
+                        if task.reply_retry_at_ms == expected.retry_at_ms {
+                            task.reply_retry_at_ms = None;
+                        }
                     }
                     ReplyResumeState {
                         sent: task.reply_sent,
@@ -1479,6 +1490,52 @@ impl BindingStore {
                         retry_at_ms: task.reply_retry_at_ms,
                     }
                 }))
+        })
+    }
+
+    /// Claim the reply's durable delivery state for one attempt's next
+    /// write, atomically: the mutation lands only while the stored
+    /// record still holds the whole `expected` state the attempt
+    /// adopted — same confirmed count, same checkpoint, same retry
+    /// deadline — and then replaces it with `claimed`. A record that
+    /// left the document means another runtime delivered and settled
+    /// the reply: the write refuses `a4mc_telegram_reply_settled`
+    /// instead of succeeding as a no-op over a dead record, so a
+    /// pre-POST checkpoint that cannot claim its task aborts the send
+    /// before transport rather than reposting finished work. A record
+    /// that moved past `expected` in any field refuses
+    /// `a4mc_telegram_state_superseded`, so the attempt re-adopts the
+    /// newer position instead of overwriting progress it never saw.
+    /// On success `expected` is advanced to `claimed`, tracking the
+    /// state this attempt's own writes leave for the next validation.
+    pub fn claim_reply_state(
+        &mut self,
+        key: impl Into<TaskKey>,
+        expected: &mut ReplyResumeState,
+        claimed: ReplyResumeState,
+    ) -> Result<()> {
+        let key = key.into();
+        self.mutate(|document| {
+            let Some(task) = document
+                .pending_updates
+                .iter_mut()
+                .find(|task| task.key() == key)
+            else {
+                return Err(anyhow!("a4mc_telegram_reply_settled"));
+            };
+            let held = ReplyResumeState {
+                sent: task.reply_sent,
+                progress: task.reply_progress.clone(),
+                retry_at_ms: task.reply_retry_at_ms,
+            };
+            if held != *expected {
+                return Err(anyhow!("a4mc_telegram_state_superseded"));
+            }
+            task.reply_sent = claimed.sent;
+            task.reply_progress = claimed.progress.clone();
+            task.reply_retry_at_ms = claimed.retry_at_ms;
+            *expected = claimed;
+            Ok(())
         })
     }
 

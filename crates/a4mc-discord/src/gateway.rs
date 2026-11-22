@@ -805,13 +805,16 @@ pub fn run_gateway_session(
         // answer than the channel's bound, so joining before draining
         // would deadlock on the last send — and commit only the
         // contiguous accepted prefix: answers arrive in receive order,
-        // so once a failure is seen nothing behind it may advance the
-        // resume cursor past work the host rejected.
+        // and a rejection is always the worker's last answer — it exits
+        // after reporting one — so once a failure is seen nothing
+        // behind it may advance the resume cursor past work the host
+        // rejected. The prefix runs from the acknowledgements
+        // themselves, not the session loop's exit: a loop that ended on
+        // a disconnected enqueue after the worker left never drained
+        // the accept already queued ahead of the rejection, and
+        // discarding it would replay work the host ran.
         drop(work_tx);
-        let mut accepted_prefix = outcome
-            .as_ref()
-            .err()
-            .is_none_or(|error| error.code != HANDLER_FAILED_CODE);
+        let mut accepted_prefix = true;
         let mut first_failure = None;
         while let Ok(ack) = ack_rx.recv() {
             match ack.result {
@@ -1307,12 +1310,40 @@ mod tests {
         }
     }
 
+    /// Gates reads past `reads` on a shared latch, so a test can pin a
+    /// session inside `read_frame` until the dispatch worker has
+    /// already reported and exited.
+    #[derive(Default)]
+    struct ReadGate {
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
+    }
+
+    impl ReadGate {
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+        }
+    }
+
     struct ScriptedConnection {
         frames: VecDeque<GatewayRead>,
         sent: Arc<Mutex<Vec<Value>>>,
         /// Simulated per-read cost so real time can cross a protocol
         /// deadline while frames keep arriving.
         read_delay: Duration,
+        /// Reads served so far, plus the gate applied once `gate_after`
+        /// reads have passed.
+        reads: usize,
+        gate_after: usize,
+        gate: Option<Arc<ReadGate>>,
     }
 
     impl ScriptedConnection {
@@ -1324,12 +1355,29 @@ mod tests {
                 frames: frames.into_iter().collect(),
                 sent,
                 read_delay: Duration::ZERO,
+                reads: 0,
+                gate_after: usize::MAX,
+                gate: None,
             }
+        }
+
+        /// The read after `reads` waits on `gate` — everything before
+        /// it flows freely.
+        fn gate_after(mut self, reads: usize, gate: Arc<ReadGate>) -> Self {
+            self.gate_after = reads;
+            self.gate = Some(gate);
+            self
         }
     }
 
     impl GatewayConnection for ScriptedConnection {
         fn read_frame(&mut self, _timeout: Duration) -> Result<GatewayRead, DiscordApiError> {
+            self.reads += 1;
+            if self.reads > self.gate_after
+                && let Some(gate) = &self.gate
+            {
+                gate.wait();
+            }
             if !self.read_delay.is_zero() {
                 std::thread::sleep(self.read_delay);
             }
@@ -1380,6 +1428,36 @@ mod tests {
             if self.calls == 1 {
                 std::thread::sleep(Duration::from_millis(50));
             }
+            Err(DiscordApiError::new(
+                "a4mc_discord_fixture_handler",
+                "fixture handler rejected the dispatch",
+            ))
+        }
+    }
+
+    /// Accepts the first dispatch, then opens a shared read gate on the
+    /// second and rejects immediately: the gate lets the pinned session
+    /// read start finishing only once this rejection is already the
+    /// worker's last act — the connection's post-gate delay covers the
+    /// send-and-exit that follows — so the session's next handoff
+    /// attempt hits a dead worker while both answers still wait in the
+    /// result channel.
+    struct GateThenRejectHandler {
+        calls: usize,
+        gate: Arc<ReadGate>,
+    }
+
+    impl GatewayHandler for GateThenRejectHandler {
+        fn on_dispatch(
+            &mut self,
+            _event: &ChannelEvent,
+            _payload: &GatewayPayload,
+        ) -> Result<(), DiscordApiError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Ok(());
+            }
+            self.gate.open();
             Err(DiscordApiError::new(
                 "a4mc_discord_fixture_handler",
                 "fixture handler rejected the dispatch",
@@ -1853,6 +1931,9 @@ mod tests {
             frames: frames.into_iter().collect(),
             sent: Arc::clone(&sent),
             read_delay: Duration::from_millis(5),
+            reads: 0,
+            gate_after: usize::MAX,
+            gate: None,
         };
         let mut handler = RecordingHandler::default();
         let mut session = GatewaySession::default();
@@ -1989,6 +2070,49 @@ mod tests {
             handler.calls, 1,
             "a queued dispatch ran after the rejection"
         );
+    }
+
+    #[test]
+    fn an_accepted_dispatch_survives_a_rejection_seen_after_the_worker_left() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(ReadGate::default());
+        // The gated read keeps the session inside `read_frame` for the
+        // dispatch behind the rejection while the worker reports its
+        // two answers and exits: the next handoff attempt fails
+        // disconnected, so the session loop exits without ever
+        // draining the acceptance queued ahead of the rejection. The
+        // teardown drain must still commit it — or the resumed session
+        // replays work the host already ran.
+        let mut connection = ScriptedConnection::new(
+            [hello(), ready(), message(2), message(3), message(4)],
+            Arc::clone(&sent),
+        )
+        .gate_after(4, Arc::clone(&gate));
+        connection.read_delay = Duration::from_millis(30);
+        let mut handler = GateThenRejectHandler {
+            calls: 0,
+            gate: Arc::clone(&gate),
+        };
+        let mut session = GatewaySession::default();
+        let stop = AtomicBool::new(false);
+        let token = SecretToken::try_from_string(fixture_token()).unwrap();
+
+        let error = run_gateway_session(
+            &mut connection,
+            &token,
+            &mut handler,
+            &mut session,
+            &GatewayConfig::default(),
+            &stop,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, HANDLER_FAILED_CODE);
+        // READY (1) and the accepted dispatch (2) hold the cursor; the
+        // rejected sequence stays replayable.
+        assert_eq!(session.sequence, Some(2));
+        assert_eq!(session.last_dispatched, Some(2));
+        assert_eq!(handler.calls, 2, "work behind the rejection ran");
     }
 
     #[test]
@@ -2438,6 +2562,9 @@ mod tests {
                 frames: frames.into_iter().collect(),
                 sent,
                 read_delay: Duration::from_millis(5),
+                reads: 0,
+                gate_after: usize::MAX,
+                gate: None,
             };
             let mut session = GatewaySession::default();
             let stop = AtomicBool::new(false);
