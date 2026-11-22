@@ -1505,14 +1505,14 @@ mod tests {
 
     #[test]
     fn a_pre_connect_failure_is_distinct_and_certain() {
-        // A port nothing listens on: connect fails before any request
-        // byte leaves, so the send's outcome is certain — safe to
-        // retry — and must not share a code with in-flight failures.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let transport =
-            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        // A port nothing can ever listen on: connect fails before any
+        // request byte leaves, so the send's outcome is certain — safe
+        // to retry — and must not share a code with in-flight failures.
+        // Port 0 is reserved and unbindable, so there is no window in
+        // which another listener could claim the destination — unlike a
+        // dropped port-0 binding, which a parallel test process could
+        // take between the drop and this connect.
+        let transport = LiveBotTransport::new_for_test("token", Some("http://127.0.0.1:0"));
         let error = transport
             .send_message(42, "hello", None, None, &mut |_| Ok(()))
             .unwrap_err();
