@@ -560,6 +560,10 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
     let mut retry_after = None;
     let mut chunked = false;
     let mut content_length: Option<usize> = None;
+    // A framing defect in the head is recorded rather than raised
+    // mid-parse: the whole header still yields a throttle's
+    // classification before the invalid body is discarded.
+    let mut head_framing_invalid = false;
     for line in head.lines().skip(1) {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -569,11 +573,16 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
             } else if name == "transfer-encoding" && value.eq_ignore_ascii_case("chunked") {
                 chunked = true;
             } else if name == "content-length" {
-                let length = value.parse::<usize>().map_err(|_| failed())?;
-                if content_length.is_some_and(|seen| seen != length) {
-                    return Err(failed());
+                match value.parse::<usize>() {
+                    Ok(length) => {
+                        if content_length.is_some_and(|seen| seen != length) {
+                            head_framing_invalid = true;
+                        } else {
+                            content_length = Some(length);
+                        }
+                    }
+                    Err(_) => head_framing_invalid = true,
                 }
-                content_length = Some(length);
             }
         }
     }
@@ -588,6 +597,9 @@ fn read_response(stream: &mut dyn Read) -> Result<HttpResponse, TelegramApiError
             body: Vec::new(),
         })
     };
+    if head_framing_invalid {
+        return throttled_body_lost().map_or_else(|| Err(failed()), Ok);
+    }
     let mut body_raw = raw.split_off(head_end);
     loop {
         // A declared frame ends the read as soon as it is complete:
@@ -680,13 +692,16 @@ fn chunked_state(raw: &[u8]) -> ChunkedState {
                 ChunkedState::Incomplete
             };
         }
+        // The declared chunk must fit the decoded budget that
+        // remains; validating before the arithmetic keeps an absurd
+        // size from overflowing the length check or the accumulator.
+        if size > MAX_RESPONSE_BYTES - decoded {
+            return ChunkedState::Malformed;
+        }
         if rest.len() < size + 2 {
             return ChunkedState::Incomplete;
         }
         decoded += size;
-        if decoded > MAX_RESPONSE_BYTES {
-            return ChunkedState::Malformed;
-        }
         rest = &rest[size..];
         if !rest.starts_with(b"\r\n") {
             return ChunkedState::Malformed;
@@ -722,13 +737,16 @@ fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
             // blank line arrived; anything still behind it is ignored.
             return chunked_tail_complete(rest).then_some(body);
         }
+        // Same budget check as the scan: a declared chunk that cannot
+        // fit the decoded bound is rejected before any arithmetic on
+        // it, so an absurd size can never overflow the slice bounds.
+        if size > MAX_RESPONSE_BYTES - body.len() {
+            return None;
+        }
         if rest.len() < size + 2 {
             return None;
         }
         body.extend_from_slice(&rest[..size]);
-        if body.len() > MAX_RESPONSE_BYTES {
-            return None;
-        }
         rest = &rest[size..];
         if !rest.starts_with(b"\r\n") {
             return None;
@@ -1780,5 +1798,68 @@ mod tests {
         };
         let error = read_response(&mut stream).err().unwrap();
         assert_eq!(error.code, "a4mc_telegram_read_failed");
+    }
+
+    #[test]
+    fn an_oversized_chunk_declaration_is_a_read_error_not_a_panic() {
+        // A chunk size of usize::MAX cannot fit any buffer: the scan
+        // rejects it against the decoded budget before `size + 2`
+        // arithmetic can overflow, and the decoder refuses the same
+        // declaration — a read error where an unchecked sum panicked.
+        let mut stream = ChunkedReader {
+            data: b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n".to_vec(),
+            reads: std::collections::VecDeque::new(),
+            offset: 0,
+        };
+        let error = read_response(&mut stream).err().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_read_failed");
+    }
+
+    #[test]
+    fn a_conflicting_content_length_discards_the_body_but_keeps_a_throttle() {
+        // Conflicting Content-Length headers invalidate the frame,
+        // but the whole head is still parsed first: a recognized 429
+        // keeps its classification and Retry-After while the invalid
+        // body is discarded.
+        let mut stream = ChunkedReader {
+            data: b"HTTP/1.1 429 X\r\nContent-Type: application/json\r\nRetry-After: 6\r\nContent-Length: 4\r\nContent-Length: 9\r\n\r\nlost-body".to_vec(),
+            reads: std::collections::VecDeque::new(),
+            offset: 0,
+        };
+        let parsed = read_response(&mut stream).unwrap();
+        assert_eq!(parsed.status, 429);
+        assert_eq!(parsed.retry_after, Some(6));
+        assert!(parsed.body.is_empty());
+    }
+
+    #[test]
+    fn a_conflicting_content_length_on_a_plain_response_is_a_read_error() {
+        let mut stream = ChunkedReader {
+            data: b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: 4\r\nContent-Length: 9\r\n\r\n{\"ok\":true}".to_vec(),
+            reads: std::collections::VecDeque::new(),
+            offset: 0,
+        };
+        let error = read_response(&mut stream).err().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_read_failed");
+    }
+
+    #[test]
+    fn a_conflicting_content_length_still_surfaces_the_throttle() {
+        // The served head carries two different Content-Length values;
+        // the throttle classification and Retry-After survive while
+        // the invalid body is dropped.
+        let body = "{\"ok\":false,\"error_code\":429}";
+        let (port, handle) = serve_once_with_headers(
+            429,
+            "application/json",
+            "Retry-After: 6\r\nContent-Length: 1\r\n",
+            body,
+        );
+        let transport =
+            LiveBotTransport::new_for_test("token", Some(&format!("http://127.0.0.1:{port}")));
+        let error = transport.get_updates(0, 1).unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error.code, "a4mc_telegram_throttled");
+        assert_eq!(error.retry_after, Some(6));
     }
 }

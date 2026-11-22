@@ -42,8 +42,10 @@ a4mc_slack::run_socket_mode(
 let api = Arc::new(a4mc_discord::live_api(None)?);           // bot token via custody
 let channel = Arc::new(a4mc_discord::DiscordChannel::new(Arc::clone(&api)));
 let mut handler = MyDiscordHandler { channel };              // impl GatewayHandler
+let mut session = a4mc_discord::GatewaySession::default();   // host-held resume state
 a4mc_discord::run_gateway(
     &a4mc_discord::LiveGatewayConnector, api.token(), &mut handler,
+    &mut session,
     &a4mc_discord::GatewayModeConfig::default(),
 )?;
 
@@ -75,8 +77,9 @@ identity it served under. Slack's `SocketModeConfig` carries the
 bounded session count, reconnect delay, envelope-dedupe capacity and
 the same shared `stop` flag. Discord's `GatewayModeConfig` carries the
 initial Gateway URL, intents, bounded session count, reconnect delays
-and the same `stop` flag; resume state lives in the session, not in the
-host.
+and the same `stop` flag; resume state lives in the host-held
+`GatewaySession` passed to every `run_gateway` invocation, so a
+handler failure retries with `RESUME` instead of a fresh `IDENTIFY`.
 
 ## Rules that keep the contract
 

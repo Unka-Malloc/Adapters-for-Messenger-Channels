@@ -99,4 +99,20 @@ mod tests {
 
         let _ = (telegram, runtime, slack, discord, receiver);
     }
+
+    /// Pins the documented `run_gateway` call shape: the host retains
+    /// the `GatewaySession` and passes it by mutable reference on
+    /// every invocation. Never called — a compile-time probe that
+    /// fails the moment the documented example drifts from the
+    /// signature a composing host links against.
+    #[allow(dead_code)]
+    fn the_documented_gateway_call_keeps_a_host_held_session(
+        connector: &dyn a4mc_discord::GatewayConnector,
+        token: &a4mc_discord::DiscordToken,
+        handler: &mut dyn a4mc_discord::GatewayHandler,
+        session: &mut a4mc_discord::GatewaySession,
+        config: &a4mc_discord::GatewayModeConfig,
+    ) -> Result<(), a4mc_discord::DiscordApiError> {
+        a4mc_discord::run_gateway(connector, token, handler, session, config)
+    }
 }
