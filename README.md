@@ -16,12 +16,12 @@ Each `a4mc-<channel>` dialect crate adapts a platform's native receive mechanism
 
 ## Quick Usage
 
-Embed `a4mc` alongside the channel dialect crates you need. crates.io currently carries only `a4mc`/`a4mc-telegram` 0.1.0, so until the 0.2 releases publish, depend on the repository directly — the `version` field asserts the checkout provides the documented API:
+Embed `a4mc` alongside the channel dialect crates you need. crates.io currently carries only `a4mc`/`a4mc-telegram` 0.1.0, so until the 0.2 releases publish, depend on the repository's `nightly` branch — an unpinned git source resolves to `main`, which still carries 0.1.0. The `version` field asserts the checkout provides the documented API:
 
 ```toml
 [dependencies]
-a4mc = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", version = "0.2" }
-a4mc-telegram = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", version = "0.2" }
+a4mc = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", branch = "nightly", version = "0.2" }
+a4mc-telegram = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", branch = "nightly", version = "0.2" }
 ```
 
 Add `tag = "…"` or `rev = "…"` to pin a specific reviewed commit.
