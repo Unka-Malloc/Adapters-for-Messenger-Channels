@@ -4,13 +4,18 @@ Embed `a4mc` plus one `a4mc-<channel>` dialect per platform, install `CustodyPor
 
 ## Host — embed a channel dialect
 
+The dialects resolve through the repository until each version lands on
+crates.io — `a4mc-slack`, `a4mc-discord` and `a4mc-webhook` are not yet
+published, and the registry carries only `a4mc`/`a4mc-telegram` 0.1.0.
+Each `version` field asserts the checkout provides the documented API.
+
 ```toml
 [dependencies]
-a4mc = "0.2"
-a4mc-telegram = "0.2"
-a4mc-slack = "0.1"
-a4mc-discord = "0.1"
-a4mc-webhook = "0.1"
+a4mc = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", version = "0.2" }
+a4mc-telegram = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", version = "0.2" }
+a4mc-slack = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", version = "0.1" }
+a4mc-discord = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", version = "0.1" }
+a4mc-webhook = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", version = "0.1" }
 ```
 
 ```rust
