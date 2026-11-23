@@ -24,7 +24,7 @@ a4mc = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels",
 a4mc-telegram = { git = "https://github.com/Unka-Malloc/Adapters-for-Messenger-Channels", branch = "nightly", version = "0.2" }
 ```
 
-Add `tag = "…"` or `rev = "…"` to pin a specific reviewed commit.
+To pin a specific reviewed commit, replace `branch = "nightly"` with `tag = "…"` or `rev = "…"` in each entry — Cargo accepts only one of those selectors per dependency.
 
 The Telegram example takes the host-provided custody and lane ports and a directory for durable state.
 
